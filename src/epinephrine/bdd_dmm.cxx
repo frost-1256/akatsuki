@@ -962,6 +962,35 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMO
 }
 
 
+// Epinephrine (WP2b-2): when the PCFG panel timing is known and its active area matches the POST mode,
+// describe the real signal (same numbers as the synthesized EDID detailed timing, so the target mode and
+// the EDID-derived monitor mode are identical). Otherwise leave the KMDOD "unspecified" values in place.
+static VOID EpiApplyPanelSignal(_In_ const EPI_PANEL* pPanel, _In_ const DXGK_DISPLAY_INFORMATION* pDispInfo,
+                                _Inout_ D3DKMDT_VIDEO_SIGNAL_INFO* pSignal)
+{
+    PAGED_CODE();
+    if (!pPanel->Valid || !pPanel->UseSignal || pPanel->Timing.HActive != pDispInfo->Width || pPanel->Timing.VActive != pDispInfo->Height)
+    {
+        return;
+    }
+    const EPI_PANEL_TIMING& t = pPanel->Timing;
+    const UINT htotal = t.HActive + t.HFrontPorch + t.HBackPorch + t.HSyncPulse;
+    const UINT vtotal = t.VActive + t.VFrontPorch + t.VBackPorch + t.VSyncPulse;
+    // Frequencies from the exact PCFG refresh (16.16), in mHz, as qcdxkm7325 reported them for the same EDID
+    // (CCD database on spacewar: VSync 60000/1000, HSync 147180000/1000, PixelRate 173819580).
+    // Deriving them from the truncated EDID pixel clock (59.997 Hz) gave a black screen (2026-11-07).
+    const UINT vsyncMilliHz = (UINT)(((UINT64)t.RefreshQ16 * 1000) >> 16);
+    pSignal->TotalSize.cx = htotal;
+    pSignal->TotalSize.cy = vtotal;
+    pSignal->ActiveSize.cx = t.HActive;
+    pSignal->ActiveSize.cy = t.VActive;
+    pSignal->PixelRate = ((UINT64)htotal * vtotal * vsyncMilliHz) / 1000;
+    pSignal->HSyncFreq.Numerator = vtotal * vsyncMilliHz;
+    pSignal->HSyncFreq.Denominator = 1000;
+    pSignal->VSyncFreq.Numerator = vsyncMilliHz;
+    pSignal->VSyncFreq.Denominator = 1000;
+}
+
 // Add the current mode information (acquired from the POST frame buffer) as the target mode.
 NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTERFACE* pVidPnTargetModeSetInterface,
                                                    D3DKMDT_HVIDPNTARGETMODESET hVidPnTargetModeSet,
@@ -990,6 +1019,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMO
     pVidPnTargetModeInfo->VideoSignalInfo.HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pVidPnTargetModeInfo->VideoSignalInfo.PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pVidPnTargetModeInfo->VideoSignalInfo.ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
+    EpiApplyPanelSignal(&m_Panel, &m_CurrentModes[SourceId].DispInfo, &pVidPnTargetModeInfo->VideoSignalInfo);
     // We add this as PREFERRED since it is the only supported target
     pVidPnTargetModeInfo->Preference = D3DKMDT_MP_PREFERRED;
 
@@ -1045,6 +1075,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMEND
     pMonitorSourceMode->VideoSignalInfo.HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pMonitorSourceMode->VideoSignalInfo.PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pMonitorSourceMode->VideoSignalInfo.ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
+    EpiApplyPanelSignal(&m_Panel, &m_CurrentModes[CorrespondingSourceId].DispInfo, &pMonitorSourceMode->VideoSignalInfo);
 
     // We set the preference to PREFERRED since this is the only supported mode
     pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;

@@ -27,7 +27,7 @@ static const EPI_BLOCK g_EpiBlocks[] = {
 #define EPI_MAX_BLOCK 0x400
 #define EPI_RES_TEXT_CCH 1024
 
-static NTSTATUS EpiSetValue(HANDLE hKey, PCWSTR Name, ULONG Type, const VOID* Data, ULONG Size)
+NTSTATUS EpiSetValue(HANDLE hKey, PCWSTR Name, ULONG Type, const VOID* Data, ULONG Size)
 {
     PAGED_CODE();
     UNICODE_STRING n;
@@ -35,13 +35,13 @@ static NTSTATUS EpiSetValue(HANDLE hKey, PCWSTR Name, ULONG Type, const VOID* Da
     return ZwSetValueKey(hKey, &n, 0, Type, const_cast<PVOID>(Data), Size);
 }
 
-static NTSTATUS EpiSetDword(HANDLE hKey, PCWSTR Name, ULONG Value)
+NTSTATUS EpiSetDword(HANDLE hKey, PCWSTR Name, ULONG Value)
 {
     PAGED_CODE();
     return EpiSetValue(hKey, Name, REG_DWORD, &Value, sizeof(Value));
 }
 
-static ULONG EpiQueryDword(HANDLE hKey, PCWSTR Name, ULONG Default)
+ULONG EpiQueryDword(HANDLE hKey, PCWSTR Name, ULONG Default)
 {
     PAGED_CODE();
     UNICODE_STRING n;
@@ -53,6 +53,27 @@ static ULONG EpiQueryDword(HANDLE hKey, PCWSTR Name, ULONG Default)
     PKEY_VALUE_PARTIAL_INFORMATION p = reinterpret_cast<PKEY_VALUE_PARTIAL_INFORMATION>(buf);
     if (p->Type != REG_DWORD || p->DataLength != sizeof(ULONG)) { return Default; }
     return *reinterpret_cast<ULONG UNALIGNED*>(p->Data);
+}
+
+NTSTATUS EpiOpenDiag(PDEVICE_OBJECT Pdo, HANDLE* phParams, HANDLE* phDiag)
+{
+    PAGED_CODE();
+    *phParams = NULL;
+    *phDiag = NULL;
+    HANDLE hParams = NULL;
+    NTSTATUS st = IoOpenDeviceRegistryKey(Pdo, PLUGPLAY_REGKEY_DEVICE, KEY_READ | KEY_WRITE, &hParams);
+    if (!NT_SUCCESS(st)) { return st; }
+
+    HANDLE hDiag = NULL;
+    UNICODE_STRING diagName;
+    RtlInitUnicodeString(&diagName, L"EpiDiag");
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &diagName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, hParams, NULL);
+    st = ZwCreateKey(&hDiag, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_VOLATILE, NULL);
+    if (!NT_SUCCESS(st)) { ZwClose(hParams); return st; }
+    *phParams = hParams;
+    *phDiag = hDiag;
+    return STATUS_SUCCESS;
 }
 
 // Walk the translated resources; classify by type and address only.
@@ -118,17 +139,8 @@ VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOUR
     RtlZeroMemory(pRes, sizeof(*pRes));
 
     HANDLE hParams = NULL;
-    NTSTATUS st = IoOpenDeviceRegistryKey(pDeviceInfo->PhysicalDeviceObject, PLUGPLAY_REGKEY_DEVICE,
-                                          KEY_READ | KEY_WRITE, &hParams);
-    if (!NT_SUCCESS(st)) { return; }
-
     HANDLE hDiag = NULL;
-    UNICODE_STRING diagName;
-    RtlInitUnicodeString(&diagName, L"EpiDiag");
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &diagName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, hParams, NULL);
-    st = ZwCreateKey(&hDiag, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_VOLATILE, NULL);
-    if (!NT_SUCCESS(st)) { ZwClose(hParams); return; }
+    if (!NT_SUCCESS(EpiOpenDiag(pDeviceInfo->PhysicalDeviceObject, &hParams, &hDiag))) { return; }
 
     // Version of this snapshot format; bump when blocks or values change.
     EpiSetDword(hDiag, L"SnapVersion", 1);

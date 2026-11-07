@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: MIT
+// Epinephrine (Akatsuki Project) - panel XML (PCFG) loader (WP2b-2). New file, not derived from KMDOD.
+
+#include "BDD.hxx"
+#include "epi_hw.hxx"
+
+#pragma code_seg("PAGE")
+
+#define EPI_ROM_CHUNK   0x1000      // GPU0._ROM returns at most 0x1000 bytes per call
+#define EPI_XML_MAX     0x10000     // PCFG is 0x167C bytes today; cap the loop anyway
+#define EPI_POOL_TAG    'ipEE'
+
+// _ROM(Offset, Length, Arg2) -> Buffer. Arg2 selects a panel variant in some firmwares; spacewar ignores it.
+static NTSTATUS EpiReadRomChunk(const DXGKRNL_INTERFACE* pDxgk, ULONG Offset, ACPI_EVAL_OUTPUT_BUFFER* pOut, ULONG OutSize)
+{
+    PAGED_CODE();
+    // Header + three integer arguments (each ACPI_METHOD_ARGUMENT_LENGTH(sizeof(ULONG)) bytes).
+    const ULONG argLen = ACPI_METHOD_ARGUMENT_LENGTH(sizeof(ULONG));
+    const ULONG inSize = FIELD_OFFSET(ACPI_EVAL_INPUT_BUFFER_COMPLEX, Argument) + 3 * argLen;
+    DECLSPEC_ALIGN(8) UCHAR inBuf[FIELD_OFFSET(ACPI_EVAL_INPUT_BUFFER_COMPLEX, Argument) + 3 * ACPI_METHOD_ARGUMENT_LENGTH(sizeof(ULONG))];
+    RtlZeroMemory(inBuf, sizeof(inBuf));
+    ACPI_EVAL_INPUT_BUFFER_COMPLEX* pIn = reinterpret_cast<ACPI_EVAL_INPUT_BUFFER_COMPLEX*>(inBuf);
+    pIn->Signature = ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE;
+    pIn->MethodNameAsUlong = (ULONG)'MOR_';   // "_ROM"
+    pIn->Size = 3 * argLen;
+    pIn->ArgumentCount = 3;
+    PACPI_METHOD_ARGUMENT a = pIn->Argument;
+    ACPI_METHOD_SET_ARGUMENT_INTEGER(a, Offset);
+    a = ACPI_METHOD_NEXT_ARGUMENT(a);
+    ACPI_METHOD_SET_ARGUMENT_INTEGER(a, EPI_ROM_CHUNK);
+    a = ACPI_METHOD_NEXT_ARGUMENT(a);
+    ACPI_METHOD_SET_ARGUMENT_INTEGER(a, 0);
+
+    RtlZeroMemory(pOut, OutSize);
+    return pDxgk->DxgkCbEvalAcpiMethod(pDxgk->DeviceHandle, DISPLAY_ADAPTER_HW_ID, pIn, inSize, pOut, OutSize);
+}
+
+VOID EpiPanelLoad(_In_ const DXGKRNL_INTERFACE* pDxgk, _In_ PDEVICE_OBJECT Pdo, _Out_ EPI_PANEL* pPanel)
+{
+    PAGED_CODE();
+    RtlZeroMemory(pPanel, sizeof(*pPanel));
+
+    HANDLE hParams = NULL;
+    HANDLE hDiag = NULL;
+    if (!NT_SUCCESS(EpiOpenDiag(Pdo, &hParams, &hDiag))) { return; }
+
+    ULONG status = 0;
+    ULONG xmlLen = 0;
+    char* xml = NULL;
+    ACPI_EVAL_OUTPUT_BUFFER* out = NULL;
+    const ULONG outSize = FIELD_OFFSET(ACPI_EVAL_OUTPUT_BUFFER, Argument) + ACPI_METHOD_ARGUMENT_LENGTH(EPI_ROM_CHUNK) + 0x10;
+
+    if (EpiQueryDword(hParams, L"EpiDisablePanel", 0) != 0)
+    {
+        status = 1;
+        goto done;
+    }
+
+    xml = static_cast<char*>(ExAllocatePool2(POOL_FLAG_PAGED, EPI_XML_MAX, EPI_POOL_TAG));
+    out = static_cast<ACPI_EVAL_OUTPUT_BUFFER*>(ExAllocatePool2(POOL_FLAG_PAGED, outSize, EPI_POOL_TAG));
+    if (xml == NULL || out == NULL)
+    {
+        status = 2;
+        goto done;
+    }
+
+    while (xmlLen < EPI_XML_MAX)
+    {
+        NTSTATUS st = EpiReadRomChunk(pDxgk, xmlLen, out, outSize);
+        if (!NT_SUCCESS(st))
+        {
+            EpiSetDword(hDiag, L"PanelAcpiStatus", (ULONG)st);
+            status = 3;
+            goto done;
+        }
+        if (out->Signature != ACPI_EVAL_OUTPUT_BUFFER_SIGNATURE || out->Count < 1 ||
+            out->Argument[0].Type != ACPI_METHOD_ARGUMENT_BUFFER ||
+            out->Argument[0].DataLength > EPI_ROM_CHUNK ||
+            FIELD_OFFSET(ACPI_EVAL_OUTPUT_BUFFER, Argument) + ACPI_METHOD_ARGUMENT_LENGTH(out->Argument[0].DataLength) > outSize)
+        {
+            status = 4;
+            goto done;
+        }
+        ULONG got = out->Argument[0].DataLength;
+        // Past the end, _ROM returns Buffer(One){0}. A real 1-byte tail would only be the trailing NUL.
+        if (got <= 1) { break; }
+        if (got > EPI_XML_MAX - xmlLen) { got = EPI_XML_MAX - xmlLen; }
+        RtlCopyMemory(xml + xmlLen, out->Argument[0].Data, got);
+        xmlLen += got;
+        if (got < EPI_ROM_CHUNK) { break; }
+    }
+    EpiSetDword(hDiag, L"PanelXmlLen", xmlLen);
+    if (xmlLen == 0)
+    {
+        status = 4;
+        goto done;
+    }
+
+    {
+        int missing = -1;
+        int rc = EpiEdidFromPanelXml(xml, xmlLen, pPanel->Edid, &pPanel->Timing, &missing);
+        if (rc != EPI_EDID_OK)
+        {
+            EpiSetDword(hDiag, L"PanelMissingTag", (ULONG)missing);
+            status = 10 + (ULONG)rc;
+            goto done;
+        }
+    }
+    if (!IsEdidHeaderValid(pPanel->Edid) || !IsEdidChecksumValid(pPanel->Edid))
+    {
+        status = 20;
+        goto done;
+    }
+    pPanel->Valid = TRUE;
+    {
+        ULONG features = EpiQueryDword(hParams, L"EpiPanelFeatures", 1);
+        pPanel->UseEdid = (features & 1) ? TRUE : FALSE;
+        pPanel->UseSignal = (features & 2) ? TRUE : FALSE;
+        EpiSetDword(hDiag, L"PanelFeatures", features);
+    }
+    EpiSetValue(hDiag, L"Edid", REG_BINARY, pPanel->Edid, EPI_EDID_SIZE);
+    {
+        const EPI_PANEL_TIMING& t = pPanel->Timing;
+        WCHAR text[160];
+        if (NT_SUCCESS(RtlStringCchPrintfW(text, RTL_NUMBER_OF(text),
+                L"%ux%u h(fp%u bp%u sw%u) v(fp%u bp%u sw%u) refQ16=0x%X pclk10k=%u invH%u invV%u",
+                t.HActive, t.VActive, t.HFrontPorch, t.HBackPorch, t.HSyncPulse,
+                t.VFrontPorch, t.VBackPorch, t.VSyncPulse, t.RefreshQ16, t.PixelClock10kHz, t.InvertHsync, t.InvertVsync)))
+        {
+            EpiSetValue(hDiag, L"PanelTiming", REG_SZ, text, (ULONG)((wcslen(text) + 1) * sizeof(WCHAR)));
+        }
+    }
+
+done:
+    EpiSetDword(hDiag, L"PanelStatus", status);
+    if (out != NULL) { ExFreePoolWithTag(out, EPI_POOL_TAG); }
+    if (xml != NULL) { ExFreePoolWithTag(xml, EPI_POOL_TAG); }
+    ZwClose(hDiag);
+    ZwClose(hParams);
+}

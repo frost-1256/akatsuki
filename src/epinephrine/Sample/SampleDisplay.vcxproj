@@ -183,6 +183,17 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
+  <!-- Epinephrine: fixed DriverVer. stampinf otherwise stamps the build time (HH.MM.SS.mmm) as the version,
+       and for display drivers dxgkrnl reads the first field as the WDDM version: builds made after 21:00
+       got 21.x and AddDevice failed with STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182). Keep it at 20.x. -->
+  <PropertyGroup>
+    <EpiDriverVersion Condition="'$(EpiDriverVersion)'==''">20.0.2.4</EpiDriverVersion>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <Inf>
+      <TimeStamp>$(EpiDriverVersion)</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\BDD.cxx" />
     <ClCompile Include="..\BDD_DDI.cxx" />
@@ -192,6 +203,8 @@
     <ClCompile Include="..\BltHw.cxx" />
     <ClCompile Include="..\memory.cxx" />
     <ClCompile Include="..\epi_hw.cxx" />
+    <ClCompile Include="..\epi_edid.cxx" />
+    <ClCompile Include="..\epi_panel.cxx" />
     <ResourceCompile Include="..\sampledisplay.rc" />
   </ItemGroup>
   <ItemGroup>

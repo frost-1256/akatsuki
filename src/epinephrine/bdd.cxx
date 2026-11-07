@@ -24,6 +24,8 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     RtlZeroMemory(&m_StartInfo, sizeof(m_StartInfo));
     RtlZeroMemory(m_CurrentModes, sizeof(m_CurrentModes));
     RtlZeroMemory(&m_DeviceInfo, sizeof(m_DeviceInfo));
+    RtlZeroMemory(&m_EpiRes, sizeof(m_EpiRes));
+    RtlZeroMemory(&m_Panel, sizeof(m_Panel));
 
 
     for (UINT i=0;i<MAX_VIEWS;i++)
@@ -73,6 +75,10 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
     // Epinephrine (Akatsuki) WP2b-1: one-shot read-only snapshot of the display block into
     // Device Parameters\EpiDiag. Diagnostic only; the start path does not depend on it.
     EpiHwSnapshot(&m_DeviceInfo, &m_EpiRes);
+
+    // Epinephrine (Akatsuki) WP2b-2: panel EDID and timing from GPU0 _ROM (PCFG). On failure m_Panel.Valid
+    // stays FALSE and the KMDOD behaviour (no EDID, POST mode with unspecified frequencies) is kept.
+    EpiPanelLoad(&m_DxgkInterface, m_DeviceInfo.PhysicalDeviceObject, &m_Panel);
 
     // TODO: Uncomment the line below after updating the TODOs in the function CheckHardware
 //    Status = CheckHardware();
@@ -554,6 +560,14 @@ NTSTATUS BASIC_DISPLAY_DRIVER::GetEdid(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId)
     NTSTATUS Status = STATUS_SUCCESS;
     RtlZeroMemory(m_EDIDs[TargetId], sizeof(m_EDIDs[TargetId]));
 
+    // Epinephrine: the integrated panel EDID is synthesized from PCFG in StartDevice (EpiPanelLoad).
+    if (m_Panel.Valid && m_Panel.UseEdid && TargetId < MAX_CHILDREN)
+    {
+        RtlCopyMemory(m_EDIDs[TargetId], m_Panel.Edid, EDID_V1_BLOCK_SIZE);
+        m_Flags.EDID_Retrieved = TRUE;
+        m_Flags.EDID_ValidHeader = IsEdidHeaderValid(m_EDIDs[TargetId]);
+        m_Flags.EDID_ValidChecksum = IsEdidChecksumValid(m_EDIDs[TargetId]);
+    }
 
     m_Flags.EDID_Attempted = TRUE;
 

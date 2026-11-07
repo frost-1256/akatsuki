@@ -208,6 +208,8 @@ private:
 
     // Epinephrine: display resources found in StartDevice (EpiHwSnapshot)
     EPI_HW_RESOURCES m_EpiRes;
+    // Epinephrine: panel EDID/timing from PCFG (WP2b-2)
+    EPI_PANEL m_Panel;
 
 public:
     BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceObject);

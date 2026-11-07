@@ -47,3 +47,46 @@ StartDevice で一度だけ、GPU0 の `_CRS` から MDP_REGS（0x0AE00000、長
 - PCFG（`_ROM`）からの EDID 合成と、モード 1080×2400@60 の通知。
 - VSYNC：IRQ 0x73 は MDSS が共有する線。割り込みが止まらなくなるおそれがあるため、まずは ISR で数えるだけにし、マスク方法を決めてから有効にする。
 - 診断用の Escape／Ioctl（EpiDiag をユーザーモードから取れるようにする）。
+
+---
+
+# WP2b-2 レポート：PCFG からの EDID 合成（2026-11-07）
+
+## 変更
+- `src/epinephrine/epi_edid.hxx` / `epi_edid.cxx`（新規、MIT）
+  - パネル XML（PCFG）から EDID 1.x の基本ブロック（128 バイト）を作る。カーネル用ヘッダに依存しないので、ドライバにもホスト側のテストにも同じファイルが入る。
+  - 構成は qcdxkm7325 が作ったもの（モニタ SHP1C70）と同じ。
+    - ヘッダ、ベンダ、色度：`EDID Configuration` グループの値をそのまま使う。
+    - 確立タイミングと標準タイミング：使わない。
+    - DTD1：Active Timing。ピクセルクロックは htotal×vtotal×DSIRefreshRate を 10 kHz 単位で切り捨てた値。
+    - DTD3：名前（PanelName の先頭 13 文字）。DTD2 と DTD4 は空き。
+- `src/epinephrine/epi_panel.cxx`（新規、MIT）
+  - StartDevice で GPU0 の `_ROM(offset, 0x1000, 0)` を `DxgkCbEvalAcpiMethod`（`DISPLAY_ADAPTER_HW_ID`）で繰り返し呼び、PCFG 全体を読む。
+  - EpiDiag に記録する値：PanelStatus、PanelXmlLen、Edid、PanelTiming。
+  - 止め方は `EpiDisablePanel=1`。提示する内容は `EpiPanelFeatures` で選ぶ（bit0＝EDID、bit1＝実際のタイミング、既定は 1）。
+- `bdd.cxx` の GetEdid：合成した EDID を `QueryDeviceDescriptor` で返す。
+- `bdd_dmm.cxx`：`EpiApplyPanelSignal` を追加した。ターゲットモードとモニタモードに実際のタイミングを入れるもので、bit1 のときだけ有効（下記の未解決事項）。
+- `tools/edid_test/`：ホスト側のテスト。`build.cmd <EWDKドライブ>` でビルドし、`edid_test.exe <panel.xml> golden_shp1c70.hex` で実行する。黄金値は電話のレジストリ（`Enum\DISPLAY\SHP1C70\...\EDID`）から取った。
+- `Sample/SampleDisplay.vcxproj`：**DriverVer を固定した**（`EpiDriverVersion`、現在 20.0.2.4。下記の判明事項）。
+
+## 結果
+- ホスト側のテスト：PCFG から合成した EDID が、黄金値と 128 バイトすべて一致した。
+- 実機（oem61、v33-akat）
+  - PanelStatus=0、PanelXmlLen=5756。電話の `_ROM` から読んで合成した EDID も、黄金値と一致した。
+  - モニタは `Default_Monitor` から `SHP1C70`「Generic Monitor (RM692E5 Visio)」に変わった。
+  - 1080×2400 で、**画面は正常に映った**。
+
+## 判明事項
+1. **DriverVer はビルド時刻から付いていた**
+   - 原因：stampinf の既定では「時.分.秒.ミリ秒」が DriverVer になる。表示ドライバでは先頭の数字が WDDM のバージョンとして扱われる。
+   - 症状：21 時以降にビルドした版（21.x）は、AddDevice が `CM_PROB_FAILED_ADD`（problem status 0xC0000182 `STATUS_DEVICE_CONFIGURATION_ERROR`）で失敗した。その場での入れ替えも「再起動が必要」になり、再起動しても失敗した。
+   - 対処：`EpiDriverVersion` で 20.x に固定した。
+2. **実際のタイミングを提示すると真っ黒になる（未解決）**
+   - 症状：ターゲットモードとモニタモードに TotalSize 1181×2453、PixelRate、HSync、VSync を入れると、ドライバは OK のまま表示経路が有効にならず、画面が真っ黒になった。
+     - EDID の丸めた値（59.997 Hz）でも、qcdxkm と同じ値（60000/1000、PixelRate 173,819,580）でも同じだった。
+     - EDID だけ（周波数は未指定）なら映る。
+   - 試したこと：古い表示構成（qcdxkm 時代の SHP1C70 構成と MSNIL 構成）を消しても、変わらなかった（バックアップは電話の `C:\Epinephrine\diag\GraphicsDrivers_before_wp2b2fix.reg`）。
+   - 次の手：dxgkrnl の ETW を採る。DOD での TotalSize≠ActiveSize の扱い、モニタモードとターゲットモードの照合を確認する。
+
+## レビュー
+- Codex の残量が少ないため、別主体レビューは未実施（Claude の自己確認のみ）。
