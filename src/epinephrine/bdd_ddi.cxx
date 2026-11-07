@@ -196,7 +196,9 @@ BddDdiSetPowerState(
         // of the hardware in this case.
         return STATUS_SUCCESS;
     }
-    return pBDD->SetPowerState(HardwareUid, DevicePowerState, ActionType);
+    NTSTATUS st = pBDD->SetPowerState(HardwareUid, DevicePowerState, ActionType);
+    pBDD->EpiTrace(L"Pwr uid%X D%u act%u st%X", HardwareUid, (ULONG)DevicePowerState, (ULONG)ActionType, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -222,7 +224,9 @@ BddDdiQueryChildStatus(
     BDD_ASSERT_CHK(pDeviceContext != NULL);
 
     BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(pDeviceContext);
-    return pBDD->QueryChildStatus(pChildStatus, NonDestructiveOnly);
+    NTSTATUS st = pBDD->QueryChildStatus(pChildStatus, NonDestructiveOnly);
+    pBDD->EpiTrace(L"ChSt t%u c%u st%X", (ULONG)pChildStatus->Type, (ULONG)pChildStatus->HotPlug.Connected, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -317,7 +321,9 @@ BddDdiPresentDisplayOnly(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->PresentDisplayOnly(pPresentDisplayOnly);
+    NTSTATUS st = pBDD->PresentDisplayOnly(pPresentDisplayOnly);
+    pBDD->EpiCountPresent(st);
+    return st;
 }
 
 NTSTATUS
@@ -331,6 +337,7 @@ BddDdiStopDeviceAndReleasePostDisplayOwnership(
     BDD_ASSERT_CHK(pDeviceContext != NULL);
 
     BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(pDeviceContext);
+    pBDD->EpiTrace(L"StopRelPost tg%u", TargetId);
     return pBDD->StopDeviceAndReleasePostDisplayOwnership(TargetId, DisplayInfo);
 }
 
@@ -352,7 +359,9 @@ BddDdiIsSupportedVidPn(
         BDD_LOG_WARNING1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->IsSupportedVidPn(pIsSupportedVidPn);
+    NTSTATUS st = pBDD->IsSupportedVidPn(pIsSupportedVidPn);
+    pBDD->EpiTrace(L"IsSup h%p ok%u st%X", pIsSupportedVidPn->hDesiredVidPn, (ULONG)pIsSupportedVidPn->IsVidPnSupported, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -406,7 +415,9 @@ BddDdiRecommendMonitorModes(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->RecommendMonitorModes(pRecommendMonitorModes);
+    NTSTATUS st = pBDD->RecommendMonitorModes(pRecommendMonitorModes);
+    pBDD->EpiTrace(L"RecMon tg%u st%X", pRecommendMonitorModes->VideoPresentTargetId, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -424,7 +435,9 @@ BddDdiEnumVidPnCofuncModality(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->EnumVidPnCofuncModality(pEnumCofuncModality);
+    NTSTATUS st = pBDD->EnumVidPnCofuncModality(pEnumCofuncModality);
+    pBDD->EpiTrace(L"Cofunc piv%u s%u t%u st%X", (ULONG)pEnumCofuncModality->EnumPivotType, pEnumCofuncModality->EnumPivot.VidPnSourceId, pEnumCofuncModality->EnumPivot.VidPnTargetId, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -442,7 +455,9 @@ BddDdiSetVidPnSourceVisibility(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->SetVidPnSourceVisibility(pSetVidPnSourceVisibility);
+    NTSTATUS st = pBDD->SetVidPnSourceVisibility(pSetVidPnSourceVisibility);
+    pBDD->EpiTrace(L"Vis s%u v%u st%X", pSetVidPnSourceVisibility->VidPnSourceId, (ULONG)pSetVidPnSourceVisibility->Visible, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -460,7 +475,9 @@ BddDdiCommitVidPn(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->CommitVidPn(pCommitVidPn);
+    NTSTATUS st = pBDD->CommitVidPn(pCommitVidPn);
+    pBDD->EpiTrace(L"Commit h%p s%u off%u mc%u st%X", pCommitVidPn->hFunctionalVidPn, pCommitVidPn->AffectedVidPnSourceId, (ULONG)pCommitVidPn->Flags.PathPoweredOff, (ULONG)pCommitVidPn->MonitorConnectivityChecks, (ULONG)st);
+    return st;
 }
 
 NTSTATUS
@@ -478,7 +495,9 @@ BddDdiUpdateActiveVidPnPresentPath(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
-    return pBDD->UpdateActiveVidPnPresentPath(pUpdateActiveVidPnPresentPath);
+    NTSTATUS st = pBDD->UpdateActiveVidPnPresentPath(pUpdateActiveVidPnPresentPath);
+    pBDD->EpiTrace(L"UpdPath st%X", (ULONG)st);
+    return st;
 }
 
 NTSTATUS

@@ -67,7 +67,7 @@ StartDevice で一度だけ、GPU0 の `_CRS` から MDP_REGS（0x0AE00000、長
 - `bdd.cxx` の GetEdid：合成した EDID を `QueryDeviceDescriptor` で返す。
 - `bdd_dmm.cxx`：`EpiApplyPanelSignal` を追加した。ターゲットモードとモニタモードに実際のタイミングを入れるもので、bit1 のときだけ有効（下記の未解決事項）。
 - `tools/edid_test/`：ホスト側のテスト。`build.cmd <EWDKドライブ>` でビルドし、`edid_test.exe <panel.xml> golden_shp1c70.hex` で実行する。黄金値は電話のレジストリ（`Enum\DISPLAY\SHP1C70\...\EDID`）から取った。
-- `Sample/SampleDisplay.vcxproj`：**DriverVer を固定した**（`EpiDriverVersion`、現在 20.0.2.4。下記の判明事項）。
+- `Sample/SampleDisplay.vcxproj`：**DriverVer を固定した**（`EpiDriverVersion`、現在 20.0.2.12。下記の判明事項）。
 
 ## 結果
 - ホスト側のテスト：PCFG から合成した EDID が、黄金値と 128 バイトすべて一致した。
@@ -81,12 +81,20 @@ StartDevice で一度だけ、GPU0 の `_CRS` から MDP_REGS（0x0AE00000、長
    - 原因：stampinf の既定では「時.分.秒.ミリ秒」が DriverVer になる。表示ドライバでは先頭の数字が WDDM のバージョンとして扱われる。
    - 症状：21 時以降にビルドした版（21.x）は、AddDevice が `CM_PROB_FAILED_ADD`（problem status 0xC0000182 `STATUS_DEVICE_CONFIGURATION_ERROR`）で失敗した。その場での入れ替えも「再起動が必要」になり、再起動しても失敗した。
    - 対処：`EpiDriverVersion` で 20.x に固定した。
-2. **実際のタイミングを提示すると真っ黒になる（未解決）**
-   - 症状：ターゲットモードとモニタモードに TotalSize 1181×2453、PixelRate、HSync、VSync を入れると、ドライバは OK のまま表示経路が有効にならず、画面が真っ黒になった。
-     - EDID の丸めた値（59.997 Hz）でも、qcdxkm と同じ値（60000/1000、PixelRate 173,819,580）でも同じだった。
-     - EDID だけ（周波数は未指定）なら映る。
-   - 試したこと：古い表示構成（qcdxkm 時代の SHP1C70 構成と MSNIL 構成）を消しても、変わらなかった（バックアップは電話の `C:\Epinephrine\diag\GraphicsDrivers_before_wp2b2fix.reg`）。
-   - 次の手：dxgkrnl の ETW を採る。DOD での TotalSize≠ActiveSize の扱い、モニタモードとターゲットモードの照合を確認する。
+2. **実際の周波数を提示すると真っ黒になる（原因判明）**
+   - 症状：ターゲットモードに PixelRate、HSync、VSync を入れると、ドライバは OK のまま表示経路が有効にならず、画面が真っ黒になった。
+   - 原因：VidPn の DDI に一時的なトレース（`EpiDiag\VidPnLog`）を入れて調べた。ターゲットの `pfnAddMode` が `STATUS_GRAPHICS_INVALID_FREQUENCY`（0xC01E030A）を返し、その結果 EnumVidPnCofuncModality が失敗して、経路が一度もコミットされていなかった。
+     - レジストリのスイッチで項目ごとに入れ、デバイスの再起動だけで切り分けた。3 つのうちどれか 1 つだけでも拒否された。値の形（mHz/1000、整数 Hz、EDID と完全に一致する有理数）には関係がない。
+     - 次のことも試したが、効かなかった。
+       - `VSyncFreqDivider=1`（モニタモードまで拒否されるようになった。0 が正しい）
+       - `MinimumVSyncFreq` を VSync と同じ値にする（初期値は 0xFFFFFFFF）
+       - EDID に Range Limits 記述子（0xFD）を加える（dxgkrnl が読み直していることはトレースで確認した）
+     - 受け付けられたもの：ターゲットモードの TotalSize（1181×2453、ブランキング込み）、モニタモードの周波数。
+   - 根拠：Microsoft の資料（Saving energy with VSync control）に次のとおりある。VSync 制御（`DxgkDdiControlInterrupt`、`DxgkDdiGetScanLine`、ISR／DPC で VSync を通知すること）を持たない表示専用ドライバは、この 3 つを `D3DKMDT_FREQUENCY_NOTSPECIFIED` にする。VSync 制御を持つドライバでは、逆に指定が必須になる。Epinephrine（KMDOD 由来）は VSync 制御を持たない。
+   - 対処：`EpiPanelFeatures` の bit1 は、TotalSize（ブランキング込み）だけを入れるようにした。周波数は未指定のままにする。実機（20.0.2.12、features=3）では、AddTgt が st0 になり、Present が通り、1080×2400 で動いた。既定値は 1 のまま。
+   - 実際の周波数は、VSync 割り込み（IRQ 0x73）を実装してから入れる（そのときは必須になる）。
+   - 途中で試した、古い表示構成（qcdxkm 時代の SHP1C70 構成と MSNIL 構成）の削除は関係がなかった（バックアップは電話の `C:\Epinephrine\diag\GraphicsDrivers_before_wp2b2fix.reg`）。
+3. **DDI トレース**：`EpiDiag\VidPnLog` は残した。VidPn、子デバイスの状態、電源、EDID の読み出し、Present（初回、失敗時、256 回ごと）の DDI と、その戻り値が記録される。
 
 ## レビュー
 - Codex の残量が少ないため、別主体レビューは未実施（Claude の自己確認のみ）。

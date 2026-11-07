@@ -44,7 +44,7 @@ typedef struct _EPI_PANEL
 {
     BOOLEAN          Valid;                 // EDID synthesized and timing usable
     BOOLEAN          UseEdid;               // EpiPanelFeatures bit0: report the EDID to the OS
-    BOOLEAN          UseSignal;             // EpiPanelFeatures bit1: report real signal timing in target/monitor modes
+    BOOLEAN          UseSignal;             // EpiPanelFeatures bit1: report the real TotalSize in target/monitor modes
     EPI_PANEL_TIMING Timing;
     UCHAR            Edid[EPI_EDID_SIZE];
 } EPI_PANEL;
@@ -54,7 +54,9 @@ typedef struct _EPI_PANEL
 // PanelStatus: 0 ok, 1 disabled (Device Parameters\EpiDisablePanel != 0), 2 no memory, 3 _ROM eval failed
 // (PanelAcpiStatus), 4 unexpected _ROM output, 10 + EPI_EDID_* synthesis error (PanelMissingTag).
 // Device Parameters\EpiPanelFeatures (DWORD, default 1 = EDID only) selects what is reported when Valid.
-// bit1 (real signal timing in target/monitor modes) gives a black screen on spacewar (2026-11-07, open issue).
+// bit1 reports the real TotalSize (with blanking) only. VSync/HSync/PixelRate stay NOTSPECIFIED: a display-only
+// driver without VSync control (DxgkDdiControlInterrupt/GetScanLine) must not specify them, and pfnAddMode rejects
+// such target modes with STATUS_GRAPHICS_INVALID_FREQUENCY (black screen, bisected 2026-11-07).
 // On any failure Valid stays FALSE and the driver keeps the KMDOD behaviour (no EDID, POST mode only).
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID EpiPanelLoad(_In_ const DXGKRNL_INTERFACE* pDxgk, _In_ PDEVICE_OBJECT Pdo, _Out_ EPI_PANEL* pPanel);

@@ -248,6 +248,13 @@ NTSTATUS BASIC_DISPLAY_DRIVER::EnumVidPnCofuncModality(_In_ CONST DXGKARG_ENUMVI
             }
 
             // If there's no pinned target add possible modes (otherwise they've already been added)
+            if (pVidPnPinnedTargetModeInfo != NULL)
+            {
+                EpiTrace(L"PinTgt tot%ux%u act%ux%u v%u/%u",
+                         pVidPnPinnedTargetModeInfo->VideoSignalInfo.TotalSize.cx, pVidPnPinnedTargetModeInfo->VideoSignalInfo.TotalSize.cy,
+                         pVidPnPinnedTargetModeInfo->VideoSignalInfo.ActiveSize.cx, pVidPnPinnedTargetModeInfo->VideoSignalInfo.ActiveSize.cy,
+                         pVidPnPinnedTargetModeInfo->VideoSignalInfo.VSyncFreq.Numerator, pVidPnPinnedTargetModeInfo->VideoSignalInfo.VSyncFreq.Denominator);
+            }
             if (pVidPnPinnedTargetModeInfo == NULL)
             {
                 // Release the acquired target mode set, since going to create a new one to put all modes in
@@ -974,21 +981,16 @@ static VOID EpiApplyPanelSignal(_In_ const EPI_PANEL* pPanel, _In_ const DXGK_DI
         return;
     }
     const EPI_PANEL_TIMING& t = pPanel->Timing;
-    const UINT htotal = t.HActive + t.HFrontPorch + t.HBackPorch + t.HSyncPulse;
-    const UINT vtotal = t.VActive + t.VFrontPorch + t.VBackPorch + t.VSyncPulse;
-    // Frequencies from the exact PCFG refresh (16.16), in mHz, as qcdxkm7325 reported them for the same EDID
-    // (CCD database on spacewar: VSync 60000/1000, HSync 147180000/1000, PixelRate 173819580).
-    // Deriving them from the truncated EDID pixel clock (59.997 Hz) gave a black screen (2026-11-07).
-    const UINT vsyncMilliHz = (UINT)(((UINT64)t.RefreshQ16 * 1000) >> 16);
-    pSignal->TotalSize.cx = htotal;
-    pSignal->TotalSize.cy = vtotal;
+    pSignal->TotalSize.cx = t.HActive + t.HFrontPorch + t.HBackPorch + t.HSyncPulse;
+    pSignal->TotalSize.cy = t.VActive + t.VFrontPorch + t.VBackPorch + t.VSyncPulse;
     pSignal->ActiveSize.cx = t.HActive;
     pSignal->ActiveSize.cy = t.VActive;
-    pSignal->PixelRate = ((UINT64)htotal * vtotal * vsyncMilliHz) / 1000;
-    pSignal->HSyncFreq.Numerator = vtotal * vsyncMilliHz;
-    pSignal->HSyncFreq.Denominator = 1000;
-    pSignal->VSyncFreq.Numerator = vsyncMilliHz;
-    pSignal->VSyncFreq.Denominator = 1000;
+    // VSyncFreq / HSyncFreq / PixelRate stay D3DKMDT_FREQUENCY_NOTSPECIFIED. Epinephrine has no VSync control
+    // (no DxgkDdiControlInterrupt / DxgkDdiGetScanLine), and for such a display-only driver dxgkrnl rejects any
+    // specified frequency in a target mode with STATUS_GRAPHICS_INVALID_FREQUENCY (0xC01E030A); cofunc then fails
+    // and no path is set (black screen). Bisected on spacewar 2026-11-07: each of the three alone is rejected,
+    // independent of the value (mHz, integer Hz, exact EDID fractions), VSyncFreqDivider, MinimumVSyncFreq or an
+    // EDID range-limits descriptor. Report them once VSync interrupts are implemented (they are then required).
 }
 
 // Add the current mode information (acquired from the POST frame buffer) as the target mode.
@@ -1024,6 +1026,12 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMO
     pVidPnTargetModeInfo->Preference = D3DKMDT_MP_PREFERRED;
 
     Status = pVidPnTargetModeSetInterface->pfnAddMode(hVidPnTargetModeSet, pVidPnTargetModeInfo);
+    EpiTrace(L"AddTgt tot%ux%u act%ux%u v%u/%u h%u/%u pr%I64u st%X",
+             pVidPnTargetModeInfo->VideoSignalInfo.TotalSize.cx, pVidPnTargetModeInfo->VideoSignalInfo.TotalSize.cy,
+             pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize.cx, pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize.cy,
+             pVidPnTargetModeInfo->VideoSignalInfo.VSyncFreq.Numerator, pVidPnTargetModeInfo->VideoSignalInfo.VSyncFreq.Denominator,
+             pVidPnTargetModeInfo->VideoSignalInfo.HSyncFreq.Numerator, pVidPnTargetModeInfo->VideoSignalInfo.HSyncFreq.Denominator,
+             pVidPnTargetModeInfo->VideoSignalInfo.PixelRate, (ULONG)Status);
     if (!NT_SUCCESS(Status))
     {
         if (Status != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET)
@@ -1087,6 +1095,8 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMEND
     pMonitorSourceMode->ColorCoeffDynamicRanges.FourthChannel = 8;
 
     Status = pRecommendMonitorModes->pMonitorSourceModeSetInterface->pfnAddMode(pRecommendMonitorModes->hMonitorSourceModeSet, pMonitorSourceMode);
+    EpiTrace(L"AddMon v%u/%u st%X", pMonitorSourceMode->VideoSignalInfo.VSyncFreq.Numerator,
+             pMonitorSourceMode->VideoSignalInfo.VSyncFreq.Denominator, (ULONG)Status);
     if (!NT_SUCCESS(Status))
     {
         if (Status != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET)

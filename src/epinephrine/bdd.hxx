@@ -210,6 +210,14 @@ private:
     EPI_HW_RESOURCES m_EpiRes;
     // Epinephrine: panel EDID/timing from PCFG (WP2b-2)
     EPI_PANEL m_Panel;
+    // Epinephrine: DDI call trace (WP2b-2 timing investigation), mirrored to EpiDiag\VidPnLog
+    WCHAR m_EpiLog[3072];
+    ULONG m_EpiLogSeq;
+    ULONG m_EpiPresentCount;
+public:
+    VOID EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format, ...);
+    VOID EpiCountPresent(NTSTATUS Status);
+private:
 
 public:
     BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceObject);

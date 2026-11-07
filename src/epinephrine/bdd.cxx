@@ -26,6 +26,9 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     RtlZeroMemory(&m_DeviceInfo, sizeof(m_DeviceInfo));
     RtlZeroMemory(&m_EpiRes, sizeof(m_EpiRes));
     RtlZeroMemory(&m_Panel, sizeof(m_Panel));
+    m_EpiLog[0] = 0;
+    m_EpiLogSeq = 0;
+    m_EpiPresentCount = 0;
 
 
     for (UINT i=0;i<MAX_VIEWS;i++)
@@ -256,6 +259,8 @@ NTSTATUS BASIC_DISPLAY_DRIVER::QueryDeviceDescriptor(_In_    ULONG              
     {
         GetEdid(ChildUid);
     }
+    EpiTrace(L"Desc c%u off%u len%u ok%u d2tag%X", ChildUid, pDeviceDescriptor->DescriptorOffset, pDeviceDescriptor->DescriptorLength,
+             (ULONG)(m_Flags.EDID_Retrieved && m_Flags.EDID_ValidHeader && m_Flags.EDID_ValidChecksum), (ULONG)m_EDIDs[ChildUid][75]);
 
     if (!m_Flags.EDID_Retrieved || !m_Flags.EDID_ValidHeader || !m_Flags.EDID_ValidChecksum)
     {

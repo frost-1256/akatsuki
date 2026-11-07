@@ -138,3 +138,44 @@ done:
     ZwClose(hDiag);
     ZwClose(hParams);
 }
+
+// ---- DDI call trace (WP2b-2 timing investigation) ----
+// Appends "<seq>:<text>;" to an in-memory log (first ~3000 chars since start are kept) and mirrors it to
+// EpiDiag\VidPnLog. Called from PASSIVE_LEVEL DDIs only (VidPn, child status, power, present count).
+VOID BASIC_DISPLAY_DRIVER::EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format, ...)
+{
+    PAGED_CODE();
+    WCHAR line[192];
+    va_list args;
+    va_start(args, Format);
+    NTSTATUS st = RtlStringCchVPrintfW(line, RTL_NUMBER_OF(line), Format, args);
+    va_end(args);
+    if (!NT_SUCCESS(st) && st != STATUS_BUFFER_OVERFLOW) { return; }
+    WCHAR head[16];
+    if (!NT_SUCCESS(RtlStringCchPrintfW(head, RTL_NUMBER_OF(head), L"%u:", ++m_EpiLogSeq))) { return; }
+    size_t used = 0;
+    if (!NT_SUCCESS(RtlStringCchLengthW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), &used))) { return; }
+    if (used + wcslen(head) + wcslen(line) + 2 >= RTL_NUMBER_OF(m_EpiLog)) { return; }   // full: keep the beginning
+    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), head);
+    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), line);
+    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), L";");
+
+    HANDLE hParams = NULL;
+    HANDLE hDiag = NULL;
+    if (!NT_SUCCESS(EpiOpenDiag(m_pPhysicalDevice, &hParams, &hDiag))) { return; }
+    EpiSetValue(hDiag, L"VidPnLog", REG_SZ, m_EpiLog, (ULONG)((wcslen(m_EpiLog) + 1) * sizeof(WCHAR)));
+    EpiSetDword(hDiag, L"PresentCount", m_EpiPresentCount);
+    ZwClose(hDiag);
+    ZwClose(hParams);
+}
+
+VOID BASIC_DISPLAY_DRIVER::EpiCountPresent(NTSTATUS Status)
+{
+    PAGED_CODE();
+    ++m_EpiPresentCount;
+    // Trace the first present, failures, and then every 256th (keeps the registry traffic low).
+    if (m_EpiPresentCount == 1 || !NT_SUCCESS(Status) || (m_EpiPresentCount & 0xFF) == 0)
+    {
+        EpiTrace(L"Present#%u st%X", m_EpiPresentCount, (ULONG)Status);
+    }
+}
