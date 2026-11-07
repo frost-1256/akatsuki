@@ -9,6 +9,8 @@
 #define EPI_MDP_REGS_LEN     0x00200000ULL
 #define EPI_DP_PHY_REGS_BASE 0x088E0000ULL   // RESI "DP_PHY_REGS" (DISPLAY)
 #define EPI_DP_PHY_REGS_LEN  0x00010000ULL
+#define EPI_GPU_CC_BASE      0x03D90000ULL   // RESI "GPU_CC"      (GPU G1a)
+#define EPI_GPU_CC_LEN       0x00009000ULL
 
 typedef struct _EPI_HW_RESOURCES
 {
@@ -16,6 +18,7 @@ typedef struct _EPI_HW_RESOURCES
     PHYSICAL_ADDRESS MdpBase;
     ULONG            MdpLength;
     BOOLEAN          DpPhyFound;
+    BOOLEAN          GpuCcFound;
     ULONG            MemoryCount;
     ULONG            InterruptCount;
     ULONG            ConnectionCount;
@@ -37,6 +40,14 @@ VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOUR
 // EpiVsyncProbe bit1 (one shot) also reads the INTF TE interrupt block (MDP + 0x36800): ProbeTearBefore/After.
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
+
+// GPU G1a (epi_gpu.cxx): one-shot read-only GPU_CC state probe, StartDevice after EpiVsyncProbe.
+// Runs only when Device Parameters\EpiGpuProbe != 0; that value is cleared and flushed before any access.
+// Reads GCC GPU branch clocks first and GPU_CC only if GCC_GPU_CFG_AHB_CLK is on. Non-volatile breadcrumb
+// Device Parameters\EpiGpuProbeStep (0x1xx GCC, 0x2xx GPU_CC index, 0xFFFF returned).
+// EpiDiag: GpuProbeStatus, GpuProbe (REG_BINARY {phys, value} pairs), GpuProbeText.
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
 
 // EpiDiag registry helpers (shared by the snapshot and the panel loader).
 // EpiOpenDiag opens <device key>\Device Parameters and its volatile EpiDiag subkey; close both handles with ZwClose.

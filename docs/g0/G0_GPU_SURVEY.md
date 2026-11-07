@@ -98,9 +98,28 @@
 
 おすすめ：A の G1a〜G1c（GMU の起動まで）は、どちらの案にも役立つ観測になる。B を選ぶ場合でも、GX のクロックと GMU の挙動を自分で確かめたことは、qcdxkm の失敗を切り分ける材料になる。
 
+### 7.1 決定（2026-11-07）：A
+
+ユーザーの判断で A（自作のオープンソース KMD）に決めた。B（qcdxkm を描画専用で使う案）は取らない。
+
+クリーンルームの方針：
+- 本家 Linux（GPL）は、レジスタの位置や手順の順番といった**事実を調べるため**にだけ使う。コードは写さない。Epinephrine は MIT のまま保つ。
+- qcdxkm の解析レポート（GX 系）は、**どこで失敗するか、どこが危ないか**を知るためにだけ使う。コードや手順の出どころにはしない。
+
+## 8. G1a の実装（v24、20.0.2.24）
+
+`src/epinephrine/epi_gpu.cxx`（MIT）。読むだけで、書き込みはしない。既定では動かない。
+
+- 起動：`Device Parameters\EpiGpuProbe` を 0 以外にする。ハードウェアに触る前に 0 に戻して書き込みを確定（flush）するので、止まっても次の起動では繰り返さない。
+- 順番：
+  1. GCC（0x100000）の GPU 用ブランチクロック 4 つ（0x71004 `GPU_CFG_AHB`、0x7100C、0x71018、0x71154）を読む。GCC は常にクロックが入っている。`GPU_CFG_AHB` は本家 Linux が「常に ON」にしているクロック。
+  2. `GPU_CFG_AHB` の CBCR bit31（CLK_OFF）が 0 のときだけ、GPU_CC（0x3D90000）の 20 個のレジスタを読む。PLL0/1 の MODE、GX/CX の GDSCR、各 CBCR、GMU/HUB の RCG、0x1534（リミッタの状態）、0x5000 が対象。0x153C（リミッタの解除）は読まない。
+- ブレッドクラム：読む直前ごとに `Device Parameters\EpiGpuProbeStep` に番号を書いて flush する。番号の意味は、0x1xx が GCC、0x2xx が GPU_CC の何番目か、0xFFFF が最後まで戻ったこと。
+- 結果は EpiDiag に書く：`GpuProbeStatus`（0 完了、1 無効、2 _CRS に GPU_CC がない、3 メモリ不足、4 マップ失敗、5 `GPU_CFG_AHB` が OFF なので GPU_CC は読まなかった）、`GpuProbe`（{物理アドレス, 値} の組）、`GpuProbeText`。
+
 ## 参照
 
-- 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/gpucc-sc7280.c`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
+- 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
 - DSDT v33-akat：`\_SB.PEP0.G0MD / G4MD / G5MD`、`\_SB.GPU0._CRS / RESI`
 - silicium/opus-session/report_qcdx_gx*.md（特に GX6、GX7、GX8、GX22、GX23）、session-logs/kd_gx_measure_2026-10-31.txt
 - goals/.../GPU_STATUS_AND_OPTIONS.md、ANALYSIS_RESULTS.md（Kodiak パックの WDDM スタック）

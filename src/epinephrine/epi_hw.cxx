@@ -109,6 +109,10 @@ static VOID EpiScanResources(const DXGK_DEVICE_INFO* pDeviceInfo, EPI_HW_RESOURC
                 {
                     pRes->DpPhyFound = TRUE;
                 }
+                else if (start == EPI_GPU_CC_BASE && len == EPI_GPU_CC_LEN)
+                {
+                    pRes->GpuCcFound = TRUE;
+                }
                 RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"mem %I64X+%X; ", start, len);
                 break;
             }
