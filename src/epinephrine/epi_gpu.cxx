@@ -61,7 +61,7 @@ static const EPI_GPU_REG g_EpiGpuCcRegs[] = {
 };
 
 #define EPI_GPU_NREGS (RTL_NUMBER_OF(g_EpiGccRegs) + RTL_NUMBER_OF(g_EpiGpuCcRegs))
-#define EPI_GPU_TEXT_CCH 1536
+#define EPI_GPU_TEXT_CCH 3072
 
 static VOID EpiGpuStep(HANDLE hParams, ULONG Step)
 {
@@ -239,9 +239,260 @@ static VOID EpiSmmuDump(HANDLE hParams, HANDLE hDiag, PWCHAR Text)
     EpiSetValue(hDiag, L"GpuSmmu", REG_BINARY, v, sizeof(v));
 }
 
+// ---- G1c-2a (bit5): SMMU register access test, no DMA/page tables ----
+// Register facts only: Arm SMMUv2 / SMMU-500 and mainline arm-smmu.h.
+// IDR1 on this device places GR1 at +0x1000, CB0 at +0x10000.
+#define EPI_SMMU_WRITE_LEN 0x17000
+typedef struct _EPI_SMMU_WRITE {
+    ULONG Offset, Original, Written, Readback, Restored;
+} EPI_SMMU_WRITE;
+
+static BOOLEAN EpiSmmuWriteTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc,
+                                PVOID GmuA, PWCHAR Text)
+{
+    EPI_SMMU_WRITE r[] = {
+        { 0x10000, 0, 0x106, 0, 0 },    // SCTLR: HUPCF/AFE/TRE; M/CFIE/CFRE off
+        { 0x01000, 0, 0x1F300, 0, 0 },  // CBAR0: stage 1, stage 2 bypass, WB, NSH
+        { 0x01800, 0, 1, 0, 0 },        // CBA2R0: AArch64
+        { 0x00C00, 0, 0, 0, 0 },        // S2CR0: translate, CB0, default privilege
+        { 0x00800, 0, 0x84000005, 0, 0 }// SMR0: valid, mask 0x400, SID 5; publish last
+    };
+    ULONG status = 0, written = 0;
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = EPI_ASMMU_BASE;
+    EpiGpuStep(hParams, 0x35E);
+    // Never reset an already running processor or power down an active GX.
+    if (READ_REGISTER_ULONG(static_cast<volatile ULONG*>(GmuA)) != 1 ||
+        (READ_REGISTER_ULONG(Cc + 0x100C / 4) & 0x80000001UL) != 1 ||
+        (READ_REGISTER_ULONG(Cc + 0x5000 / 4) & EPI_CBCR_CLK_OFF) != 0)
+    { status = 2; }
+    PVOID map = status == 0 ? MmMapIoSpaceEx(pa, EPI_SMMU_WRITE_LEN, PAGE_READWRITE | PAGE_NOCACHE) : NULL;
+    if (status == 0 && map == NULL) { status = 1; }
+    if (map != NULL)
+    {
+        volatile ULONG* s = static_cast<volatile ULONG*>(map);
+        if (READ_REGISTER_ULONG(s + 0x20 / 4) != 0x4C017E06 ||
+            READ_REGISTER_ULONG(s + 0x24 / 4) != 0x30000007 ||
+            READ_REGISTER_ULONG(s + 0x28 / 4) != 0x5511 ||
+            READ_REGISTER_ULONG(s + 0x3C / 4) != 0x24) { status = 3; }
+        if (status == 0)
+        {
+            // Read ALL originals before writing. Refuse occupied streams/contexts.
+            for (ULONG i = 0; i < RTL_NUMBER_OF(r); ++i)
+            { r[i].Original = READ_REGISTER_ULONG(s + r[i].Offset / 4); }
+            for (ULONG i = 0; i < 6; ++i)
+            { if (READ_REGISTER_ULONG(s + (0x800 + i * 4) / 4) & 0x80000000UL) { status = 4; } }
+            for (ULONG i = 0; i < 7; ++i)
+            { if (READ_REGISTER_ULONG(s + (0x10000 + i * 0x1000) / 4) & 0x61) { status = 4; } }
+        }
+        if (status == 0)
+        {
+            for (ULONG i = 0; i < RTL_NUMBER_OF(r); ++i)
+            {
+                EpiGpuStep(hParams, 0x360 + i);
+                WRITE_REGISTER_ULONG(s + r[i].Offset / 4, r[i].Written);
+                r[i].Readback = READ_REGISTER_ULONG(s + r[i].Offset / 4);
+                ++written;
+                if (r[i].Readback != r[i].Written) { status = 5; break; }
+            }
+            for (ULONG i = written; i-- > 0;)
+            {
+                EpiGpuStep(hParams, 0x365 + (RTL_NUMBER_OF(r) - 1 - i));
+                WRITE_REGISTER_ULONG(s + r[i].Offset / 4, r[i].Original);
+                r[i].Restored = READ_REGISTER_ULONG(s + r[i].Offset / 4);
+                if (r[i].Restored != r[i].Original) { status = 6; }
+            }
+        }
+        MmUnmapIoSpace(map, EPI_SMMU_WRITE_LEN);
+    }
+    EpiSetValue(hDiag, L"GpuSmmuW", REG_BINARY, r, sizeof(r));
+    EpiSetDword(hDiag, L"GpuSmmuWStatus", status);
+    EpiCat(Text, L"smmu_w_status", status);
+    EpiCat(Text, L"smr0_before", r[4].Original);
+    EpiCat(Text, L"smr0_written", r[4].Readback);
+    EpiCat(Text, L"smr0_restored", r[4].Restored);
+    return written != 0;
+}
+
+// ---- G1c-2b (EpiGpuProbe bit6): GMU firmware TCM load test ----
+// The GMU firmware (a660_gmu.bin from the stock vendor image, used as data) is a list of blocks
+// { addr, size, type, value, data[size] } (format facts from mainline a6xx_gmu.c). Blocks with size 0 describe
+// regions. GMU address 0x0..0x3FFF is the ITCM (written through dword 0x1B400), 0x10004000..0x10007FFF the DTCM
+// on the a650 family (dword 0x1C400). Everything else (icache at 0x4000, dummy at 0x60000000) lives in memory
+// behind the adreno SMMU and is only counted here. The CM3 stays in reset: no boot register is written.
+// The file is read before the CX window; the TCM writes run inside it and are read back.
+#define EPI_GMU_FW_PATH         L"\\DosDevices\\C:\\Epinephrine\\fw\\a660_gmu.bin"
+#define EPI_GMU_FW_MAX          0x40000
+#define EPI_GMU_ITCM_PHYS       (EPI_GPU_BASE + 0x1B400ULL * 4)   // 0x3D6D000
+#define EPI_GMU_DTCM_PHYS       (EPI_GPU_BASE + 0x1C400ULL * 4)   // 0x3D71000
+#define EPI_GMU_TCM_LEN         0x4000
+#define EPI_GMU_ITCM_ADDR       0x00000000UL
+#define EPI_GMU_DTCM_ADDR       0x10004000UL
+#define EPI_GMU_FW_VER_DTCM_OFF 0x3FE0          // CORE_FW_VERSION (dword 0x1D3F8) sits in the DTCM
+#define EPI_GMU_SYSRESET_DWORD  0x1F800
+
+typedef struct _EPI_GMU_FW
+{
+    PUCHAR Data;
+    ULONG Len;
+    ULONG TcmBlocks;
+    ULONG ItcmBytes;
+    ULONG DtcmBytes;
+    ULONG SmmuBytes;
+    ULONG ExpectedVer;      // DTCM word at EPI_GMU_FW_VER_DTCM_OFF after the load, if a block covers it
+} EPI_GMU_FW;
+
+typedef struct _EPI_GMU_BLK { ULONG Addr; ULONG Size; ULONG Type; ULONG Value; } EPI_GMU_BLK;
+
+static BOOLEAN EpiGmuInTcm(ULONG Addr, ULONG Size, ULONG Base)
+{
+    return (Addr >= Base && Size <= EPI_GMU_TCM_LEN && Addr - Base <= EPI_GMU_TCM_LEN - Size) ? TRUE : FALSE;
+}
+
+// Walks the block list. Returns 0 ok, 3 malformed. Fills the counters in Fw.
+static ULONG EpiGmuFwParse(EPI_GMU_FW* Fw)
+{
+    ULONG off = 0;
+    while (off < Fw->Len)
+    {
+        if (Fw->Len - off < sizeof(EPI_GMU_BLK)) { return 3; }
+        const EPI_GMU_BLK* b = reinterpret_cast<const EPI_GMU_BLK*>(Fw->Data + off);
+        const ULONG dataOff = off + sizeof(EPI_GMU_BLK);
+        if (b->Size > Fw->Len - dataOff || (b->Size & 3) != 0 || (b->Addr & 3) != 0) { return 3; }
+        if (b->Size != 0)
+        {
+            if (EpiGmuInTcm(b->Addr, b->Size, EPI_GMU_ITCM_ADDR)) { Fw->ItcmBytes += b->Size; ++Fw->TcmBlocks; }
+            else if (EpiGmuInTcm(b->Addr, b->Size, EPI_GMU_DTCM_ADDR))
+            {
+                Fw->DtcmBytes += b->Size;
+                ++Fw->TcmBlocks;
+                const ULONG verAddr = EPI_GMU_DTCM_ADDR + EPI_GMU_FW_VER_DTCM_OFF;
+                if (verAddr >= b->Addr && verAddr - b->Addr < b->Size)
+                {
+                    Fw->ExpectedVer = *reinterpret_cast<const ULONG*>(Fw->Data + dataOff + (verAddr - b->Addr));
+                }
+            }
+            else { Fw->SmmuBytes += b->Size; }
+        }
+        off = dataOff + b->Size;
+    }
+    return 0;
+}
+
+// Reads and parses the firmware file. Returns 0 ok, 1 open failed, 2 bad size / read failed, 3 malformed,
+// 9 no memory. On success Fw->Data is a 'gpEE' pool buffer owned by the caller.
+static ULONG EpiGmuFwRead(HANDLE hParams, EPI_GMU_FW* Fw)
+{
+    UNICODE_STRING path;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h = NULL;
+    FILE_STANDARD_INFORMATION info = {};
+    ULONG st = 0;
+
+    EpiGpuStep(hParams, 0x410);
+    RtlInitUnicodeString(&path, EPI_GMU_FW_PATH);
+    InitializeObjectAttributes(&oa, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+                                 FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+                                 NULL, 0)))
+    {
+        return 1;
+    }
+    if (!NT_SUCCESS(ZwQueryInformationFile(h, &iosb, &info, sizeof(info), FileStandardInformation)) ||
+        info.EndOfFile.QuadPart <= 0 || info.EndOfFile.QuadPart > EPI_GMU_FW_MAX)
+    {
+        st = 2;
+        goto out;
+    }
+    Fw->Len = (ULONG)info.EndOfFile.QuadPart;
+    Fw->Data = static_cast<PUCHAR>(ExAllocatePool2(POOL_FLAG_PAGED, Fw->Len, 'gpEE'));
+    if (Fw->Data == NULL) { st = 9; goto out; }
+    {
+        LARGE_INTEGER pos;
+        pos.QuadPart = 0;
+        if (!NT_SUCCESS(ZwReadFile(h, NULL, NULL, NULL, &iosb, Fw->Data, Fw->Len, &pos, NULL)) ||
+            iosb.Information != Fw->Len)
+        {
+            st = 2;
+            goto out;
+        }
+    }
+    EpiGpuStep(hParams, 0x411);
+    st = EpiGmuFwParse(Fw);
+out:
+    if (st != 0 && Fw->Data != NULL) { ExFreePoolWithTag(Fw->Data, 'gpEE'); Fw->Data = NULL; }
+    ZwClose(h);
+    return st;
+}
+
+// Inside the CX window (GMU branches on). GmuA maps the CM3 page (dword 0x1F800 at offset 0).
+// Returns 0 loaded and verified, 4 CM3 not in reset (nothing written), 5 map failed, 6 read-back mismatch.
+static ULONG EpiGmuFwLoadTcm(HANDLE hParams, const EPI_GMU_FW* Fw, PVOID GmuA, PWCHAR Text)
+{
+    const ULONG sysreset = READ_REGISTER_ULONG(static_cast<volatile ULONG*>(GmuA));
+    EpiCat(Text, L"fw_cm3_sysreset", sysreset);
+    if ((sysreset & 1) == 0) { return 4; }
+
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = EPI_GMU_ITCM_PHYS;
+    PVOID itcm = MmMapIoSpaceEx(pa, EPI_GMU_TCM_LEN, PAGE_READWRITE | PAGE_NOCACHE);
+    pa.QuadPart = EPI_GMU_DTCM_PHYS;
+    PVOID dtcm = MmMapIoSpaceEx(pa, EPI_GMU_TCM_LEN, PAGE_READWRITE | PAGE_NOCACHE);
+    ULONG st = 0;
+    if (itcm == NULL || dtcm == NULL) { st = 5; goto out; }
+    {
+        volatile ULONG* it = static_cast<volatile ULONG*>(itcm);
+        volatile ULONG* dt = static_cast<volatile ULONG*>(dtcm);
+        EpiCat(Text, L"fw_itcm0_before", READ_REGISTER_ULONG(it));
+        EpiCat(Text, L"fw_ver_before", READ_REGISTER_ULONG(dt + EPI_GMU_FW_VER_DTCM_OFF / 4));
+
+        ULONG mismatch = 0;
+        for (ULONG pass = 0; pass < 2; ++pass)          // pass 0 writes, pass 1 reads back
+        {
+            EpiGpuStep(hParams, 0x370 + pass);
+            ULONG off = 0;
+            while (off < Fw->Len)
+            {
+                const EPI_GMU_BLK* b = reinterpret_cast<const EPI_GMU_BLK*>(Fw->Data + off);
+                const ULONG* src = reinterpret_cast<const ULONG*>(Fw->Data + off + sizeof(EPI_GMU_BLK));
+                volatile ULONG* dst = NULL;
+                if (b->Size != 0 && EpiGmuInTcm(b->Addr, b->Size, EPI_GMU_ITCM_ADDR))
+                {
+                    dst = it + (b->Addr - EPI_GMU_ITCM_ADDR) / 4;
+                }
+                else if (b->Size != 0 && EpiGmuInTcm(b->Addr, b->Size, EPI_GMU_DTCM_ADDR))
+                {
+                    dst = dt + (b->Addr - EPI_GMU_DTCM_ADDR) / 4;
+                }
+                if (dst != NULL)
+                {
+                    for (ULONG i = 0; i < b->Size / 4; ++i)
+                    {
+                        if (pass == 0) { WRITE_REGISTER_ULONG(dst + i, src[i]); }
+                        else if (READ_REGISTER_ULONG(dst + i) != src[i]) { ++mismatch; }
+                    }
+                }
+                off += sizeof(EPI_GMU_BLK) + b->Size;
+            }
+        }
+        EpiGpuStep(hParams, 0x372);
+        const ULONG ver = READ_REGISTER_ULONG(dt + EPI_GMU_FW_VER_DTCM_OFF / 4);
+        EpiCat(Text, L"fw_mismatch", mismatch);
+        EpiCat(Text, L"fw_ver", ver);
+        EpiCat(Text, L"fw_ver_expected", Fw->ExpectedVer);
+        if (mismatch != 0) { st = 6; }
+    }
+out:
+    if (dtcm != NULL) { MmUnmapIoSpace(dtcm, EPI_GMU_TCM_LEN); }
+    if (itcm != NULL) { MmUnmapIoSpace(itcm, EPI_GMU_TCM_LEN); }
+    return st;
+}
+
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
 //              12 map failed, 13 CX GDSC did not collapse again on restore
-static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text)
+static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text,
+                          const EPI_GMU_FW* Fw, PULONG FwStatus)
 {
     ULONG status = 0;
     ULONG orig[RTL_NUMBER_OF(g_EpiCxBranches)] = {};
@@ -303,6 +554,9 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
 
     // 3a. G1c-1: adreno SMMU ID / stream mapping (read only)
     if (Flags & 0x10) { EpiSmmuDump(hParams, hDiag, Text); }
+
+    // 3a'. G1c-2b: GMU firmware ITCM/DTCM load + read-back (CM3 stays in reset)
+    if ((Flags & 0x40) && Fw->Data != NULL) { *FwStatus = EpiGmuFwLoadTcm(hParams, Fw, gmuA, Text); }
 
     // 3b. G1c-0: RSCC / GPU PDC state (read only)
     if (Flags & 4)
@@ -377,11 +631,14 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     ULONG flags = 0;
     ULONG cxStatus = 0xFFFFFFFF;
     PWCHAR cxText = NULL;
+    EPI_GMU_FW fw = {};
+    ULONG fwStatus = 0xFFFFFFFF;
 
     // One shot: cleared and flushed before any hardware access, so a hang cannot repeat at the next start.
     // EpiGpuProbe bit0 = G1a read, bit1 = G1b CX power-up test (writes GPU_CC; implies the read),
     // bit2 = G1c-0: cmd-db copy + RSCC dump (runs inside the G1b CX window, so it implies bit1),
-    // bit3 = also read GPU PDC (resets the phone, do not use), bit4 = G1c-1 adreno SMMU read (CX window).
+    // bit3 = also read GPU PDC (resets the phone, do not use), bit4 = G1c-1 adreno SMMU read (CX window),
+    // bit6 = G1c-2b GMU firmware TCM load test (reads C:\Epinephrine\fw\a660_gmu.bin; CX window).
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     EpiSetDword(hParams, L"EpiGpuProbe", 0);
@@ -395,13 +652,22 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     text[0] = L'\0';
     cxText[0] = L'\0';
     if (flags & 4) { EpiSetDword(hDiag, L"CmdDbStatus", EpiCmdDbDump(hParams, hDiag)); }
+    if (flags & 0x40)
+    {
+        fwStatus = EpiGmuFwRead(hParams, &fw);
+        EpiCat(cxText, L"fw_len", fw.Len);
+        EpiCat(cxText, L"fw_tcm_blocks", fw.TcmBlocks);
+        EpiCat(cxText, L"fw_itcm_bytes", fw.ItcmBytes);
+        EpiCat(cxText, L"fw_dtcm_bytes", fw.DtcmBytes);
+        EpiCat(cxText, L"fw_smmu_bytes", fw.SmmuBytes);
+    }
 
     {
         PHYSICAL_ADDRESS pa;
         pa.QuadPart = EPI_GCC_BASE + EPI_GCC_MAP_OFF;
         gcc = MmMapIoSpaceEx(pa, EPI_GCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
         pa.QuadPart = EPI_GPU_CC_BASE;
-        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0x16) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
+        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0x56) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
         if (gcc == NULL || gpucc == NULL) { status = 4; goto done; }
     }
 
@@ -436,7 +702,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & 0x16) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText); }
+        if (flags & 0x56) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus); }
     }
 
 done:
@@ -452,6 +718,10 @@ done:
     }
     EpiSetDword(hDiag, L"GpuProbeStatus", status);
     if (cxStatus != 0xFFFFFFFF) { EpiSetDword(hDiag, L"GpuCxStatus", cxStatus); }
+    // GpuFwStatus: 0 TCM loaded + verified, 1 open failed, 2 bad size / read, 3 malformed, 4 CM3 not in reset,
+    //              5 TCM map failed, 6 read-back mismatch, 9 no memory
+    if (fwStatus != 0xFFFFFFFF) { EpiSetDword(hDiag, L"GpuFwStatus", fwStatus); }
+    if (fw.Data != NULL) { ExFreePoolWithTag(fw.Data, 'gpEE'); }
     if (cxText != NULL && cxText[0] != L'\0')
     {
         size_t cch = 0;
