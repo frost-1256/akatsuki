@@ -1,0 +1,36 @@
+From c76edb32ce337a8bf9cf8843d498d79a95032e6b Mon Sep 17 00:00:00 2001
+From: spring <frost-1256@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 19:30:31 +0900
+Subject: [PATCH] spacewar: v33-akat test - GPU0 _HID QCOM0A36 -> AKAT0001 (on
+ v32 base)
+
+Akatsuki M1 WP1: rebind GPU0 to the Epinephrine display driver (INF matches
+ACPI\AKAT0001) so qcdxkm7325 no longer binds. Only the _HID string changes;
+_DEP, _CRS, _ROM, MON0 and _DOD are untouched. Base is v32 (WPSS _DEP on
+SSDD), which the reinstalled system needs to boot.
+
+Compiled with iasl 20260408 (same as v32; v32 AML reproduces byte-for-byte).
+Decompiled diff vs v32: header checksum and the GPU0 _HID only; AML length
+unchanged (81507 bytes).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Platforms/Nothing/spacewar/Decompiled/DSDT.dsl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Platforms/Nothing/spacewar/Decompiled/DSDT.dsl b/Platforms/Nothing/spacewar/Decompiled/DSDT.dsl
+index af4daf3..5906cbf 100644
+--- a/Platforms/Nothing/spacewar/Decompiled/DSDT.dsl
++++ b/Platforms/Nothing/spacewar/Decompiled/DSDT.dsl
+@@ -14041,7 +14041,7 @@ DefinitionBlock ("", "DSDT", 2, "QCOMM ", "SDM7280 ", 0x00000003)
+ 
+         Device (GPU0)
+         {
+-            Name (_HID, "QCOM0A36")  // _HID: Hardware ID
++            Name (_HID, "AKAT0001")  // _HID: Hardware ID
+             Alias (\_SB.PSUB, _SUB)
+             Name (_UID, Zero)  // _UID: Unique ID
+             Name (_CLS, Package (0x03)  // _CLS: Class Code
+-- 
+2.55.0.windows.5
+

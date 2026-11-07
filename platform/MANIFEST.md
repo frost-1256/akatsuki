@@ -8,9 +8,9 @@ Epinephrine が動作するために必要な、ドライバ本体の外側に�
 
 | 項目 | 内容 | 状態 |
 |---|---|---|
-| GPU0 `_HID` | `QCOM0A36` → `AKAT0001`（自作用 ID） | 未実施（WP1） |
+| GPU0 `_HID` | `QCOM0A36` → `AKAT0001`（自作用 ID） | 実施済み（2026-11-07、Silicium-ACPI `test/v33-akat` c76edb3。実機での起動は未確認） |
 | GPU0 `_DEP` | 変更なし（MMU0, MMU1, IMM0, IMM1, PEP0, PMIC, RPEN, SCM0 の 8 件） | 現行どおり |
-| ベース | 本番系譜 v24（run70）から Akatsuki 用ブランチを切る | 未実施 |
+| ベース | v32（v27 + WPSS `_DEP` = SSDD）。再インストール後の環境は v32 がないと起動時に 0xA になるため、v24 から変更 | 実施済み |
 
 差分ファイルは `platform/dsdt/` に格納予定。コンパイルは出荷用 iasl 20260930、検証は「逆コンパイル差分が HID とヘッダだけ」をゲートとする。
 
