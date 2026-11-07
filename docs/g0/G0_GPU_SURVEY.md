@@ -203,6 +203,31 @@
 2. **G1c-1（DSDT v34）**：MMU1 を Windows から外す（S1）。Epinephrine から adreno SMMU を読めるかを確かめる。
 3. **G1c-2**：SMMU のコンテキストバンク（ストリーム 5）、RSCC と PDC の初期化、GMU ファームウェアの読み込み、CM3 の起動。`FW_INIT_RESULT` に 0xBABEFACE が出るまで。
 
+### 9.4 G1c-0 の結果（v26 / v27、2026-11-07）
+
+- **v26（`EpiGpuProbe=7`）：スマホが再起動した。** ブレッドクラムは `0x338` で、GPU PDC の `GPU_ENABLE_PDC`（0xB294500）を最初に読んだところだった。cmd-db、GMU、RSCC の読み取りは、その前に終わっていた。
+  - 固まったのではなく再起動したので、ハイパーバイザの stage-2 保護（HLOS に GPU PDC が見せられていない）の可能性が高い [I]。
+  - **GPU PDC（0xB290000）には触らない。** v27 では、bit3 を立てたときだけ読むようにした。
+- **v27（`EpiGpuProbe=7`、PDC なし）：成功した。** `GpuProbeStatus=0`、`GpuCxStatus=0`、`CmdDbStatus=0`。
+- **cmd-db**（0x80860000、magic `db30030c`、version 1）が読めた。ARC（slave 3）のおもな値：
+
+| リソース | アドレス | レベル（vlvl） |
+|---|---|---|
+| gfx.lvl | 0x30050 | 0, 64, 128, 192, 224, 256, 320, 384, 416 |
+| cx.lvl | 0x30000 | 0, 16, 64, 128, 192, 256, 384, 416 |
+| mx.lvl | 0x30010 | 0, 16, 64, 128, 192, 224, 256, 320, 384, 416, 432 |
+
+  `gmxc.lvl` はない。本家 Linux では、その場合 GX の 2 つ目の投票に mx.lvl を使う [P]。VRM（slave 4）に `vrm.gfx`（0x42a00）がある。
+- **RSCC**（0x3DE0000、CX を入れた状態で読んだ）：
+  - 一部はすでに設定されていた。`PDC_SEQ_START_ADDR=0x4520`、`MATCH_VALUE_LO/HI=0x4510/0x4514`、`PDC_SLAVE_ID=1` で、本家 Linux の初期化値と同じ。HIDDEN_TCS の ADDR には 0x82204514 と 0x82204510 が入っていた。
+  - `RSC_STATUS0_DRV0=0`。
+  - `SEQ_MEM_0..5=0`：シーケンスはまだ読み込まれていない。
+  - TCS0〜3 の STATUS はどれも 1（空き）。
+  - GMU 側の `RSCC_CONTROL_REQ/ACK` は 0 / 0。
+- 意味すること：
+  - G1c-2 では、PDC に書かずに RSCC の初期化と rpmh_start だけを試す。a660 ファミリーでは PDC を AOP が持っているので、それで足りるかを確かめる [U]。
+  - GMU に渡す ARC の投票表は、この cmd-db から作れる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

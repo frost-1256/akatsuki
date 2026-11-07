@@ -125,9 +125,84 @@ static ULONG EpiPoll(volatile ULONG* Reg, ULONG Mask, ULONG Want, ULONG Max)
     return Max + 1;
 }
 
+// ---- G1c-0 (EpiGpuProbe bit2, read only) ----
+// cmd-db (AOP command database, reserved memory outside the Windows RAM map) is copied raw to EpiDiag CmdDb and
+// parsed on the PC. Inside the G1b CX window, the GPU RSCC (0x3DE0000) and GPU PDC (0xB290000) state is dumped
+// as {phys, value} pairs to EpiDiag GpuRpmh. Offsets are dwords (mainline a6xx_gmu.xml / a6xx.xml, facts only).
+#define EPI_CMDDB_BASE          0x80860000ULL
+#define EPI_CMDDB_LEN           0x20000
+#define EPI_RSCC_BASE           0x03DE0000ULL
+#define EPI_RSCC_MAP_LEN        0x2000
+#define EPI_PDC_BASE            0x0B290000ULL
+#define EPI_PDC_MAP_OFF         0x4000          // dwords 0x1000..0x17FF
+#define EPI_PDC_MAP_LEN         0x2000
+#define EPI_RPMH_MAX_PAIRS      256
+
+typedef struct _EPI_DW_RANGE { ULONG First; ULONG Count; } EPI_DW_RANGE;
+static const EPI_DW_RANGE g_EpiRsccRanges[] = {
+    { 0x000, 0x10 },    // RSC_STATUS0_DRV0, PDC_SEQ_START/MATCH, SLAVE_ID, HIDDEN_TCS_CMD0
+    { 0x082, 0x0B },    // timestamp units
+    { 0x100, 0x02 },    // OVERRIDE_START_ADDR, SEQ_BUSY_DRV0
+    { 0x180, 0x06 },    // SEQ_MEM_0_DRV0..
+    { 0x346, 0x01 },    // TCS0..3 DRV0 status
+    { 0x3EE, 0x01 },
+    { 0x496, 0x01 },
+    { 0x53E, 0x01 },
+};
+static const EPI_DW_RANGE g_EpiPdcRanges[] = {
+    { 0x1140, 0x10 },   // GPU_ENABLE_PDC, GPU_SEQ_START_ADDR ..
+    { 0x1570, 0x70 },   // GPU_TCS1..3 control / enable bank / commands
+};
+
+typedef struct _EPI_PAIRS { PULONG Buf; ULONG N; } EPI_PAIRS;
+
+static VOID EpiDumpRanges(HANDLE hParams, ULONG Step, EPI_PAIRS* Out, volatile ULONG* Map, ULONGLONG MapPhys,
+                          ULONGLONG BlockPhys, const EPI_DW_RANGE* R, ULONG Nr)
+{
+    for (ULONG i = 0; i < Nr; ++i)
+    {
+        EpiGpuStep(hParams, Step + i);
+        for (ULONG k = 0; k < R[i].Count && Out->N < EPI_RPMH_MAX_PAIRS; ++k)
+        {
+            const ULONGLONG phys = BlockPhys + (ULONGLONG)(R[i].First + k) * 4;
+            Out->Buf[Out->N * 2] = (ULONG)phys;
+            Out->Buf[Out->N * 2 + 1] = READ_REGISTER_ULONG(Map + (ULONG)(phys - MapPhys) / 4);
+            Out->N++;
+        }
+    }
+}
+
+// Copies cmd-db to EpiDiag CmdDb (trailing zero dwords trimmed). Returns 0 ok, 1 map failed, 2 no memory,
+// 3 bad magic (still stored).
+static ULONG EpiCmdDbDump(HANDLE hParams, HANDLE hDiag)
+{
+    ULONG st = 0;
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = EPI_CMDDB_BASE;
+    EpiGpuStep(hParams, 0x400);
+    PVOID map = MmMapIoSpaceEx(pa, EPI_CMDDB_LEN, PAGE_READONLY | PAGE_NOCACHE);
+    if (map == NULL) { return 1; }
+    PULONG buf = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_PAGED, EPI_CMDDB_LEN, 'gpEE'));
+    if (buf == NULL) { MmUnmapIoSpace(map, EPI_CMDDB_LEN); return 2; }
+    volatile ULONG* m = static_cast<volatile ULONG*>(map);
+    EpiGpuStep(hParams, 0x401);
+    ULONG last = 0;
+    for (ULONG i = 0; i < EPI_CMDDB_LEN / 4; ++i)
+    {
+        buf[i] = READ_REGISTER_ULONG(m + i);
+        if (buf[i] != 0) { last = i + 1; }
+    }
+    MmUnmapIoSpace(map, EPI_CMDDB_LEN);
+    if (buf[1] != 0x0C0330DB) { st = 3; }          // magic db 30 03 0c
+    EpiSetDword(hDiag, L"CmdDbLen", last * 4);
+    if (last != 0) { EpiSetValue(hDiag, L"CmdDb", REG_BINARY, buf, last * 4); }
+    ExFreePoolWithTag(buf, 'gpEE');
+    return st;
+}
+
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
 //              12 map failed, 13 CX GDSC did not collapse again on restore
-static ULONG EpiGpuCxTest(HANDLE hParams, volatile ULONG* Cc, PWCHAR Text)
+static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text)
 {
     ULONG status = 0;
     ULONG orig[RTL_NUMBER_OF(g_EpiCxBranches)] = {};
@@ -187,6 +262,39 @@ static ULONG EpiGpuCxTest(HANDLE hParams, volatile ULONG* Cc, PWCHAR Text)
         }
     }
 
+    // 3b. G1c-0: RSCC / GPU PDC state (read only)
+    if (Flags & 4)
+    {
+        EPI_PAIRS out = {};
+        out.Buf = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_PAGED, EPI_RPMH_MAX_PAIRS * 2 * sizeof(ULONG), 'gpEE'));
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = EPI_RSCC_BASE;
+        PVOID rscc = MmMapIoSpaceEx(pa, EPI_RSCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
+        pa.QuadPart = EPI_PDC_BASE + EPI_PDC_MAP_OFF;
+        PVOID pdc = MmMapIoSpaceEx(pa, EPI_PDC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
+        if (out.Buf != NULL && rscc != NULL && pdc != NULL)
+        {
+            EpiDumpRanges(hParams, 0x330, &out, static_cast<volatile ULONG*>(rscc), EPI_RSCC_BASE, EPI_RSCC_BASE,
+                          g_EpiRsccRanges, RTL_NUMBER_OF(g_EpiRsccRanges));
+            // GPU PDC read: EpiGpuProbe bit3 only. Reading GPU_ENABLE_PDC (0xB294500) reset the phone on
+            // 2026-11-07 (breadcrumb 0x338), probably a hypervisor stage-2 fault.
+            if (Flags & 8)
+            {
+                EpiDumpRanges(hParams, 0x338, &out, static_cast<volatile ULONG*>(pdc), EPI_PDC_BASE + EPI_PDC_MAP_OFF,
+                              EPI_PDC_BASE, g_EpiPdcRanges, RTL_NUMBER_OF(g_EpiPdcRanges));
+            }
+            // GMU side RSCC handshake registers (GMU page B)
+            volatile ULONG* b = static_cast<volatile ULONG*>(gmuB);
+            EpiCat(Text, L"rscc_ctrl_req", READ_REGISTER_ULONG(b + (0x23B07 * 4 - 0x8E000) / 4));
+            EpiCat(Text, L"rscc_ctrl_ack", READ_REGISTER_ULONG(b + (0x23B08 * 4 - 0x8E000) / 4));
+            EpiSetValue(hDiag, L"GpuRpmh", REG_BINARY, out.Buf, out.N * 2 * sizeof(ULONG));
+        }
+        EpiCat(Text, L"rpmh_pairs", out.N);
+        if (pdc != NULL) { MmUnmapIoSpace(pdc, EPI_PDC_MAP_LEN); }
+        if (rscc != NULL) { MmUnmapIoSpace(rscc, EPI_RSCC_MAP_LEN); }
+        if (out.Buf != NULL) { ExFreePoolWithTag(out.Buf, 'gpEE'); }
+    }
+
 restore:
     // 4. restore: branches in reverse order (original values; CLK_OFF is read-only), then collapse CX
     EpiGpuStep(hParams, 0x340);
@@ -229,7 +337,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     PWCHAR cxText = NULL;
 
     // One shot: cleared and flushed before any hardware access, so a hang cannot repeat at the next start.
-    // EpiGpuProbe bit0 = G1a read, bit1 = G1b CX power-up test (writes GPU_CC; implies the read).
+    // EpiGpuProbe bit0 = G1a read, bit1 = G1b CX power-up test (writes GPU_CC; implies the read),
+    // bit2 = G1c-0: cmd-db copy + RSCC/PDC dump (runs inside the G1b CX window, so it implies bit1).
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     EpiSetDword(hParams, L"EpiGpuProbe", 0);
@@ -242,13 +351,14 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     if (pairs == NULL || text == NULL || cxText == NULL) { status = 3; goto done; }
     text[0] = L'\0';
     cxText[0] = L'\0';
+    if (flags & 4) { EpiSetDword(hDiag, L"CmdDbStatus", EpiCmdDbDump(hParams, hDiag)); }
 
     {
         PHYSICAL_ADDRESS pa;
         pa.QuadPart = EPI_GCC_BASE + EPI_GCC_MAP_OFF;
         gcc = MmMapIoSpaceEx(pa, EPI_GCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
         pa.QuadPart = EPI_GPU_CC_BASE;
-        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 2) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
+        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 6) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
         if (gcc == NULL || gpucc == NULL) { status = 4; goto done; }
     }
 
@@ -283,7 +393,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & 2) { cxStatus = EpiGpuCxTest(hParams, c, cxText); }
+        if (flags & 6) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText); }
     }
 
 done:
