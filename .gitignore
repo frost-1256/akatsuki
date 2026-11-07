@@ -1,0 +1,24 @@
+# build outputs
+x64/
+ARM64/
+Debug/
+Release/
+*.sys
+*.cat
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+
+# signing material - never commit
+*.cer
+*.pfx
+*.pvk
+*.snk
+
+# editor / IDE
+.vs/
+*.user
+*.suo
