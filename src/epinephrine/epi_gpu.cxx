@@ -200,6 +200,45 @@ static ULONG EpiCmdDbDump(HANDLE hParams, HANDLE hDiag)
     return st;
 }
 
+// ---- G1c-1 (EpiGpuProbe bit4, read only) ----
+// adreno SMMU (MMU1, 0x3DA0000, SMMU-500; register layout from the Arm SMMUv2 architecture / mainline arm-smmu.h,
+// facts only). Read inside the CX window with hlos1_vote_gpu_smmu on. Global space 0: sCR0, IDR0..7, sGFSR,
+// then SMR/S2CR for the first stream map groups. With DSDT v34 qcsmmu no longer binds MMU1.
+#define EPI_ASMMU_BASE          0x03DA0000ULL
+#define EPI_ASMMU_MAP_LEN       0x1000
+#define EPI_ASMMU_MAX_SMR       32
+
+static VOID EpiSmmuDump(HANDLE hParams, HANDLE hDiag, PWCHAR Text)
+{
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = EPI_ASMMU_BASE;
+    PVOID map = MmMapIoSpaceEx(pa, EPI_ASMMU_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
+    if (map == NULL) { EpiCat(Text, L"smmu_map", 0); return; }
+    volatile ULONG* g = static_cast<volatile ULONG*>(map);
+    ULONG v[16 + 2 * EPI_ASMMU_MAX_SMR] = {};
+    EpiGpuStep(hParams, 0x350);
+    v[0] = READ_REGISTER_ULONG(g + 0x000 / 4);                       // sCR0
+    EpiCat(Text, L"smmu_scr0", v[0]);
+    EpiGpuStep(hParams, 0x351);
+    for (ULONG i = 0; i < 8; ++i) { v[1 + i] = READ_REGISTER_ULONG(g + (0x020 + i * 4) / 4); }   // IDR0..7
+    v[9] = READ_REGISTER_ULONG(g + 0x048 / 4);                       // sGFSR
+    EpiCat(Text, L"smmu_idr0", v[1]);
+    EpiCat(Text, L"smmu_idr1", v[2]);
+    EpiCat(Text, L"smmu_idr2", v[3]);
+    EpiCat(Text, L"smmu_idr7", v[8]);
+    EpiCat(Text, L"smmu_sgfsr", v[9]);
+    ULONG nSmr = v[1] & 0xFF;                                         // IDR0.NUMSMRG
+    if (nSmr > EPI_ASMMU_MAX_SMR) { nSmr = EPI_ASMMU_MAX_SMR; }
+    EpiGpuStep(hParams, 0x352);
+    for (ULONG i = 0; i < nSmr; ++i)
+    {
+        v[16 + i] = READ_REGISTER_ULONG(g + (0x800 + i * 4) / 4);                     // SMRn
+        v[16 + EPI_ASMMU_MAX_SMR + i] = READ_REGISTER_ULONG(g + (0xC00 + i * 4) / 4); // S2CRn
+    }
+    MmUnmapIoSpace(map, EPI_ASMMU_MAP_LEN);
+    EpiSetValue(hDiag, L"GpuSmmu", REG_BINARY, v, sizeof(v));
+}
+
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
 //              12 map failed, 13 CX GDSC did not collapse again on restore
 static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text)
@@ -261,6 +300,9 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
             if (i == 3) { KeStallExecutionProcessor(100); }
         }
     }
+
+    // 3a. G1c-1: adreno SMMU ID / stream mapping (read only)
+    if (Flags & 0x10) { EpiSmmuDump(hParams, hDiag, Text); }
 
     // 3b. G1c-0: RSCC / GPU PDC state (read only)
     if (Flags & 4)
@@ -338,7 +380,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 
     // One shot: cleared and flushed before any hardware access, so a hang cannot repeat at the next start.
     // EpiGpuProbe bit0 = G1a read, bit1 = G1b CX power-up test (writes GPU_CC; implies the read),
-    // bit2 = G1c-0: cmd-db copy + RSCC/PDC dump (runs inside the G1b CX window, so it implies bit1).
+    // bit2 = G1c-0: cmd-db copy + RSCC dump (runs inside the G1b CX window, so it implies bit1),
+    // bit3 = also read GPU PDC (resets the phone, do not use), bit4 = G1c-1 adreno SMMU read (CX window).
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     EpiSetDword(hParams, L"EpiGpuProbe", 0);
@@ -358,7 +401,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         pa.QuadPart = EPI_GCC_BASE + EPI_GCC_MAP_OFF;
         gcc = MmMapIoSpaceEx(pa, EPI_GCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
         pa.QuadPart = EPI_GPU_CC_BASE;
-        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 6) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
+        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0x16) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
         if (gcc == NULL || gpucc == NULL) { status = 4; goto done; }
     }
 
@@ -393,7 +436,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & 6) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText); }
+        if (flags & 0x16) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText); }
     }
 
 done:

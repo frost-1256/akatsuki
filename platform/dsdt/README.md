@@ -14,3 +14,17 @@
 - `0001-gpu0-hid-akat0001.patch` は DSL の差分（`Platforms/Nothing/spacewar/Decompiled/DSDT.dsl`）。AML 本体は Silicium-ACPI 側のコミットにある。
 - ロールバックは `Mu-spacewar-v32.img` に戻すだけでよい（qcdxkm が再び GPU0 にバインドする）。
 - 計画書（`docs/m1/AKATSUKI_M1_PLAN.md` WP1）では、ベースを v24、コンパイラを iasl 20260930 としていた。上の理由で、v32 と iasl 20260408 に変更した。
+
+## v34-akat（G1c-1：adreno SMMU を Epinephrine が持つ）
+
+| 項目 | 値 |
+|---|---|
+| 変更 | `\_SB.MMU1`（adreno SMMU、qcsmmu）と `\_SB.IMM1`（qciommu）の `_STA` を 0x0F から 0 に変えた。GPU0 の `_DEP` を 8 件から 6 件にした（MMU1 と IMM1 を外した） |
+| 理由 | MMU1 と IMM1 を使うのは GPU0 だけ。GMU と GPU の SMMU の設定は Epinephrine が自分で行う（G0 §9.1、案 S1） |
+| ベース | v33-akat |
+| Silicium-ACPI | `test/v34-akat`、コミット `5fe92aac34dafcddd95d382b8541ea05320a9c59` |
+| Mu-Silicium | `test/v34-akat`（サブモジュールの更新だけ）、CI run 42382200618 |
+| コンパイラ | iasl 20260408。v33 の AML をバイト単位で再現できることを確かめた |
+| DSDT.aml | 81,497 バイト、SHA256 `7226f5f111806bc56abfbc8c361d34a2feb9bde3bc125fcbfcd1f663bbcf1bf2` |
+| 検証 | v33 との逆コンパイル差分は、ヘッダ（長さ、チェックサム 0x8A → 0xFC）と上の 3 か所だけ |
+| ロールバック | v33-akat のイメージで起動し直す |

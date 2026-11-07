@@ -9,7 +9,8 @@ Epinephrine が動作するために必要な、ドライバ本体の外側に�
 | 項目 | 内容 | 状態 |
 |---|---|---|
 | GPU0 `_HID` | `QCOM0A36` → `AKAT0001`（自作用 ID） | 実施済み（2026-11-07、Silicium-ACPI `test/v33-akat` c76edb3。実機での起動は未確認） |
-| GPU0 `_DEP` | 変更なし（MMU0, MMU1, IMM0, IMM1, PEP0, PMIC, RPEN, SCM0 の 8 件） | 現行どおり |
+| GPU0 `_DEP` | v34-akat で MMU1 と IMM1 を外した（MMU0, IMM0, PEP0, PMIC, RPEN, SCM0 の 6 件） | v34-akat（2026-11-07） |
+| MMU1 / IMM1 `_STA` | v34-akat で 0 にした（qcsmmu と qciommu の GPU 用インスタンスを外す。adreno SMMU は Epinephrine が持つ） | v34-akat（2026-11-07） |
 | ベース | v32（v27 + WPSS `_DEP` = SSDD）。再インストール後の環境は v32 がないと起動時に 0xA になるため、v24 から変更 | 実施済み |
 
 差分ファイルは `platform/dsdt/` に格納予定。コンパイルは出荷用 iasl 20260930、検証は「逆コンパイル差分が HID とヘッダだけ」をゲートとする。
