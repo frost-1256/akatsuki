@@ -242,6 +242,29 @@
   - G1c-2 では SMMU を自分で設定する。SMR0 に ID 5 / マスク 0x400、S2CR0 を CB0 への変換、CB0 に AArch64 4KB のステージ 1 表を置いて GMU の IOVA（0x60000000〜）を自前のメモリに張る。
   - ハイパーバイザ（ステージ 2）がこの SMMU への書き込みを許すかは未確認 [U]。最初は sCR0 を変えずに SMR/S2CR/CB0 だけ書き、読み戻しで確かめる。
 
+### 9.6 G1c-2a 実装メモ（手作業で実装する）
+
+G1c-2a（adreno SMMU の書き込みと読み戻し）は手で実装する。2026-11-08 に Claude で実装しようとしたが、途中で止まった。この節では、既存のプローブの枠組みへの組み込み方と、テストの約束事だけを書く。SMMU の設定内容は §9.5 の方針どおりで、事実の出典は下の参照に限る。
+
+- 組み込み先：`src/epinephrine/epi_gpu.cxx`
+  - `EpiGpuCxTest` の「3a. G1c-1」の直後に入れる。ここなら GMU レジスタの読み取りが済んでいて、CX GDSC とブランチが ON の状態になっている。
+  - 有効にするフラグは `EpiGpuProbe` の bit5（0x20）。CX 窓を開く条件 `flags & 0x16` は 2 か所ある（GPU_CC を RW でマップする条件と、`EpiGpuCxTest` を呼ぶ条件）。両方を `0x36` にする。
+  - ブレッドクラム（`EpiGpuProbeStep`）は 0x360〜0x36F を使う。これは未使用。書き込みのたびに 1 ステップ進める。リセットしたら、次の起動で最後のステップを読めば、どの書き込みで落ちたかがわかる。
+  - 結果は EpiDiag に `GpuSmmuW`（REG_BINARY）として、「元の値・書いた値・読み戻した値」の並びで置く。PC 側で解読しやすい。主要な値は `GpuCxText` にも `EpiCat` で足す。
+  - `Sample/SampleDisplay.vcxproj` の DriverVer を上げる。20.x の範囲を守る（例：20.0.2.29）。
+- テストの約束事：
+  - 全体：
+    - sCR0 には書かない。
+    - GMU の CM3 は reset のまま（`cm3_sysreset=1`）にする。GX も OFF のまま。この 2 つで、SMMU を通るアクセスが起きない状態を保つ。
+    - 元の値を全部読んでから書く。書いたらすぐ読み戻す。最後は逆順で元の値に戻す。
+  - CX 窓を閉じるところ：
+    - CX GDSC を落とすと、SMMU の状態も消えるはず [U]。G1c-2a の最後には CX GDSC を落としたあと、もう一度 CX を ON にして SMR0 を読み、値が消えたかを確かめる。消えたかどうかは、そこで初めてわかる。
+    - コンテキストバンクのフォールト割り込みは有効にしない（ハンドラがないため）。
+  - リスク：
+    - リスクは GPU PDC のときと同じ種類で、ハイパーバイザのステージ 2 で止められる可能性がある [U]。落ちたらブレッドクラムで位置を特定し、その書き込みは打ち切る。
+    - 実機で走らせるのは毎回 1 回だけ（ワンショットで、`EpiGpuProbe` は自動で 0 に戻る）。
+- 参照（事実のみ。コードは持ち込まない）：Arm IHI 0062 SMMU Architecture Specification v2（グローバル空間 0/1、コンテキストバンク）、Arm SMMU-500 TRM（r2p4）、本家 Linux `drivers/iommu/arm/arm-smmu/arm-smmu.h` と `arm-smmu-qcom.c`（adreno SMMU の扱い）、`kodiak.dtsi` の `adreno_smmu` と GMU の `iommus`。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
