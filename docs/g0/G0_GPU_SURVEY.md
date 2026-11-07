@@ -142,6 +142,31 @@
 - GPU_CC への読み取りは安全だった（`GPU_CFG_AHB` が ON だったため）。
 - G1b（CX GDSC を入れ、GMU クロックを有効にする）は、まっさらな状態から始められる。
 
+### 8.2 G1b：CX 側の電源投入テスト（v25、20.0.2.25、`EpiGpuProbe` bit1）
+
+`epi_gpu.cxx` の `EpiGpuCxTest`。書き込むのは GPU_CC だけ。GCC の投票、PLL、TZ、SMMU には触らない。GMU と HUB の RCG は、リセット直後と同じ XO（19.2 MHz）のまま使う。
+
+手順：
+1. CX GDSC の SW_COLLAPSE を外し、PWR_ON を待つ。
+2. ahb、cxo、cx_gmu、hub_cx_int、hlos1_vote_smmu の各 CBCR の enable を立てる。
+3. GMU のレジスタを読む。
+4. CBCR と GDSCR を元の値に戻す。
+
+結果（2026-11-07）：成功した。固まらず、元の状態に戻った（`GpuCxStatus=0`）。
+- CX GDSC は 10 µs 以内に ON になった。GDSCR は 0x00222001 から 0xF8222000、GDS_HW_CTRL は 0x5FF4 から 0x80001FE0 に変わった。
+- 5 つのブランチがすべて動いた（CLK_OFF=0）。GMU の RCG の ROOT_OFF も外れた。
+- GMU のレジスタ：
+  - CM3_SYSRESET=1：CM3 はリセットで止まったまま。起動前としては正しい。
+  - FW_INIT_RESULT=0。HFI_CTRL_STATUS=0。
+  - SPTPRAC_PWR_CLK_STATUS=0xC0：GX_HM の GDSC もクロックも OFF。
+  - RPMH_POWER_STATE=0xF。
+- GMU の常時カウンタ（AO counter）は進んでいた（0x408E4 から 0x4759A）。GMU のクロックと CX のバスは生きている。
+- 元に戻したあとの値：GDSCR=0x00222001、HW_CTRL=0x5FF4。G1a のときと同じ。
+
+次（G1c、GMU の起動）の前に調べること：
+- GMU は adreno SMMU（0x3DA0000）のストリーム 5 を通してメモリを使う（`iommus = <&adreno_smmu 5 0x400>`）。HFI のキューやログのバッファを GMU に見せるには、この SMMU を誰が持っていて、どう設定するかを先に決める必要がある（§5.2）。
+- RSCC と PDC の初期化（rpmh_start）は、AOSS や RPMh とのやり取りになる。どこまで安全に書けるかを、机の上で確認する。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
