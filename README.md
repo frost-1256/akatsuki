@@ -1,6 +1,8 @@
 # Akatsuki Project
 
-**Akatsuki Project** は、Qualcomm Adreno GPU 向けのフリーな Windows ドライバを、クリーンルーム方式（ブラックボックス観測と仕様化による再実装）で作るプロジェクトです。ドライバ本体の名前は **Epinephrine**。
+Akatsuki Project, 以下Akatsukiは俺がWoA移植のGPUドライバに対して殺意を感じたから作ろうと考えているフリーで多分権利的に安全なように作るAdreno用ドライバ  
+ドライバ名は何か、Epinephrineね
+以下はなんか適当にMuseに書かせたやつ、読みたかったら読んでね♡
 
 土台にあるのは、Nothing Phone (1)「spacewar」(SM7325) へ Windows 11 を移植してきた調査の蓄積と、freedreno / Turnip の公開知見です。
 
