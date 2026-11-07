@@ -133,3 +133,43 @@ VSync 割り込みを入れる前に、表示のタイミングを読み取り�
 
 ## レビュー
 - Codex の残量が少ないため、別主体レビューは未実施（Claude の自己確認のみ）。
+
+---
+
+# WP2b-3b レポート：ソフトウェア VSync と実際のリフレッシュレート（2026-11-07）
+
+## 変更
+- `epi_vsync.cxx` / `epi_vsync.hxx`（新規、MIT）
+  - `DxgkDdiControlInterrupt`（`DXGK_INTERRUPT_DISPLAYONLY_VSYNC`）と `DxgkDdiGetScanLine` を登録した。
+  - 1 ms の高分解能タイマ（`ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION)`）で INTF1 +0xAC（フレームカウンタ）を見る。値が変わったら、`DxgkCbSynchronizeExecution` の中から `DxgkCbNotifyInterrupt` と `DxgkCbQueueDpc` を呼ぶ。KMDOD が PRESENT_PROGRESS に使っている経路と同じ。
+  - GetScanLine は INTF1 +0xB0 から返す。ライン 0、または VActive を超えるラインを帰線期間として扱う。
+  - ハードウェアには書き込まない。INTF1 は読み取り専用でマップする。
+  - 止め方：`Services\Epinephrine\EpiSoftVsync=0`（DriverEntry で読む。デバイスの再起動が必要）。0 にすると、KMDOD と同じ動作（周波数は未指定）に戻る。
+- `bdd_dmm.cxx`：VSync 制御が有効なときは、ターゲットモードとモニタモードに実際の周波数を入れる。値は PCFG の DSIRefreshRate（60000/1000、HSync 147180000/1000、PixelRate 173,819,580）。パネル情報がないときは 60 Hz を入れる。
+- トレース：VidPnLog が満杯になっても、PresentCount、VsyncNotifies、VsyncSkipped、TraceTimeMs、VidPnLast は更新を続ける。Present のトレースは 64 回ごとにした。
+
+## 結果（20.0.2.15 と 20.0.2.16）
+- 周波数付きのターゲットモードが受け付けられた（AddTgt st0）。OS の報告は 1080×2400 @ 60 Hz。
+- 約 74 秒の操作中に Present 506 回、VSync 通知 2484 回、フレームのとびは 0。画面が止まっているあいだは、dxgkrnl が VSync を無効にする。
+- システムログに表示関係のエラーはない。ユーザーの感想は「普通に動く。単純な動作の遅さは感じるが、ましに感じる」。描画は CPU（WARP）のままなので、遅さそのものは別の問題。
+
+# WP2b-3c レポート：割り込み状態の読み取り専用観察（2026-11-07）
+
+## 変更
+- `EpiVsyncProbe` を拡張した。INTF1 +0x1C4 と、INTF の TE 割り込みブロック（MDP + 0x36800。mainline の `MDP_INTF_REV_7xxx_TEAR_OFF`）の +0x4 もサンプルする。
+- TE ブロックは初めて読むアドレスなので、`EpiVsyncProbe` の bit1 で 1 回だけ読む。読む前にそのビットを落とし、記録（`EpiProbeTearAttempt`）を `ZwFlushKey` で確実にディスクへ書いてから読む。
+
+## 結果（20.0.2.17、oem74）
+- TE ブロックは問題なく読めた（`EpiProbeTearAttempt=2`、WHEA なし）。
+- 有効化レジスタはすべて 0 だった。状態ビットは一度立つと消すまで残る方式で、観察のあいだ値は変わらなかった。
+
+| レジスタ | 値 |
+|---|---|
+| INTF1 +0x1C0（有効化） | 0 |
+| INTF1 +0x1C4（状態） | 0x800（bit11） |
+| TE +0x0（有効化） | 0 |
+| TE +0x4（状態） | 0xF（bit0〜3） |
+| MDSS +0x10 | 0 |
+
+- MDSS +0x10 は、有効になっている割り込みだけをまとめて示すようで、ずっと 0 だった。
+- 読むだけでは、フレームごとに立つビットは見分けられない。見分けるには、クリアレジスタ（+0x8）に書いて消し、また立つ様子を見る必要がある。有効化は 0 のままにするので、割り込みは発生しない。

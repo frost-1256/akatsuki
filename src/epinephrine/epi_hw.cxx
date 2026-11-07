@@ -210,7 +210,12 @@ VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOUR
 #define EPI_PROBE_INTF_SIZE     0x300
 #define EPI_PROBE_SAMPLES       400     // x 250 us = ~100 ms (6 frames at 60 Hz)
 #define EPI_PROBE_STALL_US      250
-#define EPI_PROBE_FIELDS        6       // t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10
+#define EPI_PROBE_FIELDS        8       // t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10, +0x1C4, tear+0x4
+// INTF TE interrupt block (mainline MDP_INTF_REV_7xxx_TEAR_OFF = INTF + 0x800: EN +0x0, STATUS +0x4, CLEAR +0x8).
+// Not read before WP2b-3c; read only when EpiVsyncProbe bit1 is set, and that bit is cleared first (one shot),
+// so a fault on this address cannot repeat at every boot.
+#define EPI_PROBE_TEAR_OFF      0x36800
+#define EPI_PROBE_TEAR_SIZE     0x40
 #define EPI_PROBE_DIFF_CCH      1024
 
 VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
@@ -228,9 +233,20 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     PWCHAR diff = NULL;
     PVOID intf = NULL;
     PVOID mdss = NULL;
+    PVOID tear = NULL;
+    ULONG tearBefore[EPI_PROBE_TEAR_SIZE / 4] = {};
+    ULONG tearAfter[EPI_PROBE_TEAR_SIZE / 4] = {};
+    ULONG probeFlags = 0;
     const ULONG sampleBytes = EPI_PROBE_SAMPLES * EPI_PROBE_FIELDS * sizeof(ULONG);
 
-    if (EpiQueryDword(hParams, L"EpiVsyncProbe", 0) == 0) { status = 1; goto done; }
+    probeFlags = EpiQueryDword(hParams, L"EpiVsyncProbe", 0);
+    if (probeFlags == 0) { status = 1; goto done; }
+    if (probeFlags & 2)
+    {
+        EpiSetDword(hParams, L"EpiVsyncProbe", probeFlags & ~2UL);   // one shot (see EPI_PROBE_TEAR_OFF)
+        EpiSetDword(hParams, L"EpiProbeTearAttempt", 1);              // non-volatile breadcrumb, 2 = read ok
+        ZwFlushKey(hParams);                                          // must reach disk before the read
+    }
     if (!pRes->MdpFound || pRes->MdpLength < EPI_PROBE_INTF_OFF + EPI_PROBE_INTF_SIZE) { status = 2; goto done; }
 
     samples = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sampleBytes, 'ipEE'));
@@ -246,12 +262,24 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         pa.QuadPart = pRes->MdpBase.QuadPart;
         mdss = MmMapIoSpaceEx(pa, 0x20, PAGE_READONLY | PAGE_NOCACHE);
         if (intf == NULL || mdss == NULL) { status = 4; goto done; }
+        if (probeFlags & 2)
+        {
+            pa.QuadPart = pRes->MdpBase.QuadPart + EPI_PROBE_TEAR_OFF;
+            tear = MmMapIoSpaceEx(pa, EPI_PROBE_TEAR_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+            if (tear == NULL) { status = 4; goto done; }
+        }
     }
 
     {
         volatile ULONG* r = static_cast<volatile ULONG*>(intf);
         volatile ULONG* m = static_cast<volatile ULONG*>(mdss);
+        volatile ULONG* te = static_cast<volatile ULONG*>(tear);
         for (ULONG i = 0; i < EPI_PROBE_INTF_SIZE / sizeof(ULONG); ++i) { before[i] = READ_REGISTER_ULONG(r + i); }
+        if (te != NULL)
+        {
+            for (ULONG i = 0; i < EPI_PROBE_TEAR_SIZE / 4; ++i) { tearBefore[i] = READ_REGISTER_ULONG(te + i); }
+            EpiSetDword(hParams, L"EpiProbeTearAttempt", 2);
+        }
 
         LARGE_INTEGER freq;
         const LARGE_INTEGER t0 = KeQueryPerformanceCounter(&freq);
@@ -265,10 +293,18 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             o[3] = READ_REGISTER_ULONG(r + 0x298 / 4);
             o[4] = READ_REGISTER_ULONG(r + 0x2B0 / 4);
             o[5] = READ_REGISTER_ULONG(m + 0x10 / 4);
+            o[6] = READ_REGISTER_ULONG(r + 0x1C4 / 4);
+            o[7] = te != NULL ? READ_REGISTER_ULONG(te + 1) : 0;
             KeStallExecutionProcessor(EPI_PROBE_STALL_US);
         }
 
         for (ULONG i = 0; i < EPI_PROBE_INTF_SIZE / sizeof(ULONG); ++i) { after[i] = READ_REGISTER_ULONG(r + i); }
+        if (te != NULL)
+        {
+            for (ULONG i = 0; i < EPI_PROBE_TEAR_SIZE / 4; ++i) { tearAfter[i] = READ_REGISTER_ULONG(te + i); }
+            EpiSetValue(hDiag, L"ProbeTearBefore", REG_BINARY, tearBefore, sizeof(tearBefore));
+            EpiSetValue(hDiag, L"ProbeTearAfter", REG_BINARY, tearAfter, sizeof(tearAfter));
+        }
     }
 
     diff[0] = 0;
@@ -288,6 +324,7 @@ done:
     EpiSetDword(hDiag, L"ProbeStatus", status);
     if (intf != NULL) { MmUnmapIoSpace(intf, EPI_PROBE_INTF_SIZE); }
     if (mdss != NULL) { MmUnmapIoSpace(mdss, 0x20); }
+    if (tear != NULL) { MmUnmapIoSpace(tear, EPI_PROBE_TEAR_SIZE); }
     if (diff != NULL) { ExFreePoolWithTag(diff, 'ipEE'); }
     if (after != NULL) { ExFreePoolWithTag(after, 'ipEE'); }
     if (before != NULL) { ExFreePoolWithTag(before, 'ipEE'); }

@@ -32,8 +32,9 @@ VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOUR
 
 // Read-only timing probe (WP2b-3a), StartDevice after EpiHwSnapshot. Samples INTF1 frame/line/tear counters and
 // MDSS HW_INTR_STATUS every 250 us for ~100 ms (stalls the start path that long) and diffs INTF1 before/after.
-// EpiDiag: ProbeStatus, ProbeSamples (REG_BINARY, 400 x {t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10}),
+// EpiDiag: ProbeStatus, ProbeSamples (REG_BINARY, 400 x {t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10, +0x1C4, tear+0x4}),
 // ProbeIntfDiff ("off:before>after;"). Off by default; runs only when Device Parameters\EpiVsyncProbe != 0.
+// EpiVsyncProbe bit1 (one shot) also reads the INTF TE interrupt block (MDP + 0x36800): ProbeTearBefore/After.
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
 
