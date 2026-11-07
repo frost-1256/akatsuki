@@ -265,6 +265,50 @@ G1c-2a（adreno SMMU の書き込みと読み戻し）は手で実装する。20
     - 実機で走らせるのは毎回 1 回だけ（ワンショットで、`EpiGpuProbe` は自動で 0 に戻る）。
 - 参照（事実のみ。コードは持ち込まない）：Arm IHI 0062 SMMU Architecture Specification v2（グローバル空間 0/1、コンテキストバンク）、Arm SMMU-500 TRM（r2p4）、本家 Linux `drivers/iommu/arm/arm-smmu/arm-smmu.h` と `arm-smmu-qcom.c`（adreno SMMU の扱い）、`kodiak.dtsi` の `adreno_smmu` と GMU の `iommus`。
 
+### 9.7 G1c-2a の実装（v29、20.0.2.29、実機未実行）
+
+`EpiGpuProbe=0x20`（bit5）で単独実行できる。既存の bit6（GMU TCM ロード）も保持し、CX 窓を開くマスクは両方のビットを含む `0x76` にした。ワンショットの解除・flush は既存どおり。
+
+- `EpiSmmuWriteTest` を G1c-1 の直後に追加。CM3_SYSRESET=1、GX GDSC の collapse、SMMU クロック ON、§9.5 と同じ IDR0/1/2/7 を確認する。全 SMR の VALID と全 CB の SCTLR.M/CFIE/CFRE が 0 でなければ書かない。CX が最初から ON の場合も試験しない。
+- 書く順番は CB0 SCTLR（0x106：M/CFIE/CFRE は 0）、CBAR0（0x1F300）、CBA2R0（1：AArch64）、S2CR0（0：変換先 CB0）、SMR0（0x84000005：ID 5、mask 0x400、VALID）。全対象の元の値を先に読み、各書き込みを即時読み戻しする。不一致なら後続の設定を止め、書いた対象すべてを逆順で復元・読み戻しする。sCR0 は書かない。
+- ページテーブルは作らず、CB0 の変換も開始しない。これは書き込み可否の試験であり、GMU メモリをマップする `EpiSmmuMap/Unmap` や、運用用の `EpiSmmuEnable/Disable` ではない。それらには別途、表の確保、キャッシュ整合性、TLB 無効化と同期の実装が必要。
+- ブレッドクラム：`0x35E` は事前確認、`0x360..364` は上記順の書き込み、`0x365..369` は逆順の復元。CX collapse 完了後、`0x36A` で再投入し、`0x36B..36F` で 5 ブランチを有効化、`0x35F` で SMR0 を読む。各 CX 窓の後始末は `0x341..345` でブランチを逆順復元、`0x346` で GDSCR を復元する。
+- **電源断で値が消えるかは未確定 [U]。** SMR0 は電源断の前に元に戻してある。そのため、再投入後が 0 でも、試験値が電源断によって消えた証拠にはならない。復元後の値と再投入後の値を別々に記録する。
+
+EpiDiag の診断形式：
+
+| 値 | 内容 |
+|---|---|
+| `GpuSmmuW` (REG_BINARY) | 上記書き込み順の 5 レコード、各 5 DWORD（little endian）：SMMU ベースからのバイト offset、元の値、設定予定値、即時読み戻し値、復元読み戻し値。合計 100 バイト。未実行フィールドは 0、必ず status と併読する |
+| `GpuSmmuWStatus` | 0 完了、1 map 失敗、2 CM3/GX/クロックの前提不成立、3 ID/layout 不一致、4 既存 stream/context あり、5 書き込み不一致、6 復元不一致、7 SMMU 試験未到達 |
+| `GpuSmmuWCycleStatus` | 0 再投入後の読み取りと再 collapse 完了、1 再投入 timeout、2 branch timeout、3 map 失敗、4 最終 collapse timeout、7 再投入試験未到達 |
+| `GpuSmmuWAfterSmr0` | 再投入後の SMR0。未取得は 0xFFFFFFFF |
+| `GpuCxStatus` | 従来値に加え、14 最初から CX が ON（試験せず）、15 再投入試験失敗。SMMU 自体の成否は `GpuSmmuWStatus` を見る |
+
+主要値は `GpuCxText` にも残す。文字列バッファを 3072 WCHAR に広げ、既存の GMU 診断と同時に記録できるようにした。
+
+レジスタ定義の照合元（事実のみ、コードは取り込んでいない）：[本家 arm-smmu.h](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)、[adreno SMMU の扱い](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c)。ハイパーバイザによる書き込み許可と実機の読み戻し結果は未検証 [U]。
+
+### 9.7 G1c-2b 結果（2026-11-08、v34-akat、Epinephrine v29、`EpiGpuProbe=0x40`）
+
+- ファームウェア：stock vendor の `a660_gmu.bin`（55,256 バイト、SHA-256 6bb9360a…）。Adreno 635 は a660 のファームウェアを使う。
+  - 先頭の 11 ブロックは size 0 の領域記述。そのうち 2 つは type 7（0x60000000 と 0x60001000、各 0x1000）。
+  - データを持つのは 4 ブロック：
+    | ブロック | GMU アドレス | サイズ | 中身 |
+    |---|---|---|---|
+    | blk11 | 0x0 | 0x1DC | ITCM、ベクタテーブル。先頭は初期 SP = 0x10007F80 |
+    | blk12 | 0x4000 | 0xD4CC | icache、**コード本体。SMMU 経由** |
+    | blk13 | 0x10007F98 | 0x28 | DTCM |
+    | blk14 | 0x10007FDC | 0x18 | DTCM。CORE_FW_VERSION = 0x30010008 を含む |
+- 結果：GpuFwStatus 0。リセットなし。
+  - ITCM 0x1DC バイトと DTCM 0x40 バイトを書き、読み戻しの不一致は 0。
+  - `CORE_FW_VERSION` は書く前が 0x9E58CE6C（TCM のごみ）、書いた後は **0x30010008**（v3.1.8）。
+  - CM3 は reset のまま（`cm3_sysreset=1`）。CX は元どおり落ちた。
+- 意味すること：
+  - CX 窓の中で、GMU の TCM は AHB から読み書きできる。
+  - CM3 を起動するには、icache（IOVA 0x4000）に blk12 を置いて SMMU で対応付ける必要がある。0x60000000 の dummy 領域も同じ。
+  - バージョンが 0x20010004 より大きいので、起動完了の判定は `(FW_INIT_RESULT & 0x1FF) == 0x100` になる（0xBABEFACE ではない）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
