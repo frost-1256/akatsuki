@@ -191,6 +191,7 @@
     <ClCompile Include="..\BltFuncs.cxx" />
     <ClCompile Include="..\BltHw.cxx" />
     <ClCompile Include="..\memory.cxx" />
+    <ClCompile Include="..\epi_hw.cxx" />
     <ResourceCompile Include="..\sampledisplay.rc" />
   </ItemGroup>
   <ItemGroup>

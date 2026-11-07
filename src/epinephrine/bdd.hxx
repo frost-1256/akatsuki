@@ -136,6 +136,9 @@ typedef struct _CURRENT_BDD_MODE
     } FrameBuffer;
 } CURRENT_BDD_MODE;
 
+// Epinephrine (Akatsuki) additions
+#include "epi_hw.hxx"
+
 class BASIC_DISPLAY_DRIVER;
 
 class BDD_HWBLT
@@ -202,6 +205,9 @@ private:
 
     // Device information
     DXGK_DEVICE_INFO m_DeviceInfo;
+
+    // Epinephrine: display resources found in StartDevice (EpiHwSnapshot)
+    EPI_HW_RESOURCES m_EpiRes;
 
 public:
     BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceObject);

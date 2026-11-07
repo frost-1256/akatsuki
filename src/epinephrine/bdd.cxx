@@ -70,6 +70,10 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
     // Ignore return value, since it's not the end of the world if we failed to write these values to the registry
     RegisterHWInfo();
 
+    // Epinephrine (Akatsuki) WP2b-1: one-shot read-only snapshot of the display block into
+    // Device Parameters\EpiDiag. Diagnostic only; the start path does not depend on it.
+    EpiHwSnapshot(&m_DeviceInfo, &m_EpiRes);
+
     // TODO: Uncomment the line below after updating the TODOs in the function CheckHardware
 //    Status = CheckHardware();
     if (!NT_SUCCESS(Status))

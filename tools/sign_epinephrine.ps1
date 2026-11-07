@@ -26,4 +26,10 @@ $ErrorActionPreference = 'Continue'
 & $SignTool verify /pa /c (Join-Path $pkg 'epinephrine.cat') (Join-Path $pkg 'Epinephrine.sys') 2>&1 | Out-File $log -Append -Encoding utf8
 "verify_catalog_exit=$LASTEXITCODE (nonzero expected on the PC: test root untrusted)" | Out-File $log -Append -Encoding utf8
 $ErrorActionPreference = 'Stop'
-Get-ChildItem $pkg -File | ForEach-Object { "$($_.Name)  $((Get-FileHash $_.FullName).Hash)" } | Tee-Object -FilePath $log -Append
+# .NET SHA256 instead of Get-FileHash (the Utility module is not always loadable in a bare -NoProfile host).
+$sha = [System.Security.Cryptography.SHA256]::Create()
+Get-ChildItem $pkg -File | ForEach-Object {
+  $fs = [System.IO.File]::OpenRead($_.FullName)
+  try { $h = -join ($sha.ComputeHash($fs) | ForEach-Object { $_.ToString('X2') }) } finally { $fs.Dispose() }
+  "$($_.Name)  $h"
+} | Tee-Object -FilePath $log -Append
