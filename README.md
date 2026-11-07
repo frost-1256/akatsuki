@@ -29,4 +29,6 @@ Akatsuki Project, 以下Akatsukiは俺がWoA移植のGPUドライバに対して
 
 ## ライセンス
 
-MIT License（[LICENSE](LICENSE)）。土台に取り込む予定の WDK サンプル (KMDOD) は Microsoft の MIT ライセンスに従う。
+Epinephrine のために新しく書いたコードは MIT License（[LICENSE](LICENSE)）。
+
+土台の WDK サンプル KMDOD（`src/epinephrine/` のうちサンプル由来のファイルとその改変版）は **Microsoft Public License（MS-PL）** に従う（[src/epinephrine/LICENSE-MSPL.txt](src/epinephrine/LICENSE-MSPL.txt)、出自は [src/epinephrine/UPSTREAM.md](src/epinephrine/UPSTREAM.md)）。リポジトリは MIT と MS-PL の混在になる。

@@ -1,0 +1,62 @@
+; Epinephrine.inf - Akatsuki Project display driver for Nothing Phone (1) "spacewar" (SM7325)
+; Derived from the WDK KMDOD sample INF (MS-PL, see ..\LICENSE-MSPL.txt).
+; Binds ONLY to ACPI\AKAT0001 (GPU0 with the Akatsuki DSDT). The sample's PCI/ACPI class-code
+; matches are intentionally removed: GPU0 carries _CLS 03/00/00, and a class match would bind
+; regardless of _HID.
+
+[Version]
+Signature="$Windows NT$"
+Class=Display
+ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderString%
+DriverVer=11/07/2026,0.1.0.0
+CatalogFile=Epinephrine.cat
+PnpLockdown=1
+
+[DestinationDirs]
+Epinephrine.Files = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+Epinephrine.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Akatsuki,NTarm64.10.0...16299
+
+[Akatsuki.NTarm64.10.0...16299]
+%DeviceName% = Epinephrine_Inst, ACPI\AKAT0001
+
+[Epinephrine_Inst]
+CopyFiles = Epinephrine.Files
+
+[Epinephrine_Inst.Services]
+AddService = Epinephrine, 0x00000002, Epinephrine_Service_Inst, Epinephrine_EventLog_Inst
+
+[Epinephrine_Service_Inst]
+ServiceType   = %SERVICE_KERNEL_DRIVER%
+StartType     = %SERVICE_DEMAND_START%
+ErrorControl  = %SERVICE_ERROR_IGNORE%
+ServiceBinary = %13%\Epinephrine.sys
+
+[Epinephrine.Files]
+Epinephrine.sys
+
+[Epinephrine_EventLog_Inst]
+AddReg = Epinephrine_EventLog_Inst.AddReg
+
+[Epinephrine_EventLog_Inst.AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Strings]
+ProviderString   = "Akatsuki Project"
+ManufacturerName = "Akatsuki Project"
+DiskName         = "Epinephrine Install Disk"
+DeviceName       = "Epinephrine Display (Akatsuki)"
+SERVICE_KERNEL_DRIVER = 0x1
+SERVICE_DEMAND_START  = 0x3
+SERVICE_ERROR_IGNORE  = 0x0
+REG_EXPAND_SZ = 0x00020000
+REG_DWORD     = 0x00010001
