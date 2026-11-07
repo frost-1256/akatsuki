@@ -30,10 +30,13 @@ Epinephrine が動作するために必要な、ドライバ本体の外側に�
 
 - グラフィックス系はブート時無効が既定（ConfigFlags）。有効化は手動セッションで行い、終了後は無効化と ConfigFlags の読み戻し確認までをひと続きとする
 - 公式ドライバと Epinephrine は同じ表示ハードウェアに二重にバインドしない。実験時は公式側を無効化する
+- BCD の `numproc 4` はグラフィックス実験時の必須条件（8 コアでは BugCheck 0x101 で固まる）
 
 ## 5. 参考: 公式スタック側の設定（Epinephrine の依存ではない）
 
-再インストール時に欠落すると公式ドライバ側が開始不能になる設定の記録。切り分けの参照用:
+再インストール時に欠落すると公式ドライバ側が開始不能になる設定の記録。切り分けの参照用（2026-11-07 の引き継ぎで確定した完全版）:
 
+- `HKLM\SOFTWARE\QCOM\Drivers\DxKMD`、`DxKMD\DISPLAY`、`DxKMD\GRAPHICS`: それぞれ `WriteEDIDToReg=1`（DWORD）
 - `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\GRAPHICS`: ForceActive=1、PreventPowerCollapse=1
-- `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\GRAPHICS\A6x`: DisableGmuACD=0x11、DisableICG=1
+- `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\GRAPHICS\A6x`: DisableGmuACD=0x11、DisableICG=1（**ACD を切らないと GMU が GX_BW_PERF_VOTE に応答せず、開始が 10 秒でタイムアウトする**）
+- `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\DISPLAY\PanelEdid`（128 バイト）: qcdxkm が自分で書くので用意は不要
