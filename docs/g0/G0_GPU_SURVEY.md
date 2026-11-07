@@ -167,6 +167,42 @@
 - GMU は adreno SMMU（0x3DA0000）のストリーム 5 を通してメモリを使う（`iommus = <&adreno_smmu 5 0x400>`）。HFI のキューやログのバッファを GMU に見せるには、この SMMU を誰が持っていて、どう設定するかを先に決める必要がある（§5.2）。
 - RSCC と PDC の初期化（rpmh_start）は、AOSS や RPMh とのやり取りになる。どこまで安全に書けるかを、机の上で確認する。
 
+## 9. G1c の前の机上調査（2026-11-07）
+
+### 9.1 adreno SMMU（MMU1）の持ち主
+
+- DSDT v33-akat の `\_SB.MMU1`（`QCOM0A09`、UID 1）が adreno SMMU を受け持っている。_CRS は 0x3DA0000 / 0x20000 [P]。
+- スマホ上では **qcsmmu.sys（Qualcomm 製）** が `ACPI\VEN_QCOM&DEV_0A09...` として動いている（Status OK）[P]。もう 1 つの ` ` は MMU0（apps SMMU）。
+- `IMM0`/`IMM1`（`QCOM068F`）には qciommu.sys が付いている [P]。
+- **MMU1 を _DEP に持っているのは GPU0 だけ**（行 13522–13523：MMU0、MMU1、IMM0、IMM1、PEP0…）[P]。MMU0 は多くのデバイスが使っている。
+- IORT はない（HKLM\HARDWARE\ACPI に DSDT、FADT、RSDT、SSDT だけ）[P]。Windows 標準の DMA リマップではなく、Qualcomm のドライバが SMMU を握る構成になっている。
+- GMU はストリーム 5 を使う（`iommus = <&adreno_smmu 5 0x400>`）。GMU のファームウェアは決まった IOVA を前提にしている（0x60000000 から始まる uncached 領域、HFI と log のバッファ）[P]。このためバイパスでは動かせず、変換テーブルが必要になる。
+- adreno SMMU 自体も、GPU_CC の `hlos1_vote_gpu_smmu` と CX の電源の内側にある [I]。G1a の時点ではこのクロックが OFF だったので、qcsmmu は今は MMU1 を実際には動かしていないと考えられる [I]。
+
+選択肢：
+
+| 案 | 内容 | 評価 |
+|---|---|---|
+| S1：自分で持つ | MMU1 を Windows から外し（DSDT で GPU0 の _DEP から MMU1 を抜き、MMU1 の _STA を 0 にする）、Epinephrine が SMMU-500 のコンテキストバンクを自分で設定する。手本は本家 Linux の arm-smmu（qcom の adreno-smmu 向け対策を含む）で、事実だけを使う | オープンな方針に合う。MMU1 を使うのは GPU0 だけなので、他への影響は小さい。ハイパーバイザが SMMU の一部の書き込みを横取りする可能性があり、それを確かめる必要がある [U] |
+| S2：qcsmmu を使う | qcsmmu / qciommu のインターフェースを解析して呼ぶ | プロプラ依存が残る。解析も必要になる。方針に合わない |
+
+おすすめは S1。注意点として、MMU1 をデバイスマネージャーで無効にするだけだと、_DEP が満たされず GPU0（Epinephrine）が起動しなくなるおそれがある [I]。外すときは DSDT（v34）でまとめて変える。
+
+### 9.2 RSCC と PDC
+
+- A635 は a660 ファミリーに入る。本家 Linux では、この場合 `pdc_in_aop = true` になり、**PDC の TCS コマンドは AOP（ファームウェア）側が設定済み**として書かない [P]。
+- このためドライバが書くのは次の範囲だけ：
+  - GPU PDC（0xB290000、_CRS にある）：`PDC_GPU_SEQ_START_ADDR = 0` と `PDC_GPU_ENABLE_PDC = 0x80000001` の 2 つ。
+  - RSCC（GPU 専用の RSC。kodiak では "rscc" リソース。DSDT の _CRS では 0x3DE0000 / 0x10000）：約 20 個の初期化値（シーケンスメモリと TCS 設定）。そのあと rpmh_start（`RSCC_CONTROL_REQ` を立てて ACK と SEQ_BUSY を待つ）。
+- どちらも GPU 専用のブロックで、他のサブシステムの投票には触れない [I]。実際に電圧（GX/CX のレール）を投票するのは、GMU のファームウェアが動き出してから [I]。
+- GMU に渡す ARC レベル表（gfx.lvl、cx.lvl、mx.lvl）は、cmd-db から読む。cmd-db は予約メモリ 0x80860000 / 0x20000 にあり、読むだけで済む [P]。形式は本家 Linux の cmd-db.c で確認する（事実だけ）。
+
+### 9.3 G1c の分け方（案）
+
+1. **G1c-0（読むだけ）**：cmd-db からレベル表を読む。G1b と同じ手順で CX を入れ、RSCC と GPU PDC の現在値を読む。
+2. **G1c-1（DSDT v34）**：MMU1 を Windows から外す（S1）。Epinephrine から adreno SMMU を読めるかを確かめる。
+3. **G1c-2**：SMMU のコンテキストバンク（ストリーム 5）、RSCC と PDC の初期化、GMU ファームウェアの読み込み、CM3 の起動。`FW_INIT_RESULT` に 0xBABEFACE が出るまで。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
