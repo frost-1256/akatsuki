@@ -184,6 +184,10 @@ VOID BASIC_DISPLAY_DRIVER::EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format,
     EpiSetValue(hDiag, L"PresentUsTotal", REG_QWORD, &m_EpiPresentUs, sizeof(m_EpiPresentUs));
     EpiSetValue(hDiag, L"PresentPixelsTotal", REG_QWORD, &m_EpiPresentPixels, sizeof(m_EpiPresentPixels));
     EpiSetDword(hDiag, L"PresentMaxUs", m_EpiPresentMaxUs);
+    EpiSetDword(hDiag, L"BrightEnabled", (ULONG)m_Dsi.Enabled);
+    EpiSetDword(hDiag, L"BrightLevel", m_Dsi.Level);
+    EpiSetDword(hDiag, L"BrightSends", m_Dsi.Sends);
+    EpiSetDword(hDiag, L"BrightFails", m_Dsi.Fails);
     EpiSetDword(hDiag, L"TraceTimeMs", (ULONG)(KeQueryInterruptTime() / 10000));
     ZwClose(hDiag);
     ZwClose(hParams);

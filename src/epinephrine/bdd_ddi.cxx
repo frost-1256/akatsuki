@@ -60,6 +60,7 @@ DriverEntry(
     InitialData.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = BddDdiStopDeviceAndReleasePostDisplayOwnership;
     InitialData.DxgkDdiSystemDisplayEnable          = BddDdiSystemDisplayEnable;
     InitialData.DxgkDdiSystemDisplayWrite           = BddDdiSystemDisplayWrite;
+    InitialData.DxgkDdiQueryInterface               = BddDdiQueryInterface;   // Epinephrine: brightness (WP2b-5)
 
     // Epinephrine (WP2b-3b): VSync control. Registering these makes dxgkrnl expect VSync notifications and real
     // target-mode frequencies; Services\Epinephrine\EpiSoftVsync=0 keeps the plain KMDOD behaviour.
@@ -582,6 +583,17 @@ BddDdiGetScanLine(
     BDD_ASSERT_CHK(hAdapter != NULL);
     BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(hAdapter);
     return pBDD->GetScanLine(pGetScanLine);
+}
+
+NTSTATUS
+BddDdiQueryInterface(
+    _In_ CONST PVOID pDeviceContext,
+    _Inout_ PQUERY_INTERFACE pQueryInterface)
+{
+    PAGED_CODE();
+    BDD_ASSERT_CHK(pDeviceContext != NULL);
+    BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(pDeviceContext);
+    return pBDD->QueryInterface(pQueryInterface);
 }
 
 VOID

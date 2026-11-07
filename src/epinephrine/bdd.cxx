@@ -28,6 +28,7 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     RtlZeroMemory(&m_Panel, sizeof(m_Panel));
     m_EpiLog[0] = 0;
     RtlZeroMemory(&m_Vsync, sizeof(m_Vsync));
+    RtlZeroMemory(&m_Dsi, sizeof(m_Dsi));
     m_EpiLogSeq = 0;
     m_EpiPresentCount = 0;
     m_EpiPresentUs = 0;
@@ -132,6 +133,37 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
         EpiTrace(L"VsyncStart hw%u st%X", (ULONG)hw, (ULONG)vst);
     }
     {
+        // WP2b-5 brightness. Device Parameters (both reset to 0 and flushed before any DSI access when one-shot):
+        //   EpiBrightness: 0 = off (default), 1 = offer the brightness interface (panel reported as internal),
+        //                  2 = same, this start only.
+        //   EpiBrightTest: 1..4095 = send that level once at start (one shot).
+        HANDLE hParams = NULL;
+        HANDLE hDiag = NULL;
+        ULONG mode = 0;
+        ULONG level = 0;
+        if (NT_SUCCESS(EpiOpenDiag(m_DeviceInfo.PhysicalDeviceObject, &hParams, &hDiag)))
+        {
+            mode = EpiQueryDword(hParams, L"EpiBrightness", 0);
+            level = EpiQueryDword(hParams, L"EpiBrightTest", 0);
+            if (mode == 2) { EpiSetDword(hParams, L"EpiBrightness", 0); }
+            if (level != 0) { EpiSetDword(hParams, L"EpiBrightTest", 0); }
+            if (mode == 2 || level != 0) { ZwFlushKey(hParams); }
+            ZwClose(hDiag);
+            ZwClose(hParams);
+        }
+        if (mode == 1 || mode == 2 || (level != 0 && level <= EPI_BL_MAX_LEVEL))
+        {
+            NTSTATUS dst = EpiDsiStart(&m_Dsi, &m_EpiRes);
+            m_Dsi.Enabled = (m_Dsi.Ready && (mode == 1 || mode == 2)) ? TRUE : FALSE;
+            EpiTrace(L"DsiStart st%X ready%u bl%u", (ULONG)dst, (ULONG)m_Dsi.Ready, (ULONG)m_Dsi.Enabled);
+            if (m_Dsi.Ready && level != 0 && level <= EPI_BL_MAX_LEVEL)
+            {
+                NTSTATUS bst = EpiDsiSendBrightness(&m_Dsi, level);
+                EpiTrace(L"BrightTest %u st%X idle%u done%u", level, (ULONG)bst, m_Dsi.LastIdleUs, m_Dsi.LastDoneUs);
+            }
+        }
+    }
+    {
         // Device Parameters\EpiFastPresent: present path (blthw.cxx). Default 1.
         HANDLE hParams = NULL;
         HANDLE hDiag = NULL;
@@ -157,6 +189,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StopDevice(VOID)
     PAGED_CODE();
 
     EpiVsyncStop(&m_Vsync);
+    EpiDsiStop(&m_Dsi);
     CleanUp();
 
     m_Flags.DriverStarted = FALSE;
@@ -246,7 +279,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::QueryChildRelations(_Out_writes_bytes_(ChildRelat
     {
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
         pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
-        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = m_CurrentModes[0].Flags.IsInternal ? D3DKMDT_VOT_INTERNAL : D3DKMDT_VOT_OTHER;
+        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = (m_CurrentModes[0].Flags.IsInternal || m_Dsi.Enabled) ? D3DKMDT_VOT_INTERNAL : D3DKMDT_VOT_OTHER;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
         // TODO: Replace 0 with the actual ACPI ID of the child device, if available
@@ -255,6 +288,30 @@ NTSTATUS BASIC_DISPLAY_DRIVER::QueryChildRelations(_Out_writes_bytes_(ChildRelat
     }
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS BASIC_DISPLAY_DRIVER::QueryInterface(_Inout_ PQUERY_INTERFACE pQueryInterface)
+{
+    PAGED_CODE();
+    NTSTATUS st = STATUS_NOT_SUPPORTED;
+    if (m_Dsi.Enabled)
+    {
+        st = EpiBrightnessQueryInterface(this, pQueryInterface);
+    }
+    const ULONG g = (pQueryInterface->InterfaceType != NULL) ? pQueryInterface->InterfaceType->Data1 : 0;
+    EpiTrace(L"QI %08X v%u sz%u st%X", g, (ULONG)pQueryInterface->Version, (ULONG)pQueryInterface->Size, (ULONG)st);
+    return st;
+}
+
+NTSTATUS BASIC_DISPLAY_DRIVER::EpiBrightnessSet(UCHAR Percent)
+{
+    PAGED_CODE();
+    if (Percent > 100) { return STATUS_INVALID_PARAMETER; }
+    const ULONG level = EpiDsiPercentToLevel(Percent);
+    NTSTATUS st = EpiDsiSendBrightness(&m_Dsi, level);
+    if (NT_SUCCESS(st)) { m_Dsi.Percent = Percent; }
+    EpiTrace(L"Bl %u lv%u st%X idle%u done%u", (ULONG)Percent, level, (ULONG)st, m_Dsi.LastIdleUs, m_Dsi.LastDoneUs);
+    return st;
 }
 
 NTSTATUS BASIC_DISPLAY_DRIVER::QueryChildStatus(_Inout_ DXGK_CHILD_STATUS* pChildStatus,
