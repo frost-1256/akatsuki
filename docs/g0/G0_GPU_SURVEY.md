@@ -117,6 +117,31 @@
 - ブレッドクラム：読む直前ごとに `Device Parameters\EpiGpuProbeStep` に番号を書いて flush する。番号の意味は、0x1xx が GCC、0x2xx が GPU_CC の何番目か、0xFFFF が最後まで戻ったこと。
 - 結果は EpiDiag に書く：`GpuProbeStatus`（0 完了、1 無効、2 _CRS に GPU_CC がない、3 メモリ不足、4 マップ失敗、5 `GPU_CFG_AHB` が OFF なので GPU_CC は読まなかった）、`GpuProbe`（{物理アドレス, 値} の組）、`GpuProbeText`。
 
+### 8.1 G1a の結果（2026-11-07、v24）
+
+最後まで読めた。固まらなかった（`EpiGpuProbeStep=0xFFFF`、`GpuProbeStatus=0`）。
+
+| レジスタ | 値 | 読み方 |
+|---|---|---|
+| GCC `GPU_CFG_AHB` (0x71004) | 0x00000009 | ON。このため GPU_CC が読めた |
+| GCC `GPU_MEMNOC_GFX` (0x7100C) | 0x80004221 | 有効にはなっているが OFF（CLK_OFF） |
+| GCC `GPU_SNOC_DVM` (0x71018) | 0x80000001 | 有効にはなっているが OFF |
+| GCC `DDRSS_GPU_AXI` (0x71154) | 0x00300001 | ON |
+| PLL0 / PLL1 MODE | 0 / 0 | 両方とも停止、ロックしていない |
+| GX GDSCR / CX GDSCR | 0x00222001 / 0x00222001 | SW_COLLAPSE=1、PWR_ON=0。**両方とも電源が落ちている** |
+| `cx_gmu` / `gx_gmu` | 0x80006221 / 0x80000000 | OFF（cx_gmu は有効になっているが、CX GDSC が落ちているので止まっている） |
+| GMU RCG CMD | 0x80000000 | ROOT_OFF |
+| HUB RCG CMD/CFG | 0 / 0 | XO を分周なしで使っている |
+| `hub_aon` | 0x00000001 | ON |
+| `ahb` / `crc_ahb` / `cxo_aon` | 0 | OFF とは出ていない |
+| `cxo`、`hub_cx_int`、`cx_snoc_dvm`、`sleep`、`hlos1_vote_smmu` | bit31=1 | OFF |
+| 0x1534（リミッタ） | 0 | 立っていない |
+
+まとめ：
+- GPU コアは完全に冷えた状態にある。CX と GX のどちらの電源も落ちていて、GMU のクロックも PLL も止まっている。UEFI も他のドライバも、GPU コアには触れていない。
+- GPU_CC への読み取りは安全だった（`GPU_CFG_AHB` が ON だったため）。
+- G1b（CX GDSC を入れ、GMU クロックを有効にする）は、まっさらな状態から始められる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
