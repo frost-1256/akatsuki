@@ -40,3 +40,11 @@ Epinephrine が動作するために必要な、ドライバ本体の外側に�
 - `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\GRAPHICS`: ForceActive=1、PreventPowerCollapse=1
 - `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\GRAPHICS\A6x`: DisableGmuACD=0x11、DisableICG=1（**ACD を切らないと GMU が GX_BW_PERF_VOTE に応答せず、開始が 10 秒でタイムアウトする**）
 - `HKLM\SOFTWARE\QCOM\Drivers\DxKMD\DISPLAY\PanelEdid`（128 バイト）: qcdxkm が自分で書くので用意は不要
+
+## 5. 配置の前提（2026-11-07 に判明）
+
+| 項目 | 内容 | 状態 |
+|---|---|---|
+| テスト証明書の信頼 | spacewar テスト証明書（公開鍵、`270E894625FF92924385BB9C7774E455D464F890`）を `LocalMachine\Root` と `LocalMachine\TrustedPublisher` に入れる。ないと `pnputil /add-driver` がカタログを拒否する | 実機に適用済み（再インストール時は再適用） |
+| ドライバの割り当て | Basic Display（Microsoft 署名、クラスコードで一致）が順位で勝つため、`UpdateDriverForPlugAndPlayDevicesW(…, "ACPI\AKAT0001", oemNN.inf, INSTALLFLAG_FORCE)` で強制する | 手順化が必要（WP5） |
+

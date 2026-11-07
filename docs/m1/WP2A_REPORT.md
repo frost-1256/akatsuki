@@ -37,3 +37,13 @@
 - `_CRS` を RESI の名前で対応付け、表示系 4 件だけをマップする（GFX／VIDEO 系は触らない）。
 - モード 1080×2400@60、PCFG（`_ROM`）からの EDID 合成、VSYNC（IRQ 0x73）のカウント、診断用 Ioctl。
 - 実機の M1a 試験（WP6）の前に、サンプルのままの版を一度だけ `v33-akat` で動かして「Started になる／POST フレームバッファで表示される／凍結しない」を見る案もある（POST 表示の引き継ぎだけで、ハードウェアには触らない）。
+
+## 実機確認（2026-11-07 20:0x、サンプルのままの版）
+- 環境：Mu-spacewar-v33-akat.img（GPU0 `_HID` = AKAT0001）、numproc 4。qcdxkm の GPU デバイスは `CM_PROB_PHANTOM`（列挙されない）になった。
+- 起動直後の `ACPI\VEN_AKAT&DEV_0001&SUBSYS_IDP07325&REV_0118\0` は **Microsoft Basic Display**（display.inf、互換 ID `ACPI\CLS_0003&SUBCLS_0000` で一致）が担当していた。ハードウェア ID には `ACPI\AKAT0001` と `*AKAT0001` がある。
+- Epinephrine を割り当てた結果：`OK/CM_PROB_NONE`、サービス Running、ビデオコントローラ "Epinephrine Display (Akatsuki)" 1080×2400、モニタは `DISPLAY\DEFAULT_MONITOR`、System ログにエラーなし。**画面は正常に映った**（POST フレームバッファの引き継ぎ）。
+
+### 配置でつまずいた点（WP5 の手順に入れる）
+1. `pnputil /add-driver` が「信頼されていないルート」で拒否された。testsigning が有効でも、カタログの検証には信頼されたルートが必要。→ spacewar テスト証明書の公開鍵（`270E8946…F890`）を電話の `LocalMachine\Root` と `LocalMachine\TrustedPublisher` に入れた。
+2. 追加しても「up-to-date」とされ、Basic Display のままだった。ドライバの順位付けでは署名の格付けが ID の一致より優先され、Microsoft 署名の display.inf が勝つ。→ `newdev!UpdateDriverForPlugAndPlayDevicesW(NULL, "ACPI\AKAT0001", <oemNN.inf>, INSTALLFLAG_FORCE, …)` で強制的に割り当てた（devcon update と同じ）。このとき、無効にしてあったデバイスも有効になり、そのまま開始した。
+- 戻し方：`pnputil /delete-driver oemNN.inf /uninstall`（Basic Display に戻る）、または v32 イメージで起動（AKAT0001 自体が消える）。
