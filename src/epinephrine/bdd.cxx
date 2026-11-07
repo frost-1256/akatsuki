@@ -105,8 +105,25 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
     // ControlInterrupt fails and no VSync is reported (dxgkrnl was told at DriverEntry that we have VSync control).
     if (g_EpiSoftVsync)
     {
-        NTSTATUS vst = EpiVsyncStart(&m_Vsync, &m_EpiRes, &m_DxgkInterface, m_CurrentModes[0].DispInfo.Height, 0);
-        EpiTrace(L"VsyncStart st%X", (ULONG)vst);
+        // Device Parameters\EpiHwVsync: 0 = software VSync (default), 1 = hardware VSync, 2 = hardware VSync for
+        // this start only (reset to 0 before use, so a hang cannot repeat at the next boot).
+        BOOLEAN hw = FALSE;
+        HANDLE hParams = NULL;
+        HANDLE hDiag = NULL;
+        if (NT_SUCCESS(EpiOpenDiag(m_DeviceInfo.PhysicalDeviceObject, &hParams, &hDiag)))
+        {
+            const ULONG req = EpiQueryDword(hParams, L"EpiHwVsync", 0);
+            if (req == 2)
+            {
+                EpiSetDword(hParams, L"EpiHwVsync", 0);
+                ZwFlushKey(hParams);
+            }
+            hw = (req == 1 || req == 2) ? TRUE : FALSE;
+            ZwClose(hDiag);
+            ZwClose(hParams);
+        }
+        NTSTATUS vst = EpiVsyncStart(&m_Vsync, &m_EpiRes, &m_DxgkInterface, m_CurrentModes[0].DispInfo.Height, 0, hw);
+        EpiTrace(L"VsyncStart hw%u st%X", (ULONG)hw, (ULONG)vst);
     }
     m_Flags.DriverStarted = TRUE;
     *pNumberOfViews = MAX_VIEWS;
@@ -798,8 +815,8 @@ BOOLEAN BASIC_DISPLAY_DRIVER::InterruptRoutine(_In_  ULONG MessageNumber)
 {
     UNREFERENCED_PARAMETER(MessageNumber);
 
-    // BDD cannot handle interrupts
-    return FALSE;
+    // Epinephrine (WP2b-3e): INTF1 frame interrupt in hardware VSync mode; everything else is not ours.
+    return EpiVsyncIsr(&m_Vsync);
 }
 
 VOID BASIC_DISPLAY_DRIVER::ResetDevice(VOID)

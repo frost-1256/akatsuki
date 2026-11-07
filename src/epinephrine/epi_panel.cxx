@@ -175,6 +175,12 @@ VOID BASIC_DISPLAY_DRIVER::EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format,
     EpiSetDword(hDiag, L"PresentCount", m_EpiPresentCount);
     EpiSetDword(hDiag, L"VsyncNotifies", (ULONG)m_Vsync.Notifies);
     EpiSetDword(hDiag, L"VsyncSkipped", (ULONG)m_Vsync.Skipped);
+    EpiSetDword(hDiag, L"HwVsyncMode", (ULONG)m_Vsync.HwMode);
+    EpiSetDword(hDiag, L"HwVsyncArmed", (ULONG)m_Vsync.HwArmed);
+    EpiSetDword(hDiag, L"HwVsyncFailed", (ULONG)m_Vsync.HwFailed);
+    EpiSetDword(hDiag, L"HwIsrCalls", (ULONG)m_Vsync.IsrCalls);
+    EpiSetDword(hDiag, L"HwIsrFrames", (ULONG)m_Vsync.IsrFrames);
+    EpiSetDword(hDiag, L"HwLastTop", m_Vsync.LastTop);
     EpiSetDword(hDiag, L"TraceTimeMs", (ULONG)(KeQueryInterruptTime() / 10000));
     ZwClose(hDiag);
     ZwClose(hParams);
