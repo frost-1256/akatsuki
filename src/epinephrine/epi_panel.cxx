@@ -181,19 +181,44 @@ VOID BASIC_DISPLAY_DRIVER::EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format,
     EpiSetDword(hDiag, L"HwIsrCalls", (ULONG)m_Vsync.IsrCalls);
     EpiSetDword(hDiag, L"HwIsrFrames", (ULONG)m_Vsync.IsrFrames);
     EpiSetDword(hDiag, L"HwLastTop", m_Vsync.LastTop);
+    EpiSetValue(hDiag, L"PresentUsTotal", REG_QWORD, &m_EpiPresentUs, sizeof(m_EpiPresentUs));
+    EpiSetValue(hDiag, L"PresentPixelsTotal", REG_QWORD, &m_EpiPresentPixels, sizeof(m_EpiPresentPixels));
+    EpiSetDword(hDiag, L"PresentMaxUs", m_EpiPresentMaxUs);
     EpiSetDword(hDiag, L"TraceTimeMs", (ULONG)(KeQueryInterruptTime() / 10000));
     ZwClose(hDiag);
     ZwClose(hParams);
 }
 
-VOID BASIC_DISPLAY_DRIVER::EpiCountPresent(NTSTATUS Status)
+VOID BASIC_DISPLAY_DRIVER::EpiCountPresent(NTSTATUS Status, ULONG Us, _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPresent)
 {
     PAGED_CODE();
     ++m_EpiPresentCount;
+    ULONGLONG px = 0;
+    for (ULONG i = 0; i < pPresent->NumMoves; i++)
+    {
+        const RECT& r = pPresent->pMoves[i].DestRect;
+        if (r.right > r.left && r.bottom > r.top) { px += (ULONGLONG)(r.right - r.left) * (ULONGLONG)(r.bottom - r.top); }
+    }
+    for (ULONG i = 0; i < pPresent->NumDirtyRects; i++)
+    {
+        const RECT& r = pPresent->pDirtyRect[i];
+        if (r.right > r.left && r.bottom > r.top) { px += (ULONGLONG)(r.right - r.left) * (ULONGLONG)(r.bottom - r.top); }
+    }
+    m_EpiPresentUs += Us;
+    m_EpiPresentPixels += px;
+    if (Us > m_EpiPresentMaxUs) { m_EpiPresentMaxUs = Us; }
+    m_EpiWinUs += Us;
+    m_EpiWinPixels += (px > MAXULONG) ? MAXULONG : (ULONG)px;
+    m_EpiWinCount++;
     // Trace the first present, failures, and then every 64th (keeps the registry traffic low).
     if (m_EpiPresentCount == 1 || !NT_SUCCESS(Status) || (m_EpiPresentCount & 0x3F) == 0)
     {
-        EpiTrace(L"Present#%u st%X vs%u skip%u en%u", m_EpiPresentCount, (ULONG)Status,
-                 (ULONG)m_Vsync.Notifies, (ULONG)m_Vsync.Skipped, (ULONG)m_Vsync.Enabled);
+        // avg us / avg kpixels per present over the window
+        EpiTrace(L"Present#%u st%X vs%u skip%u en%u us%u kpx%u", m_EpiPresentCount, (ULONG)Status,
+                 (ULONG)m_Vsync.Notifies, (ULONG)m_Vsync.Skipped, (ULONG)m_Vsync.Enabled,
+                 m_EpiWinUs / m_EpiWinCount, m_EpiWinPixels / m_EpiWinCount / 1000);
+        m_EpiWinUs = 0;
+        m_EpiWinPixels = 0;
+        m_EpiWinCount = 0;
     }
 }

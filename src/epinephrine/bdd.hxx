@@ -215,6 +215,13 @@ private:
     WCHAR m_EpiLog[3072];
     ULONG m_EpiLogSeq;
     ULONG m_EpiPresentCount;
+    // Epinephrine: present cost (WP2b-4), measured around PresentDisplayOnly
+    ULONGLONG m_EpiPresentUs;       // total
+    ULONGLONG m_EpiPresentPixels;   // total pixels in moves + dirty rects
+    ULONG m_EpiPresentMaxUs;
+    ULONG m_EpiWinUs;               // since the last Present trace line
+    ULONG m_EpiWinPixels;
+    ULONG m_EpiWinCount;
     // Epinephrine: software VSync (WP2b-3b), active only when g_EpiSoftVsync
     EPI_VSYNC m_Vsync;
 public:
@@ -223,7 +230,7 @@ public:
     NTSTATUS GetScanLine(_Inout_ DXGKARG_GETSCANLINE* pGetScanLine);
     const EPI_VSYNC* GetVsync() const { return &m_Vsync; }
     VOID EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format, ...);
-    VOID EpiCountPresent(NTSTATUS Status);
+    VOID EpiCountPresent(NTSTATUS Status, ULONG Us, _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPresent);
 private:
 
 public:
@@ -424,6 +431,9 @@ VOID BltBits(
     CONST BLT_INFO* pSrc,
     UINT  NumRects,
     _In_reads_(NumRects) CONST RECT *pRects);
+
+// Epinephrine (WP2b-4): present path selected in StartDevice (Device Parameters\EpiFastPresent), see blthw.cxx.
+extern ULONG g_EpiFastPresent;
 
 //
 // Driver Entry point

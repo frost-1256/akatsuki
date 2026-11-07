@@ -30,6 +30,12 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     RtlZeroMemory(&m_Vsync, sizeof(m_Vsync));
     m_EpiLogSeq = 0;
     m_EpiPresentCount = 0;
+    m_EpiPresentUs = 0;
+    m_EpiPresentPixels = 0;
+    m_EpiPresentMaxUs = 0;
+    m_EpiWinUs = 0;
+    m_EpiWinPixels = 0;
+    m_EpiWinCount = 0;
 
 
     for (UINT i=0;i<MAX_VIEWS;i++)
@@ -124,6 +130,19 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
         }
         NTSTATUS vst = EpiVsyncStart(&m_Vsync, &m_EpiRes, &m_DxgkInterface, m_CurrentModes[0].DispInfo.Height, 0, hw);
         EpiTrace(L"VsyncStart hw%u st%X", (ULONG)hw, (ULONG)vst);
+    }
+    {
+        // Device Parameters\EpiFastPresent: present path (blthw.cxx). Default 1.
+        HANDLE hParams = NULL;
+        HANDLE hDiag = NULL;
+        if (NT_SUCCESS(EpiOpenDiag(m_DeviceInfo.PhysicalDeviceObject, &hParams, &hDiag)))
+        {
+            const ULONG fp = EpiQueryDword(hParams, L"EpiFastPresent", 1);
+            g_EpiFastPresent = (fp <= 2) ? fp : 1;
+            EpiSetDword(hDiag, L"FastPresent", g_EpiFastPresent);
+            ZwClose(hDiag);
+            ZwClose(hParams);
+        }
     }
     m_Flags.DriverStarted = TRUE;
     *pNumberOfViews = MAX_VIEWS;

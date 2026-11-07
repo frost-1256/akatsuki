@@ -330,8 +330,12 @@ BddDdiPresentDisplayOnly(
         BDD_LOG_ASSERTION1("BDD (0x%I64x) is being called when not active!", pBDD);
         return STATUS_UNSUCCESSFUL;
     }
+    LARGE_INTEGER freq;
+    const LARGE_INTEGER t0 = KeQueryPerformanceCounter(&freq);
     NTSTATUS st = pBDD->PresentDisplayOnly(pPresentDisplayOnly);
-    pBDD->EpiCountPresent(st);
+    const LARGE_INTEGER t1 = KeQueryPerformanceCounter(NULL);
+    ULONGLONG us = (freq.QuadPart > 0) ? (ULONGLONG)(t1.QuadPart - t0.QuadPart) * 1000000ULL / (ULONGLONG)freq.QuadPart : 0;
+    pBDD->EpiCountPresent(st, (us > MAXULONG) ? MAXULONG : (ULONG)us, pPresentDisplayOnly);
     return st;
 }
 

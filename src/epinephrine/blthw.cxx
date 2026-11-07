@@ -233,6 +233,124 @@ BDD_HWBLT::SetPresentWorkerThreadInfo(
 }
 #pragma warning(pop)
 
+// ---- Epinephrine (WP2b-4): faster CPU present ----
+// Device Parameters\EpiFastPresent (read in StartDevice): 0 = KMDOD path (MDL of the whole source surface each
+// present, every other present on a new system thread), 1 = synchronous, MDL of the source rows the rects cover
+// only (default), 2 = synchronous, read the source directly in the caller's context (ProbeForRead, no MDL).
+ULONG g_EpiFastPresent = 1;
+
+static NTSTATUS EpiFastPresent(BDD_HWBLT* pBlt, BYTE* DstAddr, UINT DstBitPerPixel, BYTE* SrcAddr, LONG SrcPitch,
+                               ULONG NumMoves, D3DKMT_MOVE_RECT* Moves, ULONG NumDirtyRects, RECT* DirtyRect,
+                               D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Rotation)
+{
+    PAGED_CODE();
+    const CURRENT_BDD_MODE* pModeCur = pBlt->m_DevExt->GetCurrentMode(pBlt->m_SourceId);
+    const BOOLEAN swap = (Rotation == D3DKMDT_VPPR_ROTATE90 || Rotation == D3DKMDT_VPPR_ROTATE270) ? TRUE : FALSE;
+    const LONG srcW = (LONG)(swap ? pModeCur->SrcModeHeight : pModeCur->SrcModeWidth);
+    const LONG srcH = (LONG)(swap ? pModeCur->SrcModeWidth : pModeCur->SrcModeHeight);
+
+    // Source rows covered by all rects (rects are in source coordinates). Reject anything out of bounds.
+    LONG top = srcH;
+    LONG bottom = 0;
+    for (ULONG i = 0; i < NumMoves + NumDirtyRects; i++)
+    {
+        const RECT& r = (i < NumMoves) ? Moves[i].DestRect : DirtyRect[i - NumMoves];
+        if (r.left < 0 || r.top < 0 || r.right > srcW || r.bottom > srcH || r.left > r.right || r.top > r.bottom)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (r.top < r.bottom)
+        {
+            if (r.top < top) { top = r.top; }
+            if (r.bottom > bottom) { bottom = r.bottom; }
+        }
+    }
+    if (top >= bottom) { return STATUS_SUCCESS; }
+
+    BYTE* start = SrcAddr + (SIZE_T)top * (SIZE_T)SrcPitch;
+    const SIZE_T len = (SIZE_T)(bottom - top - 1) * (SIZE_T)SrcPitch + (SIZE_T)srcW * 4;
+    const BOOLEAN user = (SrcAddr <= (BYTE* const)MM_USER_PROBE_ADDRESS) ? TRUE : FALSE;
+    PMDL mdl = NULL;
+    BYTE* rows = start;
+
+    if (g_EpiFastPresent == 2)
+    {
+        if (user)
+        {
+            __try
+            {
+                ProbeForRead(start, len, 1);
+            }
+            #pragma prefast(suppress: __WARNING_EXCEPTIONEXECUTEHANDLER, "only user-mode faults are caught here");
+            __except(EXCEPTION_EXECUTE_HANDLER)
+            {
+                return GetExceptionCode();
+            }
+        }
+    }
+    else
+    {
+        if (len > MAXULONG) { return STATUS_INVALID_PARAMETER; }
+        mdl = IoAllocateMdl(start, (ULONG)len, FALSE, FALSE, NULL);
+        if (mdl == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+        __try
+        {
+            MmProbeAndLockPages(mdl, static_cast<KPROCESSOR_MODE>(user ? UserMode : KernelMode), IoReadAccess);
+        }
+        #pragma prefast(suppress: __WARNING_EXCEPTIONEXECUTEHANDLER, "only user-mode faults are caught here");
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            NTSTATUS st = GetExceptionCode();
+            IoFreeMdl(mdl);
+            return st;
+        }
+        rows = reinterpret_cast<BYTE*>(MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute));
+        if (rows == NULL)
+        {
+            MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    BLT_INFO DstBltInfo;
+    DstBltInfo.pBits = DstAddr;
+    DstBltInfo.Pitch = pModeCur->DispInfo.Pitch;
+    DstBltInfo.BitsPerPel = DstBitPerPixel;
+    DstBltInfo.Offset.x = 0;
+    DstBltInfo.Offset.y = 0;
+    DstBltInfo.Rotation = Rotation;
+    DstBltInfo.Width = pModeCur->SrcModeWidth;
+    DstBltInfo.Height = pModeCur->SrcModeHeight;
+
+    // rows points at source row 'top'; Offset.y shifts the rect coordinates onto it.
+    BLT_INFO SrcBltInfo;
+    SrcBltInfo.pBits = rows;
+    SrcBltInfo.Pitch = SrcPitch;
+    SrcBltInfo.BitsPerPel = 32;
+    SrcBltInfo.Offset.x = 0;
+    SrcBltInfo.Offset.y = -top;
+    SrcBltInfo.Rotation = D3DKMDT_VPPR_IDENTITY;
+    SrcBltInfo.Width = (UINT)srcW;
+    SrcBltInfo.Height = (UINT)srcH;
+
+    for (ULONG i = 0; i < NumMoves; i++)
+    {
+        BltBits(&DstBltInfo, &SrcBltInfo, 1, &Moves[i].DestRect);
+    }
+    for (ULONG i = 0; i < NumDirtyRects; i++)
+    {
+        BltBits(&DstBltInfo, &SrcBltInfo, 1, &DirtyRect[i]);
+    }
+
+    if (mdl != NULL)
+    {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+    }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 BDD_HWBLT::ExecutePresentDisplayOnly(
     _In_ BYTE*             DstAddr,
@@ -274,6 +392,12 @@ BDD_HWBLT::ExecutePresentDisplayOnly(
 {
 
     PAGED_CODE();
+
+    if (g_EpiFastPresent != 0 && SrcBytesPerPixel == 4 && SrcPitch > 0)
+    {
+        return EpiFastPresent(this, DstAddr, DstBitPerPixel, SrcAddr, SrcPitch, NumMoves, Moves,
+                              NumDirtyRects, DirtyRect, Rotation);
+    }
 
     NTSTATUS Status = STATUS_SUCCESS;
 
