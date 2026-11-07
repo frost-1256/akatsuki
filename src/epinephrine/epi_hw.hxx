@@ -30,6 +30,13 @@ typedef struct _EPI_HW_RESOURCES
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOURCES* pRes);
 
+// Read-only timing probe (WP2b-3a), StartDevice after EpiHwSnapshot. Samples INTF1 frame/line/tear counters and
+// MDSS HW_INTR_STATUS every 250 us for ~100 ms (stalls the start path that long) and diffs INTF1 before/after.
+// EpiDiag: ProbeStatus, ProbeSamples (REG_BINARY, 400 x {t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10}),
+// ProbeIntfDiff ("off:before>after;"). Off by default; runs only when Device Parameters\EpiVsyncProbe != 0.
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
+
 // EpiDiag registry helpers (shared by the snapshot and the panel loader).
 // EpiOpenDiag opens <device key>\Device Parameters and its volatile EpiDiag subkey; close both handles with ZwClose.
 _IRQL_requires_(PASSIVE_LEVEL) NTSTATUS EpiOpenDiag(PDEVICE_OBJECT Pdo, HANDLE* phParams, HANDLE* phDiag);

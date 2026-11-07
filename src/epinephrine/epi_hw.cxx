@@ -202,3 +202,96 @@ VOID EpiHwSnapshot(_In_ const DXGK_DEVICE_INFO* pDeviceInfo, _Out_ EPI_HW_RESOUR
     ZwClose(hDiag);
     ZwClose(hParams);
 }
+
+// ---- VSync probe (WP2b-3a): read-only timing observation ----
+// Candidates (mainline DPU names): INTF_FRAME_COUNT +0xAC, INTF_LINE_COUNT +0xB0, tear-check +0x298 / +0x2B0,
+// MDSS HW_INTR_STATUS +0x10. All of them were already read safely by the WP2b-1 snapshot.
+#define EPI_PROBE_INTF_OFF      0x36000
+#define EPI_PROBE_INTF_SIZE     0x300
+#define EPI_PROBE_SAMPLES       400     // x 250 us = ~100 ms (6 frames at 60 Hz)
+#define EPI_PROBE_STALL_US      250
+#define EPI_PROBE_FIELDS        6       // t_us, +0xAC, +0xB0, +0x298, +0x2B0, mdss+0x10
+#define EPI_PROBE_DIFF_CCH      1024
+
+VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
+{
+    PAGED_CODE();
+    HANDLE hParams = NULL;
+    HANDLE hDiag = NULL;
+    if (!NT_SUCCESS(EpiOpenDiag(Pdo, &hParams, &hDiag))) { return; }
+
+    // 0 = done, 1 = not enabled (EpiVsyncProbe == 0), 2 = no MDP_REGS, 3 = no memory, 4 = map failed
+    ULONG status = 0;
+    PULONG samples = NULL;
+    PULONG before = NULL;
+    PULONG after = NULL;
+    PWCHAR diff = NULL;
+    PVOID intf = NULL;
+    PVOID mdss = NULL;
+    const ULONG sampleBytes = EPI_PROBE_SAMPLES * EPI_PROBE_FIELDS * sizeof(ULONG);
+
+    if (EpiQueryDword(hParams, L"EpiVsyncProbe", 0) == 0) { status = 1; goto done; }
+    if (!pRes->MdpFound || pRes->MdpLength < EPI_PROBE_INTF_OFF + EPI_PROBE_INTF_SIZE) { status = 2; goto done; }
+
+    samples = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sampleBytes, 'ipEE'));
+    before = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_NON_PAGED, EPI_PROBE_INTF_SIZE, 'ipEE'));
+    after = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_NON_PAGED, EPI_PROBE_INTF_SIZE, 'ipEE'));
+    diff = static_cast<PWCHAR>(ExAllocatePool2(POOL_FLAG_PAGED, EPI_PROBE_DIFF_CCH * sizeof(WCHAR), 'ipEE'));
+    if (samples == NULL || before == NULL || after == NULL || diff == NULL) { status = 3; goto done; }
+
+    {
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = pRes->MdpBase.QuadPart + EPI_PROBE_INTF_OFF;
+        intf = MmMapIoSpaceEx(pa, EPI_PROBE_INTF_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+        pa.QuadPart = pRes->MdpBase.QuadPart;
+        mdss = MmMapIoSpaceEx(pa, 0x20, PAGE_READONLY | PAGE_NOCACHE);
+        if (intf == NULL || mdss == NULL) { status = 4; goto done; }
+    }
+
+    {
+        volatile ULONG* r = static_cast<volatile ULONG*>(intf);
+        volatile ULONG* m = static_cast<volatile ULONG*>(mdss);
+        for (ULONG i = 0; i < EPI_PROBE_INTF_SIZE / sizeof(ULONG); ++i) { before[i] = READ_REGISTER_ULONG(r + i); }
+
+        LARGE_INTEGER freq;
+        const LARGE_INTEGER t0 = KeQueryPerformanceCounter(&freq);
+        for (ULONG s = 0; s < EPI_PROBE_SAMPLES; ++s)
+        {
+            PULONG o = samples + s * EPI_PROBE_FIELDS;
+            const LARGE_INTEGER t = KeQueryPerformanceCounter(NULL);
+            o[0] = (ULONG)(((t.QuadPart - t0.QuadPart) * 1000000) / freq.QuadPart);
+            o[1] = READ_REGISTER_ULONG(r + 0xAC / 4);
+            o[2] = READ_REGISTER_ULONG(r + 0xB0 / 4);
+            o[3] = READ_REGISTER_ULONG(r + 0x298 / 4);
+            o[4] = READ_REGISTER_ULONG(r + 0x2B0 / 4);
+            o[5] = READ_REGISTER_ULONG(m + 0x10 / 4);
+            KeStallExecutionProcessor(EPI_PROBE_STALL_US);
+        }
+
+        for (ULONG i = 0; i < EPI_PROBE_INTF_SIZE / sizeof(ULONG); ++i) { after[i] = READ_REGISTER_ULONG(r + i); }
+    }
+
+    diff[0] = 0;
+    for (ULONG i = 0; i < EPI_PROBE_INTF_SIZE / sizeof(ULONG); ++i)
+    {
+        if (before[i] == after[i]) { continue; }
+        WCHAR item[40];
+        if (NT_SUCCESS(RtlStringCchPrintfW(item, RTL_NUMBER_OF(item), L"%X:%X>%X;", i * 4, before[i], after[i])))
+        {
+            RtlStringCchCatW(diff, EPI_PROBE_DIFF_CCH, item);   // truncation is fine
+        }
+    }
+    EpiSetValue(hDiag, L"ProbeSamples", REG_BINARY, samples, sampleBytes);
+    EpiSetValue(hDiag, L"ProbeIntfDiff", REG_SZ, diff, (ULONG)((wcslen(diff) + 1) * sizeof(WCHAR)));
+
+done:
+    EpiSetDword(hDiag, L"ProbeStatus", status);
+    if (intf != NULL) { MmUnmapIoSpace(intf, EPI_PROBE_INTF_SIZE); }
+    if (mdss != NULL) { MmUnmapIoSpace(mdss, 0x20); }
+    if (diff != NULL) { ExFreePoolWithTag(diff, 'ipEE'); }
+    if (after != NULL) { ExFreePoolWithTag(after, 'ipEE'); }
+    if (before != NULL) { ExFreePoolWithTag(before, 'ipEE'); }
+    if (samples != NULL) { ExFreePoolWithTag(samples, 'ipEE'); }
+    ZwClose(hDiag);
+    ZwClose(hParams);
+}

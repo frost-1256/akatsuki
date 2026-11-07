@@ -78,6 +78,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
     // Epinephrine (Akatsuki) WP2b-1: one-shot read-only snapshot of the display block into
     // Device Parameters\EpiDiag. Diagnostic only; the start path does not depend on it.
     EpiHwSnapshot(&m_DeviceInfo, &m_EpiRes);
+    EpiVsyncProbe(&m_EpiRes, m_DeviceInfo.PhysicalDeviceObject);
 
     // Epinephrine (Akatsuki) WP2b-2: panel EDID and timing from GPU0 _ROM (PCFG). On failure m_Panel.Valid
     // stays FALSE and the KMDOD behaviour (no EDID, POST mode with unspecified frequencies) is kept.
