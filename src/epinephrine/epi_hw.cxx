@@ -247,6 +247,17 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         EpiSetDword(hParams, L"EpiProbeTearAttempt", 1);              // non-volatile breadcrumb, 2 = read ok
         ZwFlushKey(hParams);                                          // must reach disk before the read
     }
+    // bit2 (WP2b-3d, one shot): write-1-to-clear the INTF (+0x1C8) and TE (+0x808) interrupt status during
+    // sampling, so each latched bit shows when it fires. The enables stay 0, so no interrupt is raised. These are
+    // the only hardware writes Epinephrine makes; mainline's IRQ handler does the same writes.
+    const BOOLEAN doClear = (probeFlags & 4) ? TRUE : FALSE;
+    if (doClear)
+    {
+        EpiSetDword(hParams, L"EpiVsyncProbe", probeFlags & ~6UL);
+        EpiSetDword(hParams, L"EpiProbeClearAttempt", 1);             // 2 = finished
+        ZwFlushKey(hParams);
+    }
+    const ULONG mapProt = (doClear ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE;
     if (!pRes->MdpFound || pRes->MdpLength < EPI_PROBE_INTF_OFF + EPI_PROBE_INTF_SIZE) { status = 2; goto done; }
 
     samples = static_cast<PULONG>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sampleBytes, 'ipEE'));
@@ -258,14 +269,14 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     {
         PHYSICAL_ADDRESS pa;
         pa.QuadPart = pRes->MdpBase.QuadPart + EPI_PROBE_INTF_OFF;
-        intf = MmMapIoSpaceEx(pa, EPI_PROBE_INTF_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+        intf = MmMapIoSpaceEx(pa, EPI_PROBE_INTF_SIZE, mapProt);
         pa.QuadPart = pRes->MdpBase.QuadPart;
         mdss = MmMapIoSpaceEx(pa, 0x20, PAGE_READONLY | PAGE_NOCACHE);
         if (intf == NULL || mdss == NULL) { status = 4; goto done; }
-        if (probeFlags & 2)
+        if (probeFlags & 6)
         {
             pa.QuadPart = pRes->MdpBase.QuadPart + EPI_PROBE_TEAR_OFF;
-            tear = MmMapIoSpaceEx(pa, EPI_PROBE_TEAR_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+            tear = MmMapIoSpaceEx(pa, EPI_PROBE_TEAR_SIZE, mapProt);
             if (tear == NULL) { status = 4; goto done; }
         }
     }
@@ -279,6 +290,11 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         {
             for (ULONG i = 0; i < EPI_PROBE_TEAR_SIZE / 4; ++i) { tearBefore[i] = READ_REGISTER_ULONG(te + i); }
             EpiSetDword(hParams, L"EpiProbeTearAttempt", 2);
+        }
+        if (doClear)
+        {
+            WRITE_REGISTER_ULONG(r + 0x1C8 / 4, 0xFFFFFFFF);
+            if (te != NULL) { WRITE_REGISTER_ULONG(te + 2, 0xFFFFFFFF); }
         }
 
         LARGE_INTEGER freq;
@@ -295,6 +311,11 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             o[5] = READ_REGISTER_ULONG(m + 0x10 / 4);
             o[6] = READ_REGISTER_ULONG(r + 0x1C4 / 4);
             o[7] = te != NULL ? READ_REGISTER_ULONG(te + 1) : 0;
+            if (doClear)
+            {
+                if (o[6] != 0) { WRITE_REGISTER_ULONG(r + 0x1C8 / 4, o[6]); }
+                if (o[7] != 0 && te != NULL) { WRITE_REGISTER_ULONG(te + 2, o[7]); }
+            }
             KeStallExecutionProcessor(EPI_PROBE_STALL_US);
         }
 
@@ -305,6 +326,7 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             EpiSetValue(hDiag, L"ProbeTearBefore", REG_BINARY, tearBefore, sizeof(tearBefore));
             EpiSetValue(hDiag, L"ProbeTearAfter", REG_BINARY, tearAfter, sizeof(tearAfter));
         }
+        if (doClear) { EpiSetDword(hParams, L"EpiProbeClearAttempt", 2); }
     }
 
     diff[0] = 0;
