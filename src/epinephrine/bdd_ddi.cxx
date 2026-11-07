@@ -61,6 +61,15 @@ DriverEntry(
     InitialData.DxgkDdiSystemDisplayEnable          = BddDdiSystemDisplayEnable;
     InitialData.DxgkDdiSystemDisplayWrite           = BddDdiSystemDisplayWrite;
 
+    // Epinephrine (WP2b-3b): VSync control. Registering these makes dxgkrnl expect VSync notifications and real
+    // target-mode frequencies; Services\Epinephrine\EpiSoftVsync=0 keeps the plain KMDOD behaviour.
+    EpiReadDriverSwitches(pRegistryPath);
+    if (g_EpiSoftVsync)
+    {
+        InitialData.DxgkDdiControlInterrupt         = BddDdiControlInterrupt;
+        InitialData.DxgkDdiGetScanLine              = BddDdiGetScanLine;
+    }
+
     NTSTATUS Status = DxgkInitializeDisplayOnlyDriver(pDriverObject, pRegistryPath, &InitialData);
     if (!NT_SUCCESS(Status))
     {
@@ -548,6 +557,27 @@ BddDdiInterruptRoutine(
 
     BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(pDeviceContext);
     return pBDD->InterruptRoutine(MessageNumber);
+}
+
+NTSTATUS
+BddDdiControlInterrupt(
+    _In_ CONST HANDLE hAdapter,
+    _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
+    _In_ BOOLEAN EnableInterrupt)
+{
+    BDD_ASSERT_CHK(hAdapter != NULL);
+    BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(hAdapter);
+    return pBDD->ControlInterrupt(InterruptType, EnableInterrupt);
+}
+
+NTSTATUS
+BddDdiGetScanLine(
+    _In_ CONST HANDLE hAdapter,
+    _Inout_ DXGKARG_GETSCANLINE* pGetScanLine)
+{
+    BDD_ASSERT_CHK(hAdapter != NULL);
+    BASIC_DISPLAY_DRIVER* pBDD = reinterpret_cast<BASIC_DISPLAY_DRIVER*>(hAdapter);
+    return pBDD->GetScanLine(pGetScanLine);
 }
 
 VOID

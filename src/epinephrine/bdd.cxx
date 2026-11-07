@@ -27,6 +27,7 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     RtlZeroMemory(&m_EpiRes, sizeof(m_EpiRes));
     RtlZeroMemory(&m_Panel, sizeof(m_Panel));
     m_EpiLog[0] = 0;
+    RtlZeroMemory(&m_Vsync, sizeof(m_Vsync));
     m_EpiLogSeq = 0;
     m_EpiPresentCount = 0;
 
@@ -100,6 +101,13 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
         // after a pre-WDDM 1.2 driver. Since we can't draw anything, we should fail to start.
         return STATUS_UNSUCCESSFUL;
     }
+    // Epinephrine (WP2b-3b): software VSync from the INTF1 frame counter (read-only). If it cannot start,
+    // ControlInterrupt fails and no VSync is reported (dxgkrnl was told at DriverEntry that we have VSync control).
+    if (g_EpiSoftVsync)
+    {
+        NTSTATUS vst = EpiVsyncStart(&m_Vsync, &m_EpiRes, &m_DxgkInterface, m_CurrentModes[0].DispInfo.Height, 0);
+        EpiTrace(L"VsyncStart st%X", (ULONG)vst);
+    }
     m_Flags.DriverStarted = TRUE;
     *pNumberOfViews = MAX_VIEWS;
     *pNumberOfChildren = MAX_CHILDREN;
@@ -112,6 +120,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StopDevice(VOID)
 {
     PAGED_CODE();
 
+    EpiVsyncStop(&m_Vsync);
     CleanUp();
 
     m_Flags.DriverStarted = FALSE;
@@ -760,6 +769,29 @@ D3DDDI_VIDEO_PRESENT_SOURCE_ID BASIC_DISPLAY_DRIVER::FindSourceForTarget(D3DDDI_
 VOID BASIC_DISPLAY_DRIVER::DpcRoutine(VOID)
 {
     m_DxgkInterface.DxgkCbNotifyDpc((HANDLE)m_DxgkInterface.DeviceHandle);
+}
+
+NTSTATUS BASIC_DISPLAY_DRIVER::ControlInterrupt(DXGK_INTERRUPT_TYPE InterruptType, BOOLEAN EnableInterrupt)
+{
+    if (InterruptType != DXGK_INTERRUPT_DISPLAYONLY_VSYNC)
+    {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    return EpiVsyncControl(&m_Vsync, EnableInterrupt);
+}
+
+NTSTATUS BASIC_DISPLAY_DRIVER::GetScanLine(_Inout_ DXGKARG_GETSCANLINE* pGetScanLine)
+{
+    if (pGetScanLine->VidPnTargetId != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    BOOLEAN inVBlank = FALSE;
+    UINT line = 0;
+    NTSTATUS st = EpiVsyncScanLine(&m_Vsync, &inVBlank, &line);
+    pGetScanLine->InVerticalBlank = inVBlank;
+    pGetScanLine->ScanLine = line;
+    return st;
 }
 
 BOOLEAN BASIC_DISPLAY_DRIVER::InterruptRoutine(_In_  ULONG MessageNumber)

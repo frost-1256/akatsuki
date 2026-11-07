@@ -969,28 +969,40 @@ NTSTATUS BASIC_DISPLAY_DRIVER::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMO
 }
 
 
-// Epinephrine (WP2b-2): when the PCFG panel timing is known and its active area matches the POST mode,
-// describe the real signal (same numbers as the synthesized EDID detailed timing, so the target mode and
-// the EDID-derived monitor mode are identical). Otherwise leave the KMDOD "unspecified" values in place.
+// Epinephrine (WP2b-2/3b): fill the signal description of target and monitor source modes.
+// - TotalSize: active + porches + sync from PCFG when EpiPanelFeatures bit1 is set and the panel matches the
+//   POST mode; otherwise TotalSize = ActiveSize (KMDOD).
+// - Frequencies: only with VSync control (g_EpiSoftVsync). A display-only driver without it must leave
+//   VSyncFreq / HSyncFreq / PixelRate D3DKMDT_FREQUENCY_NOTSPECIFIED (pfnAddMode rejects any of them with
+//   STATUS_GRAPHICS_INVALID_FREQUENCY, black screen; bisected 2026-11-07), and one with it must specify them.
+//   Refresh is the PCFG DSIRefreshRate (60 Hz on spacewar), or 60 Hz when the panel is unknown.
 static VOID EpiApplyPanelSignal(_In_ const EPI_PANEL* pPanel, _In_ const DXGK_DISPLAY_INFORMATION* pDispInfo,
                                 _Inout_ D3DKMDT_VIDEO_SIGNAL_INFO* pSignal)
 {
     PAGED_CODE();
-    if (!pPanel->Valid || !pPanel->UseSignal || pPanel->Timing.HActive != pDispInfo->Width || pPanel->Timing.VActive != pDispInfo->Height)
+    const BOOLEAN panel = pPanel->Valid && pPanel->Timing.HActive == pDispInfo->Width && pPanel->Timing.VActive == pDispInfo->Height;
+    const EPI_PANEL_TIMING& t = pPanel->Timing;
+    UINT htotal = pDispInfo->Width;
+    UINT vtotal = pDispInfo->Height;
+    if (panel && pPanel->UseSignal)
+    {
+        htotal = t.HActive + t.HFrontPorch + t.HBackPorch + t.HSyncPulse;
+        vtotal = t.VActive + t.VFrontPorch + t.VBackPorch + t.VSyncPulse;
+        pSignal->TotalSize.cx = htotal;
+        pSignal->TotalSize.cy = vtotal;
+        pSignal->ActiveSize.cx = t.HActive;
+        pSignal->ActiveSize.cy = t.VActive;
+    }
+    if (!g_EpiSoftVsync)
     {
         return;
     }
-    const EPI_PANEL_TIMING& t = pPanel->Timing;
-    pSignal->TotalSize.cx = t.HActive + t.HFrontPorch + t.HBackPorch + t.HSyncPulse;
-    pSignal->TotalSize.cy = t.VActive + t.VFrontPorch + t.VBackPorch + t.VSyncPulse;
-    pSignal->ActiveSize.cx = t.HActive;
-    pSignal->ActiveSize.cy = t.VActive;
-    // VSyncFreq / HSyncFreq / PixelRate stay D3DKMDT_FREQUENCY_NOTSPECIFIED. Epinephrine has no VSync control
-    // (no DxgkDdiControlInterrupt / DxgkDdiGetScanLine), and for such a display-only driver dxgkrnl rejects any
-    // specified frequency in a target mode with STATUS_GRAPHICS_INVALID_FREQUENCY (0xC01E030A); cofunc then fails
-    // and no path is set (black screen). Bisected on spacewar 2026-11-07: each of the three alone is rejected,
-    // independent of the value (mHz, integer Hz, exact EDID fractions), VSyncFreqDivider, MinimumVSyncFreq or an
-    // EDID range-limits descriptor. Report them once VSync interrupts are implemented (they are then required).
+    const UINT vsyncMilliHz = (panel && t.RefreshQ16 != 0) ? (UINT)(((UINT64)t.RefreshQ16 * 1000) >> 16) : 60000;
+    pSignal->VSyncFreq.Numerator = vsyncMilliHz;
+    pSignal->VSyncFreq.Denominator = 1000;
+    pSignal->HSyncFreq.Numerator = vtotal * vsyncMilliHz;
+    pSignal->HSyncFreq.Denominator = 1000;
+    pSignal->PixelRate = ((UINT64)htotal * vtotal * vsyncMilliHz) / 1000;
 }
 
 // Add the current mode information (acquired from the POST frame buffer) as the target mode.

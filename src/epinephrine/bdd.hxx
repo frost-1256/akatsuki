@@ -138,6 +138,7 @@ typedef struct _CURRENT_BDD_MODE
 
 // Epinephrine (Akatsuki) additions
 #include "epi_hw.hxx"
+#include "epi_vsync.hxx"
 
 class BASIC_DISPLAY_DRIVER;
 
@@ -214,7 +215,13 @@ private:
     WCHAR m_EpiLog[3072];
     ULONG m_EpiLogSeq;
     ULONG m_EpiPresentCount;
+    // Epinephrine: software VSync (WP2b-3b), active only when g_EpiSoftVsync
+    EPI_VSYNC m_Vsync;
 public:
+    // Non-paged; called by dxgkrnl only when DriverEntry registered them (g_EpiSoftVsync).
+    NTSTATUS ControlInterrupt(DXGK_INTERRUPT_TYPE InterruptType, BOOLEAN EnableInterrupt);
+    NTSTATUS GetScanLine(_Inout_ DXGKARG_GETSCANLINE* pGetScanLine);
+    const EPI_VSYNC* GetVsync() const { return &m_Vsync; }
     VOID EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format, ...);
     VOID EpiCountPresent(NTSTATUS Status);
 private:
@@ -503,6 +510,18 @@ BddDdiInterruptRoutine(
 VOID
 BddDdiDpcRoutine(
     _In_  VOID* pDeviceContext);
+
+// Epinephrine (WP2b-3b), non-paged
+NTSTATUS
+BddDdiControlInterrupt(
+    _In_ CONST HANDLE hAdapter,
+    _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
+    _In_ BOOLEAN EnableInterrupt);
+
+NTSTATUS
+BddDdiGetScanLine(
+    _In_ CONST HANDLE hAdapter,
+    _Inout_ DXGKARG_GETSCANLINE* pGetScanLine);
 
 //
 // WDDM Display Only Driver DDIs

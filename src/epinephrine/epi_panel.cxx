@@ -155,16 +155,27 @@ VOID BASIC_DISPLAY_DRIVER::EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format,
     if (!NT_SUCCESS(RtlStringCchPrintfW(head, RTL_NUMBER_OF(head), L"%u:", ++m_EpiLogSeq))) { return; }
     size_t used = 0;
     if (!NT_SUCCESS(RtlStringCchLengthW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), &used))) { return; }
-    if (used + wcslen(head) + wcslen(line) + 2 >= RTL_NUMBER_OF(m_EpiLog)) { return; }   // full: keep the beginning
-    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), head);
-    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), line);
-    RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), L";");
+    // When full, keep the beginning of the log but still refresh the counters and the last line.
+    const BOOLEAN full = (used + wcslen(head) + wcslen(line) + 2 >= RTL_NUMBER_OF(m_EpiLog)) ? TRUE : FALSE;
+    if (!full)
+    {
+        RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), head);
+        RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), line);
+        RtlStringCchCatW(m_EpiLog, RTL_NUMBER_OF(m_EpiLog), L";");
+    }
 
     HANDLE hParams = NULL;
     HANDLE hDiag = NULL;
     if (!NT_SUCCESS(EpiOpenDiag(m_pPhysicalDevice, &hParams, &hDiag))) { return; }
-    EpiSetValue(hDiag, L"VidPnLog", REG_SZ, m_EpiLog, (ULONG)((wcslen(m_EpiLog) + 1) * sizeof(WCHAR)));
+    if (!full)
+    {
+        EpiSetValue(hDiag, L"VidPnLog", REG_SZ, m_EpiLog, (ULONG)((wcslen(m_EpiLog) + 1) * sizeof(WCHAR)));
+    }
+    EpiSetValue(hDiag, L"VidPnLast", REG_SZ, line, (ULONG)((wcslen(line) + 1) * sizeof(WCHAR)));
     EpiSetDword(hDiag, L"PresentCount", m_EpiPresentCount);
+    EpiSetDword(hDiag, L"VsyncNotifies", (ULONG)m_Vsync.Notifies);
+    EpiSetDword(hDiag, L"VsyncSkipped", (ULONG)m_Vsync.Skipped);
+    EpiSetDword(hDiag, L"TraceTimeMs", (ULONG)(KeQueryInterruptTime() / 10000));
     ZwClose(hDiag);
     ZwClose(hParams);
 }
@@ -173,9 +184,10 @@ VOID BASIC_DISPLAY_DRIVER::EpiCountPresent(NTSTATUS Status)
 {
     PAGED_CODE();
     ++m_EpiPresentCount;
-    // Trace the first present, failures, and then every 256th (keeps the registry traffic low).
-    if (m_EpiPresentCount == 1 || !NT_SUCCESS(Status) || (m_EpiPresentCount & 0xFF) == 0)
+    // Trace the first present, failures, and then every 64th (keeps the registry traffic low).
+    if (m_EpiPresentCount == 1 || !NT_SUCCESS(Status) || (m_EpiPresentCount & 0x3F) == 0)
     {
-        EpiTrace(L"Present#%u st%X", m_EpiPresentCount, (ULONG)Status);
+        EpiTrace(L"Present#%u st%X vs%u skip%u en%u", m_EpiPresentCount, (ULONG)Status,
+                 (ULONG)m_Vsync.Notifies, (ULONG)m_Vsync.Skipped, (ULONG)m_Vsync.Enabled);
     }
 }
