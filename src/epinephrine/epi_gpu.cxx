@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Epinephrine (Akatsuki Project) - GPU G1a: read-only GPU_CC state probe. New file, not derived from KMDOD.
+// Epinephrine (Akatsuki Project) - GPU/GMU bring-up probes. New file, not derived from KMDOD.
 //
 // Clean room: register offsets are hardware facts (mainline Linux gcc-sc7280.c / gpucc-sc7280.c used as a
 // datasheet only, no code taken). Nothing here is derived from qcdxkm.
 //
-// Reads only, no writes. Order:
+// G1a (bit0) reads only. Later opt-in tests temporarily power CX and can write registers/TCM.
+// G1a order:
 //   1. GCC GPU branch clocks (GCC is always clocked; GCC_GPU_CFG_AHB_CLK is kept on as a critical clock).
 //   2. Only if GCC_GPU_CFG_AHB_CLK reports on (CBCR bit31 CLK_OFF == 0): the GPU_CC registers below.
 // GPU_CC is reached over GPU_CFG_AHB, so step 2 cannot be attempted with that clock off.
@@ -13,6 +14,7 @@
 
 #include "BDD.hxx"
 #include "epi_hw.hxx"
+#include "epi_gmu.hxx"
 extern "C" {
 #include <ntstrsafe.h>
 }
@@ -70,7 +72,8 @@ static VOID EpiGpuStep(HANDLE hParams, ULONG Step)
 }
 
 // ---- G1b: CX power-up test (EpiGpuProbe bit1) ----
-// Writes GPU_CC only (no GCC, no TZ, no SMMU). The GMU and hub RCGs stay on XO (their reset source, cfg 0), so no
+// G1b writes GPU_CC only (no GCC, no TZ). Optional G1c tests run within this CX window.
+// The GMU and hub RCGs stay on XO (their reset source, cfg 0), so no
 // PLL or GCC vote is touched. Steps:
 //   1. CX GDSC on: clear SW_COLLAPSE (GDSCR bit0), poll PWR_ON (bit31) of GDS_HW_CTRL (0x1540) / GDSCR.
 //   2. Set the enable bit (bit0) of the GMU-side branches, poll CLK_OFF (bit31) clear.
@@ -263,6 +266,7 @@ static BOOLEAN EpiSmmuWriteTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc
     EpiGpuStep(hParams, 0x35E);
     // Never reset an already running processor or power down an active GX.
     if (READ_REGISTER_ULONG(static_cast<volatile ULONG*>(GmuA)) != 1 ||
+        (READ_REGISTER_ULONG(static_cast<volatile ULONG*>(GmuA) + 0x340 / 4) & 0xC0) != 0xC0 || // GX HM off
         (READ_REGISTER_ULONG(Cc + 0x100C / 4) & 0x80000001UL) != 1 ||
         (READ_REGISTER_ULONG(Cc + 0x5000 / 4) & EPI_CBCR_CLK_OFF) != 0)
     { status = 2; }
@@ -312,6 +316,60 @@ static BOOLEAN EpiSmmuWriteTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc
     EpiCat(Text, L"smr0_written", r[4].Readback);
     EpiCat(Text, L"smr0_restored", r[4].Restored);
     return written != 0;
+}
+
+// Reopen only after a confirmed collapse; always return clocks and GDSCR to their originals.
+// A zero SMR after this cycle cannot prove loss of the test value: it was restored first.
+static ULONG EpiSmmuAfterCollapse(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc,
+                                 ULONG GdscOrig, const ULONG* Orig, PWCHAR Text)
+{
+    ULONG status = 0;
+    BOOLEAN branches = FALSE;
+    PVOID map = NULL;
+    volatile ULONG* gdsc = Cc + EPI_CC_CX_GDSCR / 4;
+    volatile ULONG* hw = Cc + EPI_CC_CX_GDS_HW_CTRL / 4;
+    EpiGpuStep(hParams, 0x36A);
+    WRITE_REGISTER_ULONG(gdsc, GdscOrig & ~EPI_GDSC_SW_COLLAPSE);
+    if (EpiPoll(hw, EPI_GDSC_PWR_ON, EPI_GDSC_PWR_ON, 1000) > 1000)
+    { status = 1; goto restore; }
+    branches = TRUE;
+    for (ULONG i = 0; i < RTL_NUMBER_OF(g_EpiCxBranches); ++i)
+    {
+        volatile ULONG* b = Cc + g_EpiCxBranches[i].Offset / 4;
+        EpiGpuStep(hParams, 0x36B + i);
+        WRITE_REGISTER_ULONG(b, Orig[i] | 1);
+        if (EpiPoll(b, EPI_CBCR_CLK_OFF, 0, 50) > 50) { status = 2; }
+    }
+    if (status == 0)
+    {
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = EPI_ASMMU_BASE;
+        map = MmMapIoSpaceEx(pa, EPI_ASMMU_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
+        if (map == NULL) { status = 3; }
+        else
+        {
+            EpiGpuStep(hParams, 0x35F);
+            const ULONG smr = READ_REGISTER_ULONG(static_cast<volatile ULONG*>(map) + 0x800 / 4);
+            EpiSetDword(hDiag, L"GpuSmmuWAfterSmr0", smr);
+            EpiCat(Text, L"smr0_after_cycle", smr);
+        }
+    }
+restore:
+    if (map != NULL) { MmUnmapIoSpace(map, EPI_ASMMU_MAP_LEN); }
+    if (branches)
+    {
+        for (ULONG i = RTL_NUMBER_OF(g_EpiCxBranches); i-- > 0;)
+        {
+            EpiGpuStep(hParams, 0x341 + (RTL_NUMBER_OF(g_EpiCxBranches) - 1 - i));
+            WRITE_REGISTER_ULONG(Cc + g_EpiCxBranches[i].Offset / 4, Orig[i]);
+        }
+    }
+    EpiGpuStep(hParams, 0x346);
+    WRITE_REGISTER_ULONG(gdsc, GdscOrig);
+    if (EpiPoll(hw, EPI_GDSC_PWR_ON, 0, 1000) > 1000) { status = 4; }
+    EpiSetDword(hDiag, L"GpuSmmuWCycleStatus", status);
+    EpiCat(Text, L"smmu_cycle_status", status);
+    return status;
 }
 
 // ---- G1c-2b (EpiGpuProbe bit6): GMU firmware TCM load test ----
@@ -490,16 +548,20 @@ out:
 }
 
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
-//              12 map failed, 13 CX GDSC did not collapse again on restore
+//              12 map failed, 13 CX GDSC did not collapse again on restore,
+//              14 G1c-2a/CM3 boot needs initially collapsed CX, 15 post-collapse SMMU read cycle failed,
+//              16 GMU boot test failed (GpuGmuStatus contains the reason)
 static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text,
-                          const EPI_GMU_FW* Fw, PULONG FwStatus)
+                          const EPI_GMU_FW* Fw, PULONG FwStatus, BOOLEAN* KeepCx)
 {
+    *KeepCx = FALSE;
     ULONG status = 0;
     ULONG orig[RTL_NUMBER_OF(g_EpiCxBranches)] = {};
     BOOLEAN touched = FALSE;
     PVOID gmuA = NULL;
     PVOID gmuB = NULL;
     BOOLEAN allNeeded = TRUE;
+    BOOLEAN smmuWritten = FALSE;
     ULONG t = 0;
 
     volatile ULONG* gdscr = Cc + EPI_CC_CX_GDSCR / 4;
@@ -507,6 +569,15 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
     const ULONG gdscOrig = READ_REGISTER_ULONG(gdscr);
     EpiCat(Text, L"cx_gdscr0", gdscOrig);
     EpiCat(Text, L"cx_hwctl0", READ_REGISTER_ULONG(hwctl));
+
+    if (Flags & (0x20 | EPI_GMU_PROBE_BOOT))
+    {
+        EpiSetDword(hDiag, L"GpuSmmuWStatus", 7);
+        EpiSetDword(hDiag, L"GpuSmmuWCycleStatus", 7);
+        EpiSetDword(hDiag, L"GpuSmmuWAfterSmr0", 0xFFFFFFFF);
+        if ((gdscOrig & (EPI_GDSC_PWR_ON | EPI_GDSC_SW_COLLAPSE)) != EPI_GDSC_SW_COLLAPSE)
+        { return 14; }
+    }
 
     // 1. CX GDSC on
     EpiGpuStep(hParams, 0x300);
@@ -555,8 +626,21 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
     // 3a. G1c-1: adreno SMMU ID / stream mapping (read only)
     if (Flags & 0x10) { EpiSmmuDump(hParams, hDiag, Text); }
 
+    // 3a. G1c-2a: write/read-back/restore while CM3 is reset and GX is off.
+    if (Flags & 0x20) { smmuWritten = EpiSmmuWriteTest(hParams, hDiag, Cc, gmuA, Text); }
+
     // 3a'. G1c-2b: GMU firmware ITCM/DTCM load + read-back (CM3 stays in reset)
     if ((Flags & 0x40) && Fw->Data != NULL) { *FwStatus = EpiGmuFwLoadTcm(hParams, Fw, gmuA, Text); }
+
+    if (Flags & EPI_GMU_PROBE_BOOT)
+    {
+        const ULONG gmuStatus = EpiGmuBootTest(hParams, hDiag, Cc, Fw->Data, Fw->Len,
+                                               Text, EPI_GPU_TEXT_CCH, KeepCx);
+        EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
+        if (gmuStatus != EPI_GMU_OK) { status = 16; }
+        // No further probes after boot, especially when teardown retained the CX window.
+        goto restore;
+    }
 
     // 3b. G1c-0: RSCC / GPU PDC state (read only)
     if (Flags & 4)
@@ -592,21 +676,37 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
     }
 
 restore:
+    if (*KeepCx)
+    {
+        // EpiGmuBootTest owns quarantined memory; its SMMU ctx borrows Cc.
+        // Leave every branch/CX ON and keep the outer GPU_CC mapping alive too.
+        EpiCat(Text, L"cx_kept", 1);
+        if (gmuB != NULL) { MmUnmapIoSpace(gmuB, PAGE_SIZE); }
+        if (gmuA != NULL) { MmUnmapIoSpace(gmuA, PAGE_SIZE); }
+        EpiGpuStep(hParams, 0x6FF);
+        return status;
+    }
     // 4. restore: branches in reverse order (original values; CLK_OFF is read-only), then collapse CX
     EpiGpuStep(hParams, 0x340);
     if (touched)
     {
         for (ULONG i = RTL_NUMBER_OF(g_EpiCxBranches); i-- > 0;)
         {
+            EpiGpuStep(hParams, 0x341 + (RTL_NUMBER_OF(g_EpiCxBranches) - 1 - i));
             WRITE_REGISTER_ULONG(Cc + g_EpiCxBranches[i].Offset / 4, orig[i]);
         }
     }
+    EpiGpuStep(hParams, 0x346);
     WRITE_REGISTER_ULONG(gdscr, gdscOrig);
     t = EpiPoll(hwctl, EPI_GDSC_PWR_ON, 0, 1000);
     EpiCat(Text, L"cx_off_x10us", t);
     EpiCat(Text, L"cx_gdscr2", READ_REGISTER_ULONG(gdscr));
     EpiCat(Text, L"cx_hwctl2", READ_REGISTER_ULONG(hwctl));
     if (t > 1000 && status == 0) { status = 13; }
+    if (smmuWritten && t <= 1000 && status == 0)
+    {
+        if (EpiSmmuAfterCollapse(hParams, hDiag, Cc, gdscOrig, orig, Text) != 0) { status = 15; }
+    }
     if (gmuB != NULL) { MmUnmapIoSpace(gmuB, PAGE_SIZE); }
     if (gmuA != NULL) { MmUnmapIoSpace(gmuA, PAGE_SIZE); }
     EpiGpuStep(hParams, 0x3FF);
@@ -633,12 +733,14 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     PWCHAR cxText = NULL;
     EPI_GMU_FW fw = {};
     ULONG fwStatus = 0xFFFFFFFF;
+    BOOLEAN keepCx = FALSE;
 
     // One shot: cleared and flushed before any hardware access, so a hang cannot repeat at the next start.
     // EpiGpuProbe bit0 = G1a read, bit1 = G1b CX power-up test (writes GPU_CC; implies the read),
     // bit2 = G1c-0: cmd-db copy + RSCC dump (runs inside the G1b CX window, so it implies bit1),
     // bit3 = also read GPU PDC (resets the phone, do not use), bit4 = G1c-1 adreno SMMU read (CX window),
-    // bit6 = G1c-2b GMU firmware TCM load test (reads C:\Epinephrine\fw\a660_gmu.bin; CX window).
+    // bit5 = G1c-2a SMMU write/read-back/restore, bit6 = G1c-2b TCM load,
+    // bit7 = G1c-3 CM3 boot/stop through SMMU (same firmware path, CX window; no PDC).
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     EpiSetDword(hParams, L"EpiGpuProbe", 0);
@@ -652,7 +754,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     text[0] = L'\0';
     cxText[0] = L'\0';
     if (flags & 4) { EpiSetDword(hDiag, L"CmdDbStatus", EpiCmdDbDump(hParams, hDiag)); }
-    if (flags & 0x40)
+    if (flags & (0x40 | EPI_GMU_PROBE_BOOT))
     {
         fwStatus = EpiGmuFwRead(hParams, &fw);
         EpiCat(cxText, L"fw_len", fw.Len);
@@ -667,7 +769,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         pa.QuadPart = EPI_GCC_BASE + EPI_GCC_MAP_OFF;
         gcc = MmMapIoSpaceEx(pa, EPI_GCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
         pa.QuadPart = EPI_GPU_CC_BASE;
-        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0x56) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
+        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0xF6) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
         if (gcc == NULL || gpucc == NULL) { status = 4; goto done; }
     }
 
@@ -702,12 +804,12 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & 0x56) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus); }
+        if (flags & 0xF6) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus, &keepCx); }
     }
 
 done:
     if (status != 1) { EpiGpuStep(hParams, 0xFFFF); }     // 0xFFFF = probe returned
-    if (gpucc != NULL) { MmUnmapIoSpace(gpucc, (SIZE_T)EPI_GPU_CC_LEN); }
+    if (gpucc != NULL && !keepCx) { MmUnmapIoSpace(gpucc, (SIZE_T)EPI_GPU_CC_LEN); }
     if (gcc != NULL) { MmUnmapIoSpace(gcc, EPI_GCC_MAP_LEN); }
     if (pairs != NULL && n != 0) { EpiSetValue(hDiag, L"GpuProbe", REG_BINARY, pairs, n * 2 * sizeof(ULONG)); }
     if (text != NULL && text[0] != L'\0')

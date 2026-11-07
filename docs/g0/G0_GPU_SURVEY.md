@@ -265,7 +265,7 @@ G1c-2a（adreno SMMU の書き込みと読み戻し）は手で実装する。20
     - 実機で走らせるのは毎回 1 回だけ（ワンショットで、`EpiGpuProbe` は自動で 0 に戻る）。
 - 参照（事実のみ。コードは持ち込まない）：Arm IHI 0062 SMMU Architecture Specification v2（グローバル空間 0/1、コンテキストバンク）、Arm SMMU-500 TRM（r2p4）、本家 Linux `drivers/iommu/arm/arm-smmu/arm-smmu.h` と `arm-smmu-qcom.c`（adreno SMMU の扱い）、`kodiak.dtsi` の `adreno_smmu` と GMU の `iommus`。
 
-### 9.7 G1c-2a の実装（v29、20.0.2.29、実機未実行）
+### 9.6.1 G1c-2a の実装（v29、20.0.2.29、実機未実行）
 
 `EpiGpuProbe=0x20`（bit5）で単独実行できる。既存の bit6（GMU TCM ロード）も保持し、CX 窓を開くマスクは両方のビットを含む `0x76` にした。ワンショットの解除・flush は既存どおり。
 
@@ -285,7 +285,7 @@ EpiDiag の診断形式：
 | `GpuSmmuWAfterSmr0` | 再投入後の SMR0。未取得は 0xFFFFFFFF |
 | `GpuCxStatus` | 従来値に加え、14 最初から CX が ON（試験せず）、15 再投入試験失敗。SMMU 自体の成否は `GpuSmmuWStatus` を見る |
 
-主要値は `GpuCxText` にも残す。文字列バッファを 3072 WCHAR に広げ、既存の GMU 診断と同時に記録できるようにした。
+主要値は `GpuCxText` にも残す。文字列バッファを 3072 WCHAR に広げ、既存の GMU 診断と同時に記録できるようにした。ARM64 Release のコンパイル・リンク、INF 検査、カタログ生成が成功（エラー・警告なし）。実機には配布・実行していない。
 
 レジスタ定義の照合元（事実のみ、コードは取り込んでいない）：[本家 arm-smmu.h](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)、[adreno SMMU の扱い](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c)。ハイパーバイザによる書き込み許可と実機の読み戻し結果は未検証 [U]。
 
@@ -308,6 +308,10 @@ EpiDiag の診断形式：
   - CX 窓の中で、GMU の TCM は AHB から読み書きできる。
   - CM3 を起動するには、icache（IOVA 0x4000）に blk12 を置いて SMMU で対応付ける必要がある。0x60000000 の dummy 領域も同じ。
   - バージョンが 0x20010004 より大きいので、起動完了の判定は `(FW_INIT_RESULT & 0x1FF) == 0x100` になる（0xBABEFACE ではない）。
+
+### 9.8 SMMU API と CM3 起動プローブ（v30、実機未実行）
+
+Map/Unmap・Enable/Disable・QueryFault と、bit7（0x80）の CM3 起動・停止プローブを実装した。API の契約、領域配置、診断値、検証結果は [G1C_SMMU_GMU_API.md](G1C_SMMU_GMU_API.md) を参照。PDC/RSCC 初期化と HFI メッセージは初版では省略しており、実機の起動成功は未確認 [U]。
 
 ## 参照
 
