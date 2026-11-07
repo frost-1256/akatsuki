@@ -228,6 +228,20 @@
   - G1c-2 では、PDC に書かずに RSCC の初期化と rpmh_start だけを試す。a660 ファミリーでは PDC を AOP が持っているので、それで足りるかを確かめる [U]。
   - GMU に渡す ARC の投票表は、この cmd-db から作れる。
 
+### 9.5 G1c-1 結果（2026-11-08、v34-akat、Epinephrine v28、`EpiGpuProbe=0x10`）
+
+- v34 で MMU1 が隠れ、qcsmmu が adreno SMMU を掴んでいない状態で、CX 窓の中から読んだ。リセットなし（Step 0xFFFF、GFSR 0）。
+- `sCR0=0x002C0406`：CLIENTPD=0（SMMU 有効）、GFRE/GFIE=1、**USFCFG=1**（どの SMR にも当たらないストリームはバイパスでなくフォールト）。上位 0x2C0000 は未解読。
+- `IDR0=0x4C017E06`：S1TS=1・S2TS=0（ステージ 1 のみ）、SMS=1（ストリームマッチ）、NUMIRPT=1、NUMSIDB=15、**NUMSMRG=6**。
+- `IDR1=0x30000007`：4KB ページ、NUMPAGENDXB=3（グローバル 16 ページ = 64KB、コンテキストバンクは 0x3DB0000 から）、NUMS2CB=0、**NUMCB=7**。
+- `IDR2=0x5511`：IAS/OAS とも 36 ビット、UBS=64 ビット、AArch64 4KB と 64KB の表形式に対応。
+- `IDR7=0x24`：r2p4（SMMU-500）。
+- SMR0〜5 はどれも 0（VALID なし）。S2CR は意味のない初期値。**誰もストリームを設定していない**。
+- 意味すること：
+  - 今のままでは GMU（ストリーム 5）の DDR アクセスはすべてフォールトする。
+  - G1c-2 では SMMU を自分で設定する。SMR0 に ID 5 / マスク 0x400、S2CR0 を CB0 への変換、CB0 に AArch64 4KB のステージ 1 表を置いて GMU の IOVA（0x60000000〜）を自前のメモリに張る。
+  - ハイパーバイザ（ステージ 2）がこの SMMU への書き込みを許すかは未確認 [U]。最初は sCR0 を変えずに SMR/S2CR/CB0 だけ書き、読み戻しで確かめる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
