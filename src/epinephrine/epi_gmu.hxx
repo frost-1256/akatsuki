@@ -17,6 +17,13 @@
 #define EPI_GMU_E_TIMEOUT       7           // CM3 released but FW_INIT_RESULT did not reach the expected value
 #define EPI_GMU_E_TEARDOWN      8           // EpiSmmuDisable failed: memory, mappings and ctx are kept (leaked)
 
+// EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
+// 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 18 records of five little-endian ULONGs
+// {Reg (GPU-base dword offset), Original, Value, Readback, CmpMask}, 20 bytes each, captured before cleanup.
+// Comparison uses (Readback & CmpMask) == (Value & CmpMask); CmpMask 0 records readback without comparing.
+// Readback is 0xFFFFFFFF until read; later entries after BadIndex were not attempted. A failed breadcrumb
+// can leave the failing entry unread too (see GpuGmuNtStatus). Empty binary means setup was not reached.
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off

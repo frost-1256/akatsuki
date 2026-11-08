@@ -209,11 +209,14 @@ static NTSTATUS GmuStep(HANDLE Params, ULONG Step)
     NTSTATUS st=EpiSetDword(Params,L"EpiGpuProbeStep",Step);
     return NT_SUCCESS(st) ? ZwFlushKey(Params) : st;
 }
-static NTSTATUS GmuWrite(GMU_TEST* S, HANDLE Params, ULONG Dword, ULONG Value, ULONG Step)
+static NTSTATUS GmuWrite(GMU_TEST* S, HANDLE Params, ULONG Dword, ULONG Value, ULONG Step,
+                         ULONG CmpMask = 0xFFFFFFFFUL, ULONG* Readback = NULL)
 {
     NTSTATUS st=GmuStep(Params,Step); if (!NT_SUCCESS(st)) { return st; }
     WRITE_REGISTER_ULONG(GmuReg(S,Dword),Value);
-    return READ_REGISTER_ULONG(GmuReg(S,Dword)) == Value ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+    const ULONG readback=READ_REGISTER_ULONG(GmuReg(S,Dword));
+    if (Readback != NULL) { *Readback=readback; }
+    return (readback & CmpMask) == (Value & CmpMask) ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
 }
 static VOID GmuText(PWCHAR Text, SIZE_T Cch, PCWSTR Name, ULONG Value)
 {
@@ -268,21 +271,28 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
     EpiSetDword(Diag,L"GpuGmuDisableStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetDword(Diag,L"GpuGmuBadIndex",0xFFFFFFFFUL);
+    EpiSetValue(Diag,L"GpuGmuSetup",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     ULONG result=EPI_GMU_OK, configured=0;
     NTSTATUS st=STATUS_SUCCESS;
     BOOLEAN smmuAttempted=FALSE, released=FALSE;
     // No PDC/RSCC/RPMh votes, no HFI messages or GX requests in this first boot probe.
-    struct SETTING { ULONG Reg, Value, Original; } setup[] = {
-        {0x23B06,0xFFFFFFFF,0}, {0x1F993,0xFFFFFFFF,0}, // mask unhandled GMU/HFI IRQs
-        {R_CX_FALNEXT_INTF,1,0}, {R_CX_FAL_INTF,1,0}, {R_GENERAL_7,1,0},
-        {R_CM3_FW_INIT_RESULT,0,0}, {R_CM3_BOOT_CONFIG,2,0},
-        {R_HFI_QTBL_ADDR,EPI_GMU_HFI_IOVA,0}, {R_HFI_QTBL_INFO,1,0},
-        {R_AHB_FENCE_RANGE_0,V_AHB_FENCE_RANGE_0,0}, {R_CM3_CFG,V_CM3_CFG,0},
-        {R_HFI_SFR_ADDR,V_GMU_CHIPID,0}, {R_PWR_COL_CP_MSG,EPI_GMU_LOG_IOVA|3,0},
-        {R_SYS_BUS_CONFIG,1,0}, {R_ICACHE_CONFIG,1,0}, {R_DCACHE_CONFIG,1,0},
-        {R_PWR_COL_IFRAME_CTRL,V_IFRAME_CTRL,0}, {R_PWR_COL_CP_RESP,0,0}
+    // Field order is the GpuGmuSetup REG_BINARY diagnostic ABI.
+    struct SETTING { ULONG Reg, Original, Value, Readback, CmpMask; } setup[] = {
+        {0x23B06,0,0xFFFFFFFF,0xFFFFFFFF,0x3F}, // only six implemented IRQ mask bits
+        {0x1F993,0,0xFFFFFFFF,0xFFFFFFFF,0}, // GMU2HOST_INTR_MASK: readback only until implemented bits are measured
+        {R_CX_FALNEXT_INTF,0,1,0xFFFFFFFF,0xFFFFFFFF},
+        {R_CX_FAL_INTF,0,1,0xFFFFFFFF,0xFFFFFFFF}, {R_GENERAL_7,0,1,0xFFFFFFFF,0xFFFFFFFF},
+        {R_CM3_FW_INIT_RESULT,0,0,0xFFFFFFFF,0xFFFFFFFF}, {R_CM3_BOOT_CONFIG,0,2,0xFFFFFFFF,0xFFFFFFFF},
+        {R_HFI_QTBL_ADDR,0,EPI_GMU_HFI_IOVA,0xFFFFFFFF,0xFFFFFFFF}, {R_HFI_QTBL_INFO,0,1,0xFFFFFFFF,0xFFFFFFFF},
+        {R_AHB_FENCE_RANGE_0,0,V_AHB_FENCE_RANGE_0,0xFFFFFFFF,0xFFFFFFFF}, {R_CM3_CFG,0,V_CM3_CFG,0xFFFFFFFF,0xFFFFFFFF},
+        {R_HFI_SFR_ADDR,0,V_GMU_CHIPID,0xFFFFFFFF,0xFFFFFFFF}, {R_PWR_COL_CP_MSG,0,EPI_GMU_LOG_IOVA|3,0xFFFFFFFF,0xFFFFFFFF},
+        {R_SYS_BUS_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF}, {R_ICACHE_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF},
+        {R_DCACHE_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF},
+        {R_PWR_COL_IFRAME_CTRL,0,V_IFRAME_CTRL,0xFFFFFFFF,0xFFFFFFFF}, {R_PWR_COL_CP_RESP,0,0,0xFFFFFFFF,0xFFFFFFFF}
     };
     const ULONGLONG bases[]={EPI_GMU_PAGE_C_PHYS,EPI_GMU_PAGE_A_PHYS,EPI_GMU_PAGE_B_PHYS,
                              EPI_GMU_ITCM_PHYS_,EPI_GMU_DTCM_PHYS_};
@@ -328,14 +338,32 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     for (ULONG i=0;i<RTL_NUMBER_OF(setup);++i)
     {
         configured=i+1;
-        st=GmuWrite(s,Params,setup[i].Reg,setup[i].Value,0x600+i);
-        if (!NT_SUCCESS(st)) { result=EPI_GMU_E_TCM; goto cleanup; }
+        st=GmuWrite(s,Params,setup[i].Reg,setup[i].Value,0x600+i,setup[i].CmpMask,&setup[i].Readback);
+        if (!NT_SUCCESS(st))
+        {
+            EpiSetDword(Diag,L"GpuGmuBadIndex",i);
+            EpiSetValue(Diag,L"GpuGmuSetup",REG_BINARY,setup,sizeof(setup));
+            result=EPI_GMU_E_TCM; goto cleanup;
+        }
     }
-    if (!GmuCopy(s,Params,Fw,FwLen)) { st=STATUS_IO_DEVICE_ERROR; result=EPI_GMU_E_TCM; goto cleanup; }
+    EpiSetValue(Diag,L"GpuGmuSetup",REG_BINARY,setup,sizeof(setup));
+    if (!GmuCopy(s,Params,Fw,FwLen))
+    {
+        EpiSetDword(Diag,L"GpuGmuBadIndex",0xFF);
+        st=STATUS_IO_DEVICE_ERROR; result=EPI_GMU_E_TCM; goto cleanup;
+    }
     GmuText(Text,TextCch,L"gmu_fw_ver",READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[4])+EPI_GMU_VER_DTCM_OFF/4));
     smmuAttempted=TRUE;
     st=EpiSmmuEnable(s->Smmu,Cc,static_cast<volatile ULONG*>(s->Maps[1]));
-    if (!NT_SUCCESS(st)) { result=EPI_GMU_E_SMMU_ENABLE; goto cleanup; }
+    if (!NT_SUCCESS(st))
+    {
+        // GpuSmmuBadWrite: four little-endian ULONGs {Step, Offset (bytes), Value, Readback}.
+        // Keep the Enable status in st even when the failure was not a write mismatch.
+        ULONG badWrite[4]={};
+        if (NT_SUCCESS(EpiSmmuQueryLastError(s->Smmu,&badWrite[0],&badWrite[1],&badWrite[2],&badWrite[3])))
+        { EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,badWrite,sizeof(badWrite)); }
+        result=EPI_GMU_E_SMMU_ENABLE; goto cleanup;
+    }
     // No release unless SMMU and all buffers are ready; clear stale init result first.
     st=GmuStep(Params,0x620);
     if (!NT_SUCCESS(st)) { result=EPI_GMU_E_PRECOND; goto cleanup; }
@@ -386,7 +414,7 @@ cleanup:
     // Processor reset and SMMU detached; restore address/config registers before freeing buffers.
     for (ULONG i=configured; i-- > 2;)
     {
-        st=GmuWrite(s,Params,setup[i].Reg,setup[i].Original,0x640+i);
+        st=GmuWrite(s,Params,setup[i].Reg,setup[i].Original,0x640+i,setup[i].CmpMask);
         if (!NT_SUCCESS(st)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
     }
     if (s->Smmu!=NULL)

@@ -33,6 +33,12 @@ NTSTATUS EpiSmmuUnmap(EPI_SMMU* Context, ULONGLONG Iova, SIZE_T Size);
 NTSTATUS EpiSmmuEnable(EPI_SMMU* Context, volatile ULONG* Cc, volatile ULONG* GmuA);
 NTSTATUS EpiSmmuDisable(EPI_SMMU* Context);
 
+// Software-only query of the FIRST Write readback mismatch during the context's lifetime.
+// Survives Disable/rollback; no hardware access and does not clear the record.
+// Offset is in bytes from the SMMU register base (0x03DA0000).
+// All outputs required. STATUS_NOT_FOUND if no mismatch; outputs unchanged on failure.
+NTSTATUS EpiSmmuQueryLastError(EPI_SMMU* Context, ULONG* Step, ULONG* Offset, ULONG* Value, ULONG* Readback);
+
 // Read-only, valid while enabled, including while CM3 runs. Does not clear faults.
 // Caller keeps CX/branches on and serializes against Disable/CX teardown.
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU* Context, ULONG* Fsr, ULONGLONG* Far, ULONG* Fsynr0);

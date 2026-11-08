@@ -32,6 +32,8 @@ struct EPI_SMMU {
     ULONG Original[RTL_NUMBER_OF(ConfigOffsets)];
     ULONG Sctlr, Smr;
     BOOLEAN Saved, Enabled;
+    ULONG BadWriteStep, BadWriteOffset, BadWriteValue, BadWriteReadback;
+    BOOLEAN HasBadWrite; // first mismatch for this context's lifetime; Disable must not overwrite it
 };
 static PVOID volatile Owner = NULL;
 
@@ -187,7 +189,13 @@ static BOOLEAN WindowReady(EPI_SMMU* C, BOOLEAN Reset)
         (READ_REGISTER_ULONG(C->Gmu+0x340/4) & 0xC0) != 0xC0)) { return FALSE; }
     return TRUE;
 }
-static NTSTATUS Write(EPI_SMMU* C, ULONG Offset, ULONG Value, ULONG Step)
+static ULONG ConfigCompareMask(ULONG Offset)
+{
+    // Ignore TCR2 bits 0x60 in readback comparisons, both on setup and restore.
+    return Offset == Cb+0x10 ? 0xFFFFFF9FUL : 0xFFFFFFFFUL;
+}
+static NTSTATUS Write(EPI_SMMU* C, ULONG Offset, ULONG Value, ULONG Step,
+                      ULONG CmpMask = 0xFFFFFFFFUL)
 {
     if (C->Params != NULL)
     {
@@ -196,7 +204,25 @@ static NTSTATUS Write(EPI_SMMU* C, ULONG Offset, ULONG Value, ULONG Step)
         st = ZwFlushKey(C->Params); if (!NT_SUCCESS(st)) { return st; }
     }
     WRITE_REGISTER_ULONG(C->Regs+Offset/4, Value);
-    return READ_REGISTER_ULONG(C->Regs+Offset/4) == Value ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+    const ULONG readback = READ_REGISTER_ULONG(C->Regs+Offset/4);
+    if ((readback & CmpMask) == (Value & CmpMask)) { return STATUS_SUCCESS; }
+    if (!C->HasBadWrite)
+    {
+        C->BadWriteStep = Step; C->BadWriteOffset = Offset;
+        C->BadWriteValue = Value; C->BadWriteReadback = readback;
+        C->HasBadWrite = TRUE;
+    }
+    return STATUS_IO_DEVICE_ERROR;
+}
+NTSTATUS EpiSmmuQueryLastError(EPI_SMMU* C, ULONG* Step, ULONG* Offset, ULONG* Value, ULONG* Readback)
+{
+    PAGED_CODE();
+    if (C == NULL || Step == NULL || Offset == NULL || Value == NULL || Readback == NULL)
+    { return STATUS_INVALID_PARAMETER; }
+    if (!C->HasBadWrite) { return STATUS_NOT_FOUND; }
+    *Step = C->BadWriteStep; *Offset = C->BadWriteOffset;
+    *Value = C->BadWriteValue; *Readback = C->BadWriteReadback;
+    return STATUS_SUCCESS;
 }
 static NTSTATUS Sync(EPI_SMMU* C, ULONG Step)
 {
@@ -238,7 +264,7 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
     st = Sync(C, 0x522); if (!NT_SUCCESS(st)) { return st; }
     for (ULONG i = 0; i < RTL_NUMBER_OF(ConfigOffsets); ++i)
     {
-        st = Write(C, ConfigOffsets[i], C->Original[i], 0x530+i);
+        st = Write(C, ConfigOffsets[i], C->Original[i], 0x530+i, ConfigCompareMask(ConfigOffsets[i]));
         if (!NT_SUCCESS(st)) { return st; }
     }
     st = Write(C, Cb, C->Sctlr, 0x53B); if (!NT_SUCCESS(st)) { return st; }
@@ -281,11 +307,12 @@ NTSTATUS EpiSmmuEnable(EPI_SMMU* C, volatile ULONG* Cc, volatile ULONG* GmuA)
     KeMemoryBarrier();
     NTSTATUS st = Write(C, Cb, 0, 0x500);
     for (ULONG i = 0; NT_SUCCESS(st) && i < RTL_NUMBER_OF(values); ++i)
-    { st = Write(C, ConfigOffsets[i], values[i], 0x501+i); }
+    { st = Write(C, ConfigOffsets[i], values[i], 0x501+i, ConfigCompareMask(ConfigOffsets[i])); }
     if (NT_SUCCESS(st)) { st = Sync(C, 0x50C); }
     // ASIDPNE/HUPCF/CFRE/AFE/TRE/M: record faults for QueryFault,
     // but CFIE=0 (no IRQ) and CFCFG=0 (no stall on a fault).
-    if (NT_SUCCESS(st)) { st = Write(C, Cb, 0x1127, 0x50D); }
+    // Ignore SCTLR bit12 (ASIDPNE) in this enable write's readback comparison.
+    if (NT_SUCCESS(st)) { st = Write(C, Cb, 0x1127, 0x50D, 0xFFFFEFFFUL); }
     if (NT_SUCCESS(st)) { st = Write(C, 0x800, 0x84000005, 0x50E); }
     if (NT_SUCCESS(st)) { C->Enabled = TRUE; return STATUS_SUCCESS; }
     const NTSTATUS cleanup = EpiSmmuDisable(C);
