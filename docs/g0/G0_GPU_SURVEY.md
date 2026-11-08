@@ -313,6 +313,72 @@ EpiDiag の診断形式：
 
 Map/Unmap・Enable/Disable・QueryFault と、bit7（0x80）の CM3 起動・停止プローブを実装した。API の契約、領域配置、診断値、検証結果は [G1C_SMMU_GMU_API.md](G1C_SMMU_GMU_API.md) を参照。PDC/RSCC 初期化と HFI メッセージは初版では省略しており、実機の起動成功は未確認 [U]。
 
+### 9.9 G1c-2a / G1c-3 の実機結果（2026-11-08、v34-akat）
+
+**G1c-2a（v30、`EpiGpuProbe=0x20`）**：`GpuSmmuWStatus=6`。書き込みはすべてハイパーバイザに止められずに通った [P]。
+
+| レジスタ | 元の値 | 書いた値＝読み戻し | 復元 |
+|---|---|---|---|
+| CB0 SCTLR | 0x31A56116 | 0x106 | OK |
+| CBAR0 | 0 | 0x1F300 | **0x1F300 のまま** |
+| CBA2R0 | 0 | 1 | OK |
+| S2CR0 | 0x1BFA5BFF | 0 | OK |
+| SMR0 | 0 | 0x84000005 | OK（0） |
+
+CBAR0 が 0 に戻らないのは、stage 1 しかない SMMU で TYPE=0（stage 2）を受け付けないためと見られる [U]。害はない。
+
+**G1c-3（`EpiGpuProbe=0x80`）**：読み戻しの不一致を 1 つずつ潰した。
+
+| 版 | 止まった場所 | 書いた値 → 読み戻し | 対処 |
+|---|---|---|---|
+| v30 / v31 | GMU setup[0] `AO_HOST_INTERRUPT_MASK`（0x23B06） | 0xFFFFFFFF → 0x3F（リセット時から 0x3F） | 比較マスク 0x3F |
+| v32 | SMMU CB0 `TCR2`（ステップ 0x503） | 0x38011 → 0x38071（bit5/6、TBI0/TBI1 [U] が 1 固定） | 比較マスク 0xFFFFFF9F |
+| v34 | SMMU CB0 `SCTLR`（ステップ 0x50D） | 0x1127 → 0x0127（bit12 ASIDPNE が RAZ） | 比較マスク 0xFFFFEFFF |
+| **v35** | **CM3 解放後の時間切れ**（status 7） | — | — |
+
+- その他の実測：`GMU2HOST_INTR_MASK`（0x1F993）は 32 ビットすべて読み戻せる。リセット時の値で 0 以外だったのは `CM3_CFG=0x4052`、`PWR_COL_INTER_FRAME_CTRL=0x09C40402`。
+- **v35（3312b49）：SMMU が有効になり、CM3 が解放され、ファームウェアが動いた** [P]。
+  - `FW_INIT_RESULT=0x800`（期待値は `(x & 0x1FF) == 0x100`）。`FW_BUSY=0`、`GMU2HOST_INTR_INFO=0x4`、`AO_HOST_INTR=0`、`GENERAL_0=0x30000009`、`GENERAL_1=0`。
+  - SMMU の `FSR=0x400`：FORMAT フィールドだけで、fault ビットは 0。icache（IOVA 0x4000）からの命令取り込みも、ログ領域への書き込みも、SMMU 越しに通った。
+  - ログ領域（IOVA 0x60004000）に 16 バイトの記録が 4 件。形式は `{ID, タイムスタンプ, 番号, 値}` と見られる [U]：(0x21, 0xCF6FC9, 1, 0)、(0x23, 0xD126D8, 1, 0xDEADBA55)、(0x23, 0xD131DD, 2, 0xDEADBA55)、(0x21, 0xD13759, 3, 0x1264)。19.2 MHz とすると約 6 ms で止まっている。
+  - 後片付け（CM3 を reset、SMMU Disable、CX を落とす）はすべて成功。
+  - 足りない候補：RSCC の初期化、`GMU_RPMH_CTRL`、GMU のクロック（§9.10）[U]。
+
+### 9.10 RSCC / RPMh の手順（本家 Linux、a660 ファミリー）
+
+事実の出典は本家 Linux の `a6xx_gmu.c` と `a6xx_gmu.xml`。行番号は手元の参照コピーのもの。コードは持ち込まない。
+
+- **`a6xx_rpmh_start`（620 行）は初回の起動では何もしない。** `GMU_STATUS_PDC_SLEEP` が立っているときだけ動き、それを立てるのは `a6xx_rpmh_stop`（673 行）だけ。初回に効くのは、プローブ時に 1 回呼ばれる `a6xx_gmu_rpmh_init`（681 行、呼び出しは 2530 行）[P]。
+- **`a6xx_gmu_rpmh_init`**：RSCC のベースは 0x3DE0000（kodiak.dtsi の "rscc"）。オフセットは dword 単位で、バイト位置は ×4。
+
+| 順 | レジスタ（dword） | バイト | 値 | 実機の値（v27） |
+|---|---|---|---|---|
+| 1 | `GPU_RSCC_RSC_STATUS0_DRV0`（0x0004） | +0x010 | 0x01000000（SDE のクロックゲーティング無効化） | 0 |
+| 2 | `RSCC_PDC_SLAVE_ID_DRV0`（0x000B） | +0x02C | 1 | 1（設定済み） |
+| 3, 4 | `HIDDEN_TCS_CMD0_DATA` / `ADDR`（0x000E / 0x000D） | +0x038 / +0x034 | 0 / 0 | ※ |
+| 5, 6 | 同 +2（0x0010 / 0x000F） | +0x040 / +0x03C | 0 / 0 | ※ |
+| 7, 8 | 同 +4（0x0012 / 0x0011） | +0x048 / +0x044 | 0x80000000 / 0 | ※ |
+| 9 | `RSCC_OVERRIDE_START_ADDR`（0x0100） | +0x400 | 0 | |
+| 10 | `RSCC_PDC_SEQ_START_ADDR`（0x0008） | +0x020 | 0x4520 | 設定済み |
+| 11, 12 | `RSCC_PDC_MATCH_VALUE_LO` / `HI`（0x0009 / 0x000A） | +0x024 / +0x028 | 0x4510 / 0x4514 | 設定済み |
+| 13〜17 | `RSCC_SEQ_MEM_0_DRV0` +0〜+4（0x0180〜） | +0x600〜+0x610 | 0xEAAAE5A0、0xE1A1EBAB、0xA2E0A581、0xECAC82E2、0x0020EDAD | すべて 0 |
+
+  - そのあと PDC（0xB290000）に `PDC_GPU_SEQ_START_ADDR=0` と `PDC_GPU_ENABLE_PDC=0x80000001` を書く（799〜800 行）。a660 ファミリーは `pdc_in_aop=true` なので、PDC の TCS とシーケンスは書かない。**PDC は読むだけで電話がリセットされるので触らない**（§9.4）。今の状態は確かめられない [U]。
+  - ※ HIDDEN_TCS の 3 つの ADDR のうち 2 つに、v27 の時点で 0x82204514 と 0x82204510 が入っていた。Linux はここを 0 にするが、ブートローダか AOP が入れた値の可能性がある [U]。まずは設定済みの値（2、10〜12、ADDR）を上書きしない形で試す。
+- **起動のたびの処理で、今の実装（3312b49）にないもの**：
+  - GMU のコアクロックを 200 MHz、hub を 150 MHz に設定（1340〜1342 行）。今は RCG の既定値（XO と見られる [U]）。
+  - 起動用のバス帯域の投票（1355 行）。DDR へのアクセスは SMMU 越しに通っているので、急ぎではない。
+  - `AO_HOST_INTERRUPT_CLR = ~0`（1358 行）。
+  - **`GMU_RPMH_CTRL`（0x1F8E8）\|= 0xF11**（846〜852 行）：RPMH_INTERFACE（bit0）、LLC（bit4）、DDR（bit8）、MX（bit9）、CX（bit10）、GFX（bit11）の投票を有効にする。
+- **`rpmh_start` / `rpmh_stop`**（2 回目以降の起動、停止時）：
+  - start：`GMU_RSCC_CONTROL_REQ`（0x23B07）に bit1 を書く。`GMU_RSCC_CONTROL_ACK`（0x23B08）の bit1 を待つ（100 µs 間隔で最大 10 ms）。RSCC の `SEQ_BUSY_DRV0`（0x0101、+0x404）が 0 になるのを待つ。REQ を 0 に戻す。
+  - stop：REQ に 1 を書く。`RSC_STATUS0_DRV0` の bit16 を待つ。REQ を 0 に戻す。
+- **次の進め方（案）**：
+  1. RSCC への書き込み試験（CM3 は reset のまま）：表の 1、3、5、7〜9、13〜17 を書いて読み戻す。書き込みごとにブレッドクラムを進める。RSCC への書き込みがハイパーバイザに止められないかを、独立した 1 回で確かめる。
+  2. RSCC の初期化をしたうえで、`RPMH_CTRL=0xF11` を足して `0x80` を実行する。`FW_INIT_RESULT` とログの記録が v35 からどう変わるかを見る。
+  3. 変わらなければ、GMU のクロックを 200 MHz にする（GPU_CC の RCG の設定）。
+  - GMU 起動のコードはユーザーが書く。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
