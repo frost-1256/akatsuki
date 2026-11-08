@@ -136,6 +136,8 @@ static ULONG EpiPoll(volatile ULONG* Reg, ULONG Mask, ULONG Want, ULONG Max)
 #define EPI_CMDDB_LEN           0x20000
 #define EPI_RSCC_BASE           0x03DE0000ULL
 #define EPI_RSCC_MAP_LEN        0x2000
+#define EPI_RSCC_PROBE_WRITE    0x100UL
+#define EPI_GPU_CX_FLAGS        (0xF6UL | EPI_RSCC_PROBE_WRITE)
 #define EPI_PDC_BASE            0x0B290000ULL
 #define EPI_PDC_MAP_OFF         0x4000          // dwords 0x1000..0x17FF
 #define EPI_PDC_MAP_LEN         0x2000
@@ -316,6 +318,98 @@ static BOOLEAN EpiSmmuWriteTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc
     EpiCat(Text, L"smr0_written", r[4].Readback);
     EpiCat(Text, L"smr0_restored", r[4].Restored);
     return written != 0;
+}
+
+// ---- RSCC write/readback/restore test (bit8), CM3 held in reset throughout ----
+// Register/value facts: G0_GPU_SURVEY.md section 9.10. No PDC, handshake or RPMH_CTRL writes.
+static NTSTATUS EpiRsccStep(HANDLE Params, ULONG Step)
+{
+    const NTSTATUS st = EpiSetDword(Params, L"EpiGpuProbeStep", Step);
+    return NT_SUCCESS(st) ? ZwFlushKey(Params) : st;
+}
+
+static ULONG EpiRsccWriteTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc,
+                             PVOID GmuA, PVOID GmuB, PWCHAR Text)
+{
+    // Diagnostic ABI: ten records of {RSCC dword offset, original, value, readback, restored}.
+    struct RSCC_WRITE { ULONG Dword, Original, Value, Readback, Restored; } r[] = {
+        {0x004,0,0x01000000,0xFFFFFFFF,0xFFFFFFFF},
+        {0x00E,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x010,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x012,0,0x80000000,0xFFFFFFFF,0xFFFFFFFF},
+        {0x100,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x180,0,0xEAAAE5A0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x181,0,0xE1A1EBAB,0xFFFFFFFF,0xFFFFFFFF},
+        {0x182,0,0xA2E0A581,0xFFFFFFFF,0xFFFFFFFF},
+        {0x183,0,0xECAC82E2,0xFFFFFFFF,0xFFFFFFFF},
+        {0x184,0,0x0020EDAD,0xFFFFFFFF,0xFFFFFFFF}
+    };
+    // Preserve every HIDDEN_TCS ADDR, PDC slave ID and PDC sequence/match value.
+    ULONG status = 0, written = 0, badIndex = 0xFFFFFFFF, restoreBadIndex = 0xFFFFFFFF;
+    PVOID map = NULL;
+    volatile ULONG* a = static_cast<volatile ULONG*>(GmuA);
+    volatile ULONG* b = static_cast<volatile ULONG*>(GmuB);
+    const ULONG clocks[] = {0x1078,0x109C,0x1098,0x1204,0x5000};
+    if (!NT_SUCCESS(EpiRsccStep(Params, 0x900))) { status = 5; }
+    if (status == 0)
+    {
+        for (ULONG i = 0; i < RTL_NUMBER_OF(clocks); ++i)
+        { if (READ_REGISTER_ULONG(Cc + clocks[i]/4) & EPI_CBCR_CLK_OFF) { status = 2; } }
+        if (!(READ_REGISTER_ULONG(Cc + EPI_CC_CX_GDSCR/4) & EPI_GDSC_PWR_ON) ||
+            READ_REGISTER_ULONG(a) != 1 || (READ_REGISTER_ULONG(a + 0x340/4) & 0xC0) != 0xC0 ||
+            (READ_REGISTER_ULONG(Cc + 0x100C/4) & 0x80000001UL) != 1 ||
+            READ_REGISTER_ULONG(b + (0x23B07-0x23800)) != 0 ||
+            READ_REGISTER_ULONG(b + (0x23B08-0x23800)) != 0) { status = 2; }
+    }
+    if (status == 0)
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart = EPI_RSCC_BASE;
+        map = MmMapIoSpaceEx(pa, EPI_RSCC_MAP_LEN, PAGE_READWRITE | PAGE_NOCACHE);
+        if (map == NULL) { status = 1; }
+    }
+    if (map != NULL)
+    {
+        volatile ULONG* s = static_cast<volatile ULONG*>(map);
+        if (!NT_SUCCESS(EpiRsccStep(Params, 0x901))) { status = 5; }
+        if (status == 0 && READ_REGISTER_ULONG(s + 0x101) != 0) { status = 2; }
+        // Snapshot ALL targets before any write. Never release or reset CM3 here.
+        if (status == 0)
+        {
+            for (ULONG i = 0; i < RTL_NUMBER_OF(r); ++i)
+            { r[i].Original = READ_REGISTER_ULONG(s + r[i].Dword); }
+            for (ULONG i = 0; i < RTL_NUMBER_OF(r); ++i)
+            {
+                if (!NT_SUCCESS(EpiRsccStep(Params, 0x910+i)))
+                { status = 5; badIndex = i; break; }
+                WRITE_REGISTER_ULONG(s + r[i].Dword, r[i].Value);
+                ++written;
+                r[i].Readback = READ_REGISTER_ULONG(s + r[i].Dword);
+                if (r[i].Readback != r[i].Value) { status = 3; badIndex = i; break; }
+            }
+            for (ULONG i = written; i-- > 0;)
+            {
+                // Restoration is mandatory even if breadcrumb persistence fails.
+                if (!NT_SUCCESS(EpiRsccStep(Params, 0x930+i)) && status != 4) { status = 5; }
+                WRITE_REGISTER_ULONG(s + r[i].Dword, r[i].Original);
+                r[i].Restored = READ_REGISTER_ULONG(s + r[i].Dword);
+                if (r[i].Restored != r[i].Original)
+                {
+                    status = 4;
+                    if (restoreBadIndex == 0xFFFFFFFF) { restoreBadIndex = i; }
+                }
+            }
+        }
+        MmUnmapIoSpace(map, EPI_RSCC_MAP_LEN);
+    }
+    EpiSetValue(Diag, L"GpuRsccW", REG_BINARY, r, sizeof(r));
+    EpiSetDword(Diag, L"GpuRsccWStatus", status);
+    EpiSetDword(Diag, L"GpuRsccWCount", written);
+    EpiSetDword(Diag, L"GpuRsccWBadIndex", badIndex);
+    EpiSetDword(Diag, L"GpuRsccWRestoreBadIndex", restoreBadIndex);
+    EpiCat(Text, L"rscc_w_status", status);
+    EpiCat(Text, L"rscc_w_count", written);
+    EpiCat(Text, L"rscc_w_bad", badIndex);
+    return status;
 }
 
 // Reopen only after a confirmed collapse; always return clocks and GDSCR to their originals.
@@ -549,8 +643,8 @@ out:
 
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
 //              12 map failed, 13 CX GDSC did not collapse again on restore,
-//              14 G1c-2a/CM3 boot needs initially collapsed CX, 15 post-collapse SMMU read cycle failed,
-//              16 GMU boot test failed (GpuGmuStatus contains the reason)
+//              14 SMMU/CM3 boot/RSCC write test needs initially collapsed CX, 15 post-collapse SMMU read cycle failed,
+//              16 GMU boot test failed (GpuGmuStatus contains the reason), 17 RSCC write test failed
 static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text,
                           const EPI_GMU_FW* Fw, PULONG FwStatus, BOOLEAN* KeepCx)
 {
@@ -575,6 +669,9 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
         EpiSetDword(hDiag, L"GpuSmmuWStatus", 7);
         EpiSetDword(hDiag, L"GpuSmmuWCycleStatus", 7);
         EpiSetDword(hDiag, L"GpuSmmuWAfterSmr0", 0xFFFFFFFF);
+    }
+    if (Flags & (0x20 | EPI_GMU_PROBE_BOOT | EPI_RSCC_PROBE_WRITE))
+    {
         if ((gdscOrig & (EPI_GDSC_PWR_ON | EPI_GDSC_SW_COLLAPSE)) != EPI_GDSC_SW_COLLAPSE)
         { return 14; }
     }
@@ -621,6 +718,13 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
             EpiCat(Text, g_EpiGmuRegs[i].Name, READ_REGISTER_ULONG(base + off / 4));
             if (i == 3) { KeStallExecutionProcessor(100); }
         }
+    }
+
+    // Independent trial: no SMMU/TCM/CM3 boot or PDC probes in this CX window.
+    if (Flags & EPI_RSCC_PROBE_WRITE)
+    {
+        if (EpiRsccWriteTest(hParams, hDiag, Cc, gmuA, gmuB, Text) != 0) { status = 17; }
+        goto restore;
     }
 
     // 3a. G1c-1: adreno SMMU ID / stream mapping (read only)
@@ -721,7 +825,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     if (!NT_SUCCESS(EpiOpenDiag(Pdo, &hParams, &hDiag))) { return; }
 
     // GpuProbeStatus: 0 done, 1 not enabled, 2 GPU_CC not in _CRS, 3 no memory, 4 map failed,
-    //                 5 GCC_GPU_CFG_AHB_CLK off (GPU_CC not read)
+    //                 5 GCC_GPU_CFG_AHB_CLK off (GPU_CC not read), 6 incompatible RSCC probe flags,
+    //                 7 RSCC one-shot persistence failed (no hardware access)
     ULONG status = 0;
     ULONG n = 0;
     PULONG pairs = NULL;
@@ -740,10 +845,23 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit2 = G1c-0: cmd-db copy + RSCC dump (runs inside the G1b CX window, so it implies bit1),
     // bit3 = also read GPU PDC (resets the phone, do not use), bit4 = G1c-1 adreno SMMU read (CX window),
     // bit5 = G1c-2a SMMU write/read-back/restore, bit6 = G1c-2b TCM load,
-    // bit7 = G1c-3 CM3 boot/stop through SMMU (same firmware path, CX window; no PDC).
+    // bit7 = G1c-3 CM3 boot/stop through SMMU (same firmware path, CX window; no PDC),
+    // bit8 = independent RSCC write/read-back/restore, CM3 reset; only bits0/1 may accompany it.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
-    EpiSetDword(hParams, L"EpiGpuProbe", 0);
+    if (flags & EPI_RSCC_PROBE_WRITE)
+    {
+        EpiSetDword(hDiag, L"GpuRsccWStatus", 7);
+        EpiSetValue(hDiag, L"GpuRsccW", REG_BINARY, NULL, 0);
+        EpiSetDword(hDiag, L"GpuRsccWCount", 0);
+        EpiSetDword(hDiag, L"GpuRsccWBadIndex", 0xFFFFFFFF);
+        EpiSetDword(hDiag, L"GpuRsccWRestoreBadIndex", 0xFFFFFFFF);
+        const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
+        if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
+        if (flags & ~(EPI_RSCC_PROBE_WRITE | 3UL))
+        { EpiSetDword(hDiag, L"GpuRsccWStatus", 6); status = 6; goto done; }
+    }
+    else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }
     EpiGpuStep(hParams, 1);
     if (!pRes->GpuCcFound) { status = 2; goto done; }
 
@@ -769,7 +887,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         pa.QuadPart = EPI_GCC_BASE + EPI_GCC_MAP_OFF;
         gcc = MmMapIoSpaceEx(pa, EPI_GCC_MAP_LEN, PAGE_READONLY | PAGE_NOCACHE);
         pa.QuadPart = EPI_GPU_CC_BASE;
-        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & 0xF6) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
+        gpucc = MmMapIoSpaceEx(pa, (SIZE_T)EPI_GPU_CC_LEN, ((flags & EPI_GPU_CX_FLAGS) ? PAGE_READWRITE : PAGE_READONLY) | PAGE_NOCACHE);
         if (gcc == NULL || gpucc == NULL) { status = 4; goto done; }
     }
 
@@ -804,7 +922,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & 0xF6) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus, &keepCx); }
+        if (flags & EPI_GPU_CX_FLAGS) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus, &keepCx); }
     }
 
 done:

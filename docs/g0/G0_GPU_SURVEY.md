@@ -374,10 +374,40 @@ CBAR0 が 0 に戻らないのは、stage 1 しかない SMMU で TYPE=0（stage
   - start：`GMU_RSCC_CONTROL_REQ`（0x23B07）に bit1 を書く。`GMU_RSCC_CONTROL_ACK`（0x23B08）の bit1 を待つ（100 µs 間隔で最大 10 ms）。RSCC の `SEQ_BUSY_DRV0`（0x0101、+0x404）が 0 になるのを待つ。REQ を 0 に戻す。
   - stop：REQ に 1 を書く。`RSC_STATUS0_DRV0` の bit16 を待つ。REQ を 0 に戻す。
 - **次の進め方（案）**：
-  1. RSCC への書き込み試験（CM3 は reset のまま）：表の 1、3、5、7〜9、13〜17 を書いて読み戻す。書き込みごとにブレッドクラムを進める。RSCC への書き込みがハイパーバイザに止められないかを、独立した 1 回で確かめる。
+  1. RSCC への書き込み試験（CM3 は reset のまま）：表の 1、3、5、7、9、13〜17 を書いて読み戻す。ADDR はすべて保持する（順8も対象外）。書き込みごとにブレッドクラムを進める。RSCC への書き込みがハイパーバイザに止められないかを、独立した 1 回で確かめる。
   2. RSCC の初期化をしたうえで、`RPMH_CTRL=0xF11` を足して `0x80` を実行する。`FW_INIT_RESULT` とログの記録が v35 からどう変わるかを見る。
   3. 変わらなければ、GMU のクロックを 200 MHz にする（GPU_CC の RCG の設定）。
   - GMU 起動のコードはユーザーが書く。
+
+### 9.10.1 RSCC 単独書き込み試験の実装（実機未実行）
+
+`EpiGpuProbe=0x100`（bit8）で実行する。実装は `src/epinephrine/epi_gpu.cxx` の既存 CX 窓に組み込んだ。フラグはハードウェアアクセス前に 0 に戻して flush し、解除に失敗した場合は試験しない。bit0/1 以外の別試験との併用は拒否するため、`0x80` の CM3 起動は同時に走らない。ファームウェアも不要。
+
+- CX が開始時点で collapse していることを要求し、CX と5ブランチを有効にする。CM3_SYSRESET=1、GX GDSC collapse と GMU 側の GX OFF、5ブランチの CLK_OFF=0、RSCC_CONTROL_REQ/ACK=0、RSCC SEQ_BUSY=0 を確認する。前提不成立なら RSCC には書かない。
+- 対象は dword 順に `0x004, 0x00E, 0x010, 0x012, 0x100, 0x180..0x184` の10項目。設定値は上表のとおり。すべての元値を先に読み、各書き込みを即時読み戻しして完全一致で比較する。失敗した項目を含め、書き込み済みの項目すべてを逆順に復元して読み戻す。復元不一致でも残りの復元を試みる。その後、既存の処理でブランチと CX を元に戻す。
+- HIDDEN_TCS の全 ADDR（`0x00D, 0x00F, 0x011`）、PDC_SLAVE_ID、PDC_SEQ_START/MATCH は保持する。GPU PDC のマップ・読み書き、RPMH_CTRL、RSCC_CONTROL_REQ、CM3_SYSRESET への書き込みは行わない。
+- ブレッドクラムは `0x900` が前提確認、`0x901` が RSCC idle 確認と元値の保存、`0x910+i` が項目 i の設定、`0x930+i` が項目 i の復元。i は0始まり。設定時はブレッドクラムの保存・flush に失敗したら次の書き込みを中止する。復元は保存に失敗しても実行する。CX の後始末は既存の `0x340..0x346`、正常に戻れば最終ステップは `0xFFFF`。
+
+EpiDiag の診断形式：
+
+| 値 | 内容 |
+|---|---|
+| `GpuRsccW`（REG_BINARY） | 上記順の10レコード、各5 DWORD（little endian）：`{Dword, Original, Value, Readback, Restored}`。合計200バイト。Dword は 0x03DE0000 からの dword offset（バイト位置は×4）。未読の Readback/Restored は 0xFFFFFFFF、元値保存前の Original は0。試験関数未到達なら空データ |
+| `GpuRsccWStatus`（REG_DWORD） | 0 設定・復元の全比較成功、1 RSCC map失敗、2 前提不成立、3 設定読み戻し不一致、4 復元読み戻し不一致、5 ブレッドクラム保存・flush失敗、6 別試験との併用を拒否、7 試験関数未到達。後始末で追加失敗した場合の優先順位は4、5、3 |
+| `GpuRsccWCount`（REG_DWORD） | 書き込みを試みた項目数（0〜10）。不一致の項目も含む |
+| `GpuRsccWBadIndex`（REG_DWORD） | 設定の不一致、または設定直前のブレッドクラム失敗の項目番号。該当なしは0xFFFFFFFF |
+| `GpuRsccWRestoreBadIndex`（REG_DWORD） | 最初の復元不一致の項目番号（復元は逆順）。該当なしは0xFFFFFFFF |
+| `GpuCxStatus` | 既存値に加え17が RSCC 試験失敗。14は開始時に CX が collapse していない。CX の復元結果も併読する |
+| `GpuProbeStatus` | 既存値に加え6が別試験との併用、7がワンショット解除の保存・flush失敗 |
+
+`GpuCxText` にも `rscc_w_status`、`rscc_w_count`、`rscc_w_bad` を追記する。`GpuRsccWStatus=0` でも CX の後始末は別なので `GpuCxStatus` を必ず併読する。今回の変更ではビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat、Epinephrine v36 / 20.0.2.36、`EpiGpuProbe=0x100`）：成功** [P]。`GpuRsccWStatus=0`、`GpuRsccWCount=10`、`GpuRsccWBadIndex` と `GpuRsccWRestoreBadIndex` はどちらも 0xFFFFFFFF、`GpuCxStatus=0`。
+
+- 10 項目とも、書く前の値は 0（v27 と同じ）。書いた値はそのまま読み戻せ、すべて 0 に戻った。
+- ハイパーバイザは RSCC（0x3DE0000）への書き込みを止めない。GPU PDC（0xB290000）とは扱いが違う。
+- CM3 は最後まで reset のまま（`cm3_sysreset=1`）。CX も正常に落ちた。
+- 次は §9.10 の 2 番目：`0x80` の起動に、RSCC の初期化と `GMU_RPMH_CTRL=0xF11` を足す。
 
 ## 参照
 
