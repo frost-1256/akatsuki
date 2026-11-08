@@ -409,6 +409,44 @@ EpiDiag の診断形式：
 - CM3 は最後まで reset のまま（`cm3_sysreset=1`）。CX も正常に落ちた。
 - 次は §9.10 の 2 番目：`0x80` の起動に、RSCC の初期化と `GMU_RPMH_CTRL=0xF11` を足す。
 
+### 9.10.2 0x80 起動試験への RSCC / RPMH_CTRL 追加（実機未実行）
+
+`EpiGpuProbe=0x80` の `EpiGmuBootTest` に §9.10 の2番目を追加した。独立試験 `0x100` と同じ10項目・同じ値を使い、HIDDEN_TCS の全 ADDR と PDC slave/sequence/match は保持する。GPU PDC、RSCC_CONTROL_REQ、クロック設定には書かない。
+
+- CM3 reset、GX OFF、CX と5ブランチ ON の既存前提を確認する。RSCC_CONTROL_REQ/ACK と RSCC SEQ_BUSY が0であることも確認し、RSCC の元値をすべて保存してから初期化する。各書き込みを即時読み戻しし、不一致やブレッドクラム失敗なら CM3 を解放せず後始末する。
+- 続いて GMU setup と TCM コピー、SMMU Enable、CM3 解放へ進む。GMU setup の末尾（index 18）に `GMU_RPMH_CTRL`（dword `0x1F8E8`）への `0xF11` を追加し、比較マスクは `0xFFFFFFFF`。`GpuGmuSetup` は19レコード×20バイト＝380バイトとなる。
+- 起動完了・時間切れ後の `GpuGmuRegs` と `GpuGmuLog`（先頭0x1000バイト）の採取は従来どおり。`GpuGmuRegs` の先頭 DWORD が FW_INIT_RESULT。v35 の `0x800` とログ4件から変化したかを実機で確認する。
+- RSCC は CM3 起動中には復元しない。CM3 reset と SMMU Disable の成功後、GMU setup（RPMH_CTRL を含む）を復元し、その後 RSCC を逆順に復元・読み戻しする。CM3 reset、SMMU Disable、GMU 設定復元に失敗した場合は RSCC の設定とマップも保持する。RSCC 復元は途中で失敗しても残りを試み、失敗時は既存の teardown 失敗と同じく CX・マップ・メモリを保持する。
+
+追加診断（EpiDiag）：
+
+| 値 | 内容 |
+|---|---|
+| `GpuGmuRsccSetup`（REG_BINARY） | 独立試験と同じ順の10レコード×20バイト。`{Dword, Original, Value, Readback, Restored}`。Dword は RSCC 0x03DE0000 からの dword offset。未読の Readback/Restored は0xFFFFFFFF。元値保存前は空データ |
+| `GpuGmuRsccBadIndex`（REG_DWORD） | 初期化の書き込み不一致、または書き込み直前のブレッドクラム失敗の0始まりの番号。該当なしは0xFFFFFFFF |
+| `GpuGmuRsccRestoreBadIndex`（REG_DWORD） | 復元不一致または復元直前のブレッドクラム失敗の最初の番号。復元は逆順。該当なしは0xFFFFFFFF |
+| `GpuGmuRsccRestoreStatus`（REG_DWORD） | 復元の NTSTATUS。0なら成功、未試行なら STATUS_NOT_FOUND。復元不一致は STATUS_IO_DEVICE_ERROR。ブレッドクラム保存に失敗しても復元書き込み自体は試みる |
+| `GpuGmuStatus` | 新規9＝RSCC 初期化の書き込み・読み戻し・ブレッドクラム失敗（CM3 未解放）。RSCC idle の前提不成立は既存の1、復元失敗は既存の8。`GpuGmuNtStatus` は後始末開始時の状態を保持する |
+
+ブレッドクラムは `0x680` が RSCC idle 確認・元値保存、`0x690+i` が初期化、`0x6B0+i` が復元（i は0始まり）。GMU_RPMH_CTRL は setup index 18 なので設定時 `0x612`、復元時 `0x652`。今回の変更ではテスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat、Epinephrine v37 / 20.0.2.37、`EpiGpuProbe=0x80`）：GMU の起動に成功** [P]。
+
+| 項目 | v35（RSCC なし） | v37 |
+|---|---|---|
+| `GpuGmuStatus` | 7（時間切れ） | **0** |
+| `FW_INIT_RESULT` | 0x800 | **0x100** |
+| `GMU2HOST_INTR_INFO` | 0x4 | 0 |
+| SMMU `FSR` | 0x400（fault なし） | 0x400（fault なし） |
+| ログの記録 | 4 件 | 6 件 |
+| `GpuCxStatus` | 16 | 0 |
+
+- RSCC の 10 項目は書いた値のまま読め、終了後にすべて 0 へ戻った（`GpuGmuRsccRestoreStatus=0`）。`GMU_RPMH_CTRL` も 0xF11 のまま読めた。
+- Disable、CM3 の reset、CX を落とす処理はすべて成功（`KeepCx=0`、`cm3_sysreset=1`、`rpmh_power_state=0xF`）。
+- ログ：(0x21, 番号 1, 0)、0x23 が 4 件（番号 1、2、3、0x3A、値はどれも 0xDEADBA55）、(0x21, 番号 5, **0x100**)。最後の 0x21 は初期化の結果と見られる [U]。v35 では最後が (0x21, 番号 3, 0x1264) だった。どちらも約 6 ms の間に書かれている。
+- わかったこと：PDC に触れなくても、RSCC の初期化と `RPMH_CTRL` だけで GMU のファームウェアの初期化は通る。a660 ファミリーで PDC を AOP が持つという見立て（§9.2）と合う [I]。
+- 次は HFI（§9.11）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

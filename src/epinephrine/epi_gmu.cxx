@@ -14,15 +14,16 @@
 //   2. Allocate each region (physically contiguous, non-cached), zero it, copy the data blocks that fall in it, and
 //      build the HFI queue table (table header + 3 queue headers, queues at +4/8/12 KB).
 //   3. EpiSmmuCreate + EpiSmmuMap for every region (SMMU still disabled).
-//   4. GMU setup: CX FAL interfaces, TCM retention, ITCM/DTCM load with read-back, FW_INIT_RESULT 0, BOOT_CONFIG 2,
+//   4. Initialise ten RSCC controls, then GMU setup: CX FAL interfaces, ITCM/DTCM load with read-back,
+//      FW_INIT_RESULT 0, BOOT_CONFIG 2, RPMH_CTRL=0xF11,
 //      HFI table, AHB fence range, CM3_CFG, chip id, log buffer, bus/cache config, inter-frame control.
 //   5. EpiSmmuEnable, then release the CM3 (SYSRESET 1, CP_RESP 0, SYSRESET 0) and poll FW_INIT_RESULT. This
 //      firmware is newer than 0x20010004, so the done value is (v & 0x1FF) == 0x100. Up to 100 ms.
 //   6. Record diagnostics, the SMMU fault state and the start of the GMU log; put the CM3 back in reset.
-//   7. EpiSmmuDisable, then Unmap / Destroy / free. A failed Disable keeps everything and asks the caller to keep
+//   7. EpiSmmuDisable, restore GMU controls and RSCC, then Unmap / Destroy / free. A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
-// Not done here (later steps): RSCC init / rpmh_start (Linux also writes the GPU PDC there, and touching the PDC
-// reset the phone on 2026-11-07), RPMH_CTRL votes, GBIF QSB settings, HFI messages.
+// Not done here (later steps): rpmh_start/stop, GPU PDC (reading it reset the phone on 2026-11-07),
+// GBIF QSB settings, HFI messages. Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
 #ifdef EPI_GMU_HOST_TEST
 #include "gmu_shim.hxx"
@@ -44,6 +45,8 @@
 #define EPI_GMU_ITCM_BASE       0x00000000UL
 #define EPI_GMU_DTCM_BASE       0x10004000UL        // a650 family
 #define EPI_GMU_VER_DTCM_OFF    0x3FE0UL            // CORE_FW_VERSION (dword 0x1D3F8)
+#define EPI_GMU_RSCC_PHYS       0x03DE0000ULL
+#define EPI_GMU_RSCC_SIZE       0x2000UL
 
 // register dwords (from the GPU base)
 #define R_ICACHE_CONFIG         0x1F400
@@ -55,6 +58,7 @@
 #define R_CM3_FW_INIT_RESULT    0x1F81C
 #define R_CM3_CFG               0x1F82D
 #define R_PWR_COL_IFRAME_CTRL   0x1F8C0
+#define R_GMU_RPMH_CTRL         0x1F8E8
 #define R_CX_FAL_INTF           0x1F8F0
 #define R_CX_FALNEXT_INTF       0x1F8F1
 #define R_PWR_COL_CP_MSG        0x1F900
@@ -104,7 +108,7 @@ struct GMU_TEST {
     GMU_REGION Regions[EPI_GMU_MAX_REGIONS];
     ULONG Count;
     EPI_SMMU* Smmu;
-    PVOID Maps[5]; // control C/A/B, ITCM, DTCM; retained after failed teardown
+    PVOID Maps[6]; // control C/A/B, ITCM, DTCM, RSCC; retained after failed teardown
 };
 static GMU_TEST* g_KeptGmu = NULL; // debugger-visible ownership of quarantined allocations
 
@@ -274,12 +278,16 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetDword(Diag,L"GpuGmuBadIndex",0xFFFFFFFFUL);
     EpiSetValue(Diag,L"GpuGmuSetup",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,NULL,0);
+    EpiSetDword(Diag,L"GpuGmuRsccBadIndex",0xFFFFFFFFUL);
+    EpiSetDword(Diag,L"GpuGmuRsccRestoreBadIndex",0xFFFFFFFFUL);
+    EpiSetDword(Diag,L"GpuGmuRsccRestoreStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
-    ULONG result=EPI_GMU_OK, configured=0;
+    ULONG result=EPI_GMU_OK, configured=0, rsccConfigured=0;
     NTSTATUS st=STATUS_SUCCESS;
-    BOOLEAN smmuAttempted=FALSE, released=FALSE;
-    // No PDC/RSCC/RPMh votes, no HFI messages or GX requests in this first boot probe.
+    BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE;
+    // No GPU PDC, RSCC handshake, HFI messages or explicit GX requests.
     // Field order is the GpuGmuSetup REG_BINARY diagnostic ABI.
     struct SETTING { ULONG Reg, Original, Value, Readback, CmpMask; } setup[] = {
         {0x23B06,0,0xFFFFFFFF,0xFFFFFFFF,0x3F}, // only six implemented IRQ mask bits
@@ -292,10 +300,20 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         {R_HFI_SFR_ADDR,0,V_GMU_CHIPID,0xFFFFFFFF,0xFFFFFFFF}, {R_PWR_COL_CP_MSG,0,EPI_GMU_LOG_IOVA|3,0xFFFFFFFF,0xFFFFFFFF},
         {R_SYS_BUS_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF}, {R_ICACHE_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF},
         {R_DCACHE_CONFIG,0,1,0xFFFFFFFF,0xFFFFFFFF},
-        {R_PWR_COL_IFRAME_CTRL,0,V_IFRAME_CTRL,0xFFFFFFFF,0xFFFFFFFF}, {R_PWR_COL_CP_RESP,0,0,0xFFFFFFFF,0xFFFFFFFF}
+        {R_PWR_COL_IFRAME_CTRL,0,V_IFRAME_CTRL,0xFFFFFFFF,0xFFFFFFFF}, {R_PWR_COL_CP_RESP,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {R_GMU_RPMH_CTRL,0,0xF11,0xFFFFFFFF,0xFFFFFFFF}
+    };
+    // Same ten targets/values as the independent 0x100 test; no HIDDEN_TCS ADDR writes.
+    struct RSCC_SETTING { ULONG Dword, Original, Value, Readback, Restored; } rscc[] = {
+        {0x004,0,0x01000000,0xFFFFFFFF,0xFFFFFFFF},
+        {0x00E,0,0,0xFFFFFFFF,0xFFFFFFFF}, {0x010,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x012,0,0x80000000,0xFFFFFFFF,0xFFFFFFFF}, {0x100,0,0,0xFFFFFFFF,0xFFFFFFFF},
+        {0x180,0,0xEAAAE5A0,0xFFFFFFFF,0xFFFFFFFF}, {0x181,0,0xE1A1EBAB,0xFFFFFFFF,0xFFFFFFFF},
+        {0x182,0,0xA2E0A581,0xFFFFFFFF,0xFFFFFFFF}, {0x183,0,0xECAC82E2,0xFFFFFFFF,0xFFFFFFFF},
+        {0x184,0,0x0020EDAD,0xFFFFFFFF,0xFFFFFFFF}
     };
     const ULONGLONG bases[]={EPI_GMU_PAGE_C_PHYS,EPI_GMU_PAGE_A_PHYS,EPI_GMU_PAGE_B_PHYS,
-                             EPI_GMU_ITCM_PHYS_,EPI_GMU_DTCM_PHYS_};
+                             EPI_GMU_ITCM_PHYS_,EPI_GMU_DTCM_PHYS_,EPI_GMU_RSCC_PHYS};
     if (!GmuPlan(s,Fw,FwLen)) { result=EPI_GMU_E_FW; goto cleanup; }
     // Confirm the CX window before accessing any GMU register.
     {
@@ -308,7 +326,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     for (ULONG i=0;i<RTL_NUMBER_OF(bases);++i)
     {
         PHYSICAL_ADDRESS pa; pa.QuadPart=bases[i];
-        s->Maps[i]=MmMapIoSpaceEx(pa,i<3 ? PAGE_SIZE : EPI_GMU_TCM_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+        s->Maps[i]=MmMapIoSpaceEx(pa,i==5 ? EPI_GMU_RSCC_SIZE : (i<3 ? PAGE_SIZE : EPI_GMU_TCM_SIZE),PAGE_READWRITE|PAGE_NOCACHE);
         if (s->Maps[i]==NULL) { result=EPI_GMU_E_NOMEM; goto cleanup; }
     }
     if (READ_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET))!=1)
@@ -335,6 +353,28 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     GmuQueues(s);
     // Snapshot all controls before writing any. IRQ masks remain masked until CX off.
     for (ULONG i=0;i<RTL_NUMBER_OF(setup);++i) { setup[i].Original=READ_REGISTER_ULONG(GmuReg(s,setup[i].Reg)); }
+    st=GmuStep(Params,0x680);
+    if (!NT_SUCCESS(st)) { result=EPI_GMU_E_RSCC; goto cleanup; }
+    if (READ_REGISTER_ULONG(GmuReg(s,0x23B07))!=0 || READ_REGISTER_ULONG(GmuReg(s,0x23B08))!=0 ||
+        READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+0x101)!=0)
+    { st=STATUS_INVALID_DEVICE_STATE; result=EPI_GMU_E_PRECOND; goto cleanup; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(rscc);++i)
+    { rscc[i].Original=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword); }
+    rsccSaved=TRUE;
+    for (ULONG i=0;i<RTL_NUMBER_OF(rscc);++i)
+    {
+        st=GmuStep(Params,0x690+i);
+        if (NT_SUCCESS(st))
+        {
+            rsccConfigured=i+1;
+            WRITE_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword,rscc[i].Value);
+            rscc[i].Readback=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword);
+            if (rscc[i].Readback!=rscc[i].Value) { st=STATUS_IO_DEVICE_ERROR; }
+        }
+        if (!NT_SUCCESS(st))
+        { EpiSetDword(Diag,L"GpuGmuRsccBadIndex",i); result=EPI_GMU_E_RSCC; goto cleanup; }
+    }
+    EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,rscc,sizeof(rscc));
     for (ULONG i=0;i<RTL_NUMBER_OF(setup);++i)
     {
         configured=i+1;
@@ -397,6 +437,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     }
 cleanup:
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
+    if (rsccSaved) { EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,rscc,sizeof(rscc)); }
     if (released)
     {
         // Reset write/readback is mandatory even if breadcrumb persistence fails here.
@@ -417,6 +458,24 @@ cleanup:
         st=GmuWrite(s,Params,setup[i].Reg,setup[i].Original,0x640+i,setup[i].CmpMask);
         if (!NT_SUCCESS(st)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
     }
+    // CM3 is reset and SMMU detached; RPMH_CTRL has been restored before RSCC changes.
+    if (rsccConfigured!=0)
+    {
+        NTSTATUS restoreStatus=STATUS_SUCCESS;
+        for (ULONG i=rsccConfigured; i-- > 0;)
+        {
+            // Restore even if breadcrumb persistence fails, and attempt every written target.
+            st=GmuStep(Params,0x6B0+i);
+            WRITE_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword,rscc[i].Original);
+            rscc[i].Restored=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword);
+            if (rscc[i].Restored!=rscc[i].Original) { st=STATUS_IO_DEVICE_ERROR; }
+            if (!NT_SUCCESS(st) && NT_SUCCESS(restoreStatus))
+            { restoreStatus=st; EpiSetDword(Diag,L"GpuGmuRsccRestoreBadIndex",i); }
+        }
+        EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,rscc,sizeof(rscc));
+        EpiSetDword(Diag,L"GpuGmuRsccRestoreStatus",static_cast<ULONG>(restoreStatus));
+        if (!NT_SUCCESS(restoreStatus)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+    }
     if (s->Smmu!=NULL)
     {
         for (ULONG i=0;i<s->Count;++i)
@@ -435,7 +494,7 @@ cleanup:
     for (ULONG i=0;i<s->Count;++i)
     { if (s->Regions[i].Va!=NULL) { MmFreeContiguousMemorySpecifyCache(s->Regions[i].Va,s->Regions[i].Size,MmNonCached); } }
     for (ULONG i=0;i<RTL_NUMBER_OF(s->Maps);++i)
-    { if (s->Maps[i]!=NULL) { MmUnmapIoSpace(s->Maps[i],i<3 ? PAGE_SIZE : EPI_GMU_TCM_SIZE); } }
+    { if (s->Maps[i]!=NULL) { MmUnmapIoSpace(s->Maps[i],i==5 ? EPI_GMU_RSCC_SIZE : (i<3 ? PAGE_SIZE : EPI_GMU_TCM_SIZE)); } }
     ExFreePoolWithTag(s,EPI_GMU_TAG);
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;

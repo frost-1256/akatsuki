@@ -15,14 +15,20 @@
 #define EPI_GMU_E_SMMU_ENABLE   5           // EpiSmmuEnable failed (CM3 never released)
 #define EPI_GMU_E_TCM           6           // setup register / TCM write or read-back failed (CM3 never released)
 #define EPI_GMU_E_TIMEOUT       7           // CM3 released but FW_INIT_RESULT did not reach the expected value
-#define EPI_GMU_E_TEARDOWN      8           // EpiSmmuDisable failed: memory, mappings and ctx are kept (leaked)
+#define EPI_GMU_E_TEARDOWN      8           // reset/disable/restore/teardown failed: memory, mappings and ctx are kept
+#define EPI_GMU_E_RSCC          9           // RSCC initialization write/readback or breadcrumb failed (CM3 never released)
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
-// 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 18 records of five little-endian ULONGs
+// 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
 // {Reg (GPU-base dword offset), Original, Value, Readback, CmpMask}, 20 bytes each, captured before cleanup.
 // Comparison uses (Readback & CmpMask) == (Value & CmpMask); CmpMask 0 records readback without comparing.
 // Readback is 0xFFFFFFFF until read; later entries after BadIndex were not attempted. A failed breadcrumb
 // can leave the failing entry unread too (see GpuGmuNtStatus). Empty binary means setup was not reached.
+// Setup index 18 is GMU_RPMH_CTRL (0x1F8E8), value 0xF11, full comparison mask.
+// GpuGmuRsccSetup (REG_BINARY): ten 20-byte records {Dword, Original, Value, Readback, Restored}.
+// Dword is relative to RSCC 0x03DE0000; unread Readback/Restored fields are 0xFFFFFFFF.
+// GpuGmuRsccBadIndex / GpuGmuRsccRestoreBadIndex (REG_DWORD): first failing index, or 0xFFFFFFFF.
+// GpuGmuRsccRestoreStatus (REG_DWORD): NTSTATUS of restoration, STATUS_NOT_FOUND if not attempted.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
