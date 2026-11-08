@@ -6,6 +6,7 @@
 // EpiGpuProbe bits owned by this file
 #define EPI_GMU_PROBE_BOOT      0x80UL      // G1c-3: boot the CM3 behind the adreno SMMU, then put it back in reset
 #define EPI_GMU_PROBE_HFI_START 0x200UL     // modifier: with 0x80 (0x280), add CORE_FW_START / START after PERF/BW
+#define EPI_GMU_PROBE_GX_VOTE   0x400UL     // modifier: requires 0x280 (0x680 total), add GBIF QSB / GX_BW_PERF_VOTE
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -19,6 +20,7 @@
 #define EPI_GMU_E_TEARDOWN      8           // reset/disable/restore/teardown failed: memory, mappings and ctx are kept
 #define EPI_GMU_E_RSCC          9           // RSCC initialization write/readback or breadcrumb failed (CM3 never released)
 #define EPI_GMU_E_HFI           10          // HFI init or a requested message failed after successful FW init
+#define EPI_GMU_E_GBIF          11          // GBIF precondition/read/write/breadcrumb failed (CM3 never released)
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -33,18 +35,25 @@
 // GpuGmuRsccRestoreStatus (REG_DWORD): NTSTATUS of restoration, STATUS_NOT_FOUND if not attempted.
 // HFI: GpuGmuHfiStatus / GpuGmuHfiIdleStatus (REG_DWORD NTSTATUS), STATUS_NOT_FOUND if not attempted.
 // GpuGmuHfiCtrlStatus: startup HFI_CTRL_STATUS; GpuGmuHfiBwPublished: BW command was exposed to GMU.
-// GpuGmuHfiMessages (REG_BINARY): four 148-byte records (PERF, BW, CORE_FW_START, START), 592 bytes total:
+// GpuGmuHfiMessages (REG_BINARY): five 148-byte records (PERF, BW, CORE_FW_START, START, GX vote), 740 bytes total:
 // {SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}.
 // Skipped includes FW errors; LastSkipped holds up to eight leading DWORDs, with zero fill for shorter packets.
 // A response is any non-id-100 packet with >=3 DWORDs and matching ret_header seq; id 126 is not required.
-// GpuGmuHfiQueues: seven 28-byte records (196 bytes) {Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}.
-// Stages: 0 before HFI init, 1 ready, 2 after PERF, 3 after BW, 4 after CORE_FW_START, 5 after START, 6 after CM3 reset.
+// GpuGmuHfiQueues: eight 28-byte records (224 bytes) {Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}.
+// Stages: 0 before HFI init, 1 ready, 2 after PERF, 3 after BW, 4 after CORE_FW_START, 5 after START, 6 after VOTE, 7 after reset.
 // GpuGmuHfiPower: four 24-byte records {Stage, RpmhPower, GxGdscr, GxHm, HfiCtrlStatus, IntrInfo}.
 // Stages: 0 before HFI init, 1 after HFI trial, 2 after reset/idle wait, 3 after config restoration.
 // GpuGmuHfiRscc: four 20-byte records {Stage, Status0, SeqBusy, ControlReq, ControlAck}; same stages as Power.
 // Uncaptured queue/power fields are 0xFFFFFFFF. HFI binaries are empty if FW init did not succeed.
 // After BW publication, require CM3 reset, RSCC SeqBusy/ControlReq/ControlAck=0, and GX off before teardown.
 // RPMh power state is recorded without requiring 0xF; RSCC quiescence does not prove CNOC vote withdrawal.
+// In 0x680 only, GpuGmuHfiExtra: five 48-byte records (240 bytes), each:
+// {Stage, GccVote, TcsStatus[4], CxBusy, CxBusy2, GbifQsb[4]}.
+// Stages 0..3 match Power; stage 4 is immediately before GX vote. Unread fields are 0xFFFFFFFF.
+// GpuGmuHfiExtraStatus: first read-breadcrumb failure, 0 on success, STATUS_NOT_FOUND if not attempted.
+// GpuGmuGbifSetup: four 20-byte records {GPU dword Reg, Original, Value, Readback, Restored}, 80 bytes total.
+// GpuGmuGbifStatus / GpuGmuGbifRestoreStatus: NTSTATUS; STATUS_NOT_FOUND when not attempted.
+// GpuGmuGbifBadIndex / GpuGmuGbifRestoreBadIndex: first failing index, or 0xFFFFFFFF.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -52,7 +61,8 @@
 // (epi_smmu.hxx contract: never collapse CX after an unsuccessful Disable).
 // Text/TextCch: diagnostic "name=value; " entries are appended.
 // StartHfi: FALSE keeps PERF/BW-only behavior; TRUE adds CORE_FW_START then START (probe 0x280).
+// VoteGx: requires StartHfi; adds GBIF QSB before release and GX vote after START (probe 0x680).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
-                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE);
+                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE, BOOLEAN VoteGx = FALSE);
