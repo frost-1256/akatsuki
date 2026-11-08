@@ -447,6 +447,74 @@ EpiDiag の診断形式：
 - わかったこと：PDC に触れなくても、RSCC の初期化と `RPMH_CTRL` だけで GMU のファームウェアの初期化は通る。a660 ファミリーで PDC を AOP が持つという見立て（§9.2）と合う [I]。
 - 次は HFI（§9.11）。
 
+### 9.11 HFI の手順（本家 Linux、A635 = 7c3、非 legacy）
+
+事実の出典は本家 Linux の `a6xx_hfi.c`、`a6xx_hfi.h`、`a6xx_gmu.c`、`a6xx_gmu.xml`、`a6xx_catalog.c`、`kodiak.dtsi`。行番号は手元の参照コピーのもの。コードは持ち込まない。
+
+**A635 の扱い** [P]：chip id 0x06030500 は `adreno_is_7c3`。カタログ（`a6xx_catalog.c` 1124 行）には `bcms`、`clx_tbl`、`thinmem_config`、`gmu_chipid`、IFPC の quirk がない。kodiak.dtsi の GPU の OPP には `qcom,opp-acd-level` がない。したがって ACD、CLX、IFPC、THINMEM のメッセージは送られない。`gbif_cx = a640_gbif`（GBIF_QSB_SIDE0〜3 = 0x00071620）は `fw_start` で書かれるが、今の実装にはない。
+
+**1. キュー表**（`a6xx_hfi_init`、1155〜1198 行）：今の `GmuQueues()`（3312b49）と同じ。表のヘッダは 6 dword（size は 168 バイト）。キューのヘッダは 12 dword が 3 つで、HFI 領域の +0x1000（コマンド、id 0）、+0x2000（応答、id 1）、+0x3000（デバッグ、id 2）に置く。各キューは 0x400 dword。
+
+**2. HFI の開始**（`a6xx_gmu_hfi_start`、346 行。`gmu_start` の成功直後に呼ばれる）：
+- `GMU_HFI_CTRL_INIT`（0x1F986）= 1。
+- `GMU_HFI_CTRL_STATUS`（0x1F980）の bit0 を待つ（100 µs 間隔、最大 10 ms）。
+
+**3. 送信**（`a6xx_hfi_send_msg` 212 行、`a6xx_hfi_queue_write` 72 行）：
+- 先頭 dword は `(seqnum << 20) | (0 << 16) | (dwords << 8) | id`。seqnum は 1 から始まり、`% 0xFFF`。
+- コマンドキューの `write_index` から書き、`size`（0x400）で折り返す。書いたあと、4 dword 境界まで 0xFAFAFAFA で埋める。空き（CIRC_SPACE）が足りなければ送らない。
+- バリアのあと `write_index` を更新し、`GMU_HOST2GMU_INTR_SET`（0x1F994）= 1。
+
+**4. 応答の待ち方**（`a6xx_hfi_wait_for_ack` 149 行）：
+- `GMU_GMU2HOST_INTR_INFO`（0x1F992）の bit0（MSGQ）を待つ（100 µs 間隔、最大 1 s）。マスク（0x1F993）が全部立っていても INFO は読める。
+- `GMU_GMU2HOST_INTR_CLR`（0x1F991）= 1。
+- 応答キューを読む。`read_index == write_index` なら空なので、`rx_request = 1` にしてもう一度待つ。先頭 dword の bit15:8 が dword 数。読んだあと `read_index` を 4 dword 境界に揃えて更新する。
+- 応答の形：`{header（id 126 = ACK）, ret_header（送った header の写し、seqnum は bit31:20）, error, payload[16]}`。id 100 は FW のエラー通知 `{header, code, payload[2]}` で、Linux は記録して読み続ける。seqnum が違うものも読み飛ばす。`error != 0` なら失敗。
+
+**5. メッセージの順番**（`a6xx_hfi_start` 1060 行。A635 で実際に送られるもの）：
+
+| 順 | メッセージ | id | 大きさ | 中身 |
+|---|---|---|---|---|
+| 1 | PERF_TABLE | 4 | 59 dword | 下の 6 |
+| 2 | BW_TABLE | 3 | 160 dword | 下の 7 |
+| 3 | CORE_FW_START | 14 | 2 dword | handle = 0 |
+| 4 | START | 10 | 1 dword | なし |
+
+そのあと Linux は `GMU2HOST_INTR_CLR = ~0`、`GMU2HOST_INTR_MASK = ~CM3_FAULT`（bit23 だけ有効）にして、`a6xx_gmu_set_initial_freq` で `GX_BW_PERF_VOTE`（id 30）を送る。**これは GX の電源を入れる要求なので、最初の試験には入れない。**
+
+**6. PERF_TABLE**（`a6xx_hfi_send_perf_table` 329 行、投票の作り方は `a6xx_gmu.c` 1772〜1917 行）：
+- 形：`{header, num_gpu_levels, num_gmu_levels, gx_votes[16] = {vote, acd, freq}, cx_votes[4] = {vote, freq}}`。freq は kHz。acd はすべて 0xFFFFFFFF。0 番は「off」（freq 0、vote 0）。
+- vote = `(primary のレベル値 << 16) | (secondary の番号 << 8) | primary の番号`。primary は OPP のレベル以上で最初の cmd-db のレベル、secondary はその primary の値以上で最初のレベル（なければ最大）。
+- GX：primary は gfx.lvl、secondary は mx.lvl（gmxc.lvl がないため）。CX：primary は cx.lvl、secondary は mx.lvl。cmd-db の値は §9.4 の実測。
+- kodiak.dtsi の OPP と、計算した vote：
+
+| 対象 | 周波数 | OPP レベル | vote | opp-supported-hw |
+|---|---|---|---|---|
+| GX 0 | 0 | — | 0x00000000 | — |
+| GX | 315 MHz | LOW_SVS（64） | 0x00400201 | 0x17 |
+| GX | 450 MHz | SVS（128） | 0x00800302 | 0x17 |
+| GX | 550 MHz | SVS_L1（192） | 0x00C00403 | 0x01 / 0x16 |
+| GX | 608 MHz | SVS_L2（224） | 0x00E00504 | 0x16 |
+| GX | 700 MHz | NOM（256） | 0x01000605 | 0x06 |
+| GX | 812 MHz | NOM_L1（320） | 0x01400706 | 0x06 |
+| GX | 840 MHz | TURBO（384） | 0x01800807 | 0x02 |
+| GX | 900 MHz | TURBO_L1（416） | 0x01A00908 | 要確認 |
+| CX 0 | 0 | — | 0x00000000 | — |
+| CX | 200 MHz | MIN_SVS（48） | 0x00400202 | — |
+
+- この電話の speedbin（ヒューズ）はまだ読んでいない [U]。315 MHz と 450 MHz は supported-hw が 0x17 で、カタログの speedbin（0、1、2、4 番）のどれでも有効なので、最初の試験は GX を 3 段（0、315、450）、CX を 2 段（0、200）にするのが安全 [I]。
+
+**7. BW_TABLE**（`adreno_7c3_build_bw_table` 649 行。bcms がないので固定値）：
+- 形：`{header, bw_level_num, cnoc_cmds_num, ddr_cmds_num, cnoc_wait_bitmask, ddr_wait_bitmask, cnoc_cmds_addrs[6], cnoc_cmds_data[2][6], ddr_cmds_addrs[8], ddr_cmds_data[16][8]}`。
+- 値：`bw_level_num = 1`、`ddr_cmds_num = 3`、`ddr_wait_bitmask = 0x07`、ddr のアドレスは 0x50004、0x50000、0x50088、ddr_cmds_data[0][0..2] はすべて 0x40000000。`cnoc_cmds_num = 1`、`cnoc_wait_bitmask = 0x01`、cnoc のアドレスは 0x5006C、cnoc_cmds_data[0][0] = 0x40000000（off）、[1][0] = 0x60000001（on）。
+- アドレスは cmd-db の BCM のアドレス。この電話の cmd-db と照合できる [U]。
+
+**8. 進め方（案）**：
+1. HFI の開始と PERF_TABLE、BW_TABLE だけを送る。応答（error、ret_header）と 3 つのキューの read/write index を記録する。そのあと今までどおり CM3 を reset に戻す。
+2. 通ったら CORE_FW_START と START を足す。
+3. GX の投票（`GX_BW_PERF_VOTE`）は、GX 側の準備（GX GDSC など）を調べてから。
+- 注意 [U]：BW_TABLE には CNOC の「on」投票（0x60000001）が入っている。GMU が動いている間に RPMh へ投票し、CM3 の reset だけでは取り消されないかもしれない。Linux は止める前に `PREPARE_SLUMBER`（id 33）と OOB の手順を踏む。試験のあとは `rpmh_power_state` などを読んで確かめる。
+- GMU を扱うコードはユーザーが書く。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
