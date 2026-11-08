@@ -1000,7 +1000,9 @@ rpmh_stopを省く試験、OOBだけでslumberを省く試験、GX/RBBM/CPやPDC
 
 ## 参照
 
-- 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
+- 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
 - DSDT v33-akat：`\_SB.PEP0.G0MD / G4MD / G5MD`、`\_SB.GPU0._CRS / RESI`
 - silicium/opus-session/report_qcdx_gx*.md（特に GX6、GX7、GX8、GX22、GX23）、session-logs/kd_gx_measure_2026-10-31.txt
 - goals/.../GPU_STATUS_AND_OPTIONS.md、ANALYSIS_RESULTS.md（Kodiak パックの WDDM スタック）
+- Arm System MMU Architecture Specification（SMMUv2）：`CBAR`、`SCTLR`、`TCR2` などの意味
+- 事実の確認にだけ使い、コードは取り込んでいない。リポジトリ全体の出典とライセンスは [CREDITS.md](../../CREDITS.md)
