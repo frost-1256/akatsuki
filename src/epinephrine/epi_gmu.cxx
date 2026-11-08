@@ -19,11 +19,13 @@
 //      HFI table, AHB fence range, CM3_CFG, chip id, log buffer, bus/cache config, inter-frame control.
 //   5. EpiSmmuEnable, then release the CM3 (SYSRESET 1, CP_RESP 0, SYSRESET 0) and poll FW_INIT_RESULT. This
 //      firmware is newer than 0x20010004, so the done value is (v & 0x1FF) == 0x100. Up to 100 ms.
-//   6. Record diagnostics, the SMMU fault state and the start of the GMU log; put the CM3 back in reset.
+//   6. After successful FW init, start HFI and send PERF_TABLE / BW_TABLE only. Record ACKs/queue indices,
+//      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset and check RPMh/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls and RSCC, then Unmap / Destroy / free. A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
 // Not done here (later steps): rpmh_start/stop, GPU PDC (reading it reset the phone on 2026-11-07),
-// GBIF QSB settings, HFI messages. Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
+// GBIF QSB settings, CORE_FW_START / START / GX_BW_PERF_VOTE / PREPARE_SLUMBER.
+// Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
 #ifdef EPI_GMU_HOST_TEST
 #include "gmu_shim.hxx"
@@ -59,14 +61,19 @@
 #define R_CM3_CFG               0x1F82D
 #define R_PWR_COL_IFRAME_CTRL   0x1F8C0
 #define R_GMU_RPMH_CTRL         0x1F8E8
+#define R_GMU_RPMH_POWER_STATE  0x1F8EC
 #define R_CX_FAL_INTF           0x1F8F0
 #define R_CX_FALNEXT_INTF       0x1F8F1
 #define R_PWR_COL_CP_MSG        0x1F900
 #define R_PWR_COL_CP_RESP       0x1F901
 #define R_HFI_SFR_ADDR          0x1F982
+#define R_HFI_CTRL_STATUS       0x1F980
 #define R_HFI_QTBL_INFO         0x1F984
 #define R_HFI_QTBL_ADDR         0x1F985
+#define R_HFI_CTRL_INIT         0x1F986
+#define R_GMU2HOST_INTR_CLR     0x1F991
 #define R_GMU2HOST_INTR_INFO    0x1F992
+#define R_HOST2GMU_INTR_SET     0x1F994
 #define R_GENERAL_0             0x1F9C5
 #define R_GENERAL_1             0x1F9C6
 #define R_GENERAL_7             0x1F9CC
@@ -228,6 +235,183 @@ static VOID GmuText(PWCHAR Text, SIZE_T Cch, PCWSTR Name, ULONG Value)
     RtlStringCchPrintfW(line,RTL_NUMBER_OF(line),L"%s=%08X; ",Name,Value);
     RtlStringCchCatW(Text,Cch,line);
 }
+
+// Non-legacy HFI wire facts: G0_GPU_SURVEY.md section 9.11 and mainline a6xx_hfi.h.
+// Volatile accesses + barriers publish non-cached shared RAM; command/W1C registers are not compared.
+struct GMU_HFI_MESSAGE {
+    ULONG Header;
+    NTSTATUS Status;
+    ULONG AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4];
+    ULONG LastSkippedDwords, LastSkipped[8];
+};
+static_assert(sizeof(GMU_HFI_MESSAGE)==148,"HFI message diagnostic ABI");
+struct GMU_HFI_TRACE {
+    BOOLEAN Attempted, BwPublished;
+    NTSTATUS Status;
+    ULONG CtrlStatus;
+    GMU_HFI_MESSAGE Messages[2];
+    ULONG Queues[5][7]; // stage, then {read_index, write_index} for command/response/debug
+    ULONG Power[4][6];  // stage, RPMh power, GX GDSCR, GX HM, HFI status, interrupt info
+    ULONG Rscc[4][5];   // same stages as Power: stage, status0, seq_busy, control_req, control_ack
+};
+static volatile ULONG* GmuHfiHeader(GMU_TEST* S, ULONG Queue)
+{
+    return static_cast<volatile ULONG*>(GmuFind(S,EPI_GMU_HFI_IOVA,EPI_GMU_HFI_SIZE)->Va)+6+Queue*12;
+}
+static volatile ULONG* GmuHfiData(GMU_TEST* S, ULONG Queue)
+{
+    return static_cast<volatile ULONG*>(GmuFind(S,EPI_GMU_HFI_IOVA,EPI_GMU_HFI_SIZE)->Va)+(Queue+1)*0x400;
+}
+static VOID GmuHfiQueues(GMU_TEST* S, GMU_HFI_TRACE* T, ULONG Stage)
+{
+    KeMemoryBarrier();
+    for (ULONG q=0;q<3;++q)
+    {
+        volatile ULONG* h=GmuHfiHeader(S,q);
+        T->Queues[Stage][1+q*2]=h[10]; T->Queues[Stage][2+q*2]=h[11];
+    }
+}
+static VOID GmuHfiPower(GMU_TEST* S, volatile ULONG* Cc, GMU_HFI_TRACE* T, ULONG Stage)
+{
+    T->Power[Stage][1]=READ_REGISTER_ULONG(GmuReg(S,R_GMU_RPMH_POWER_STATE));
+    T->Power[Stage][2]=READ_REGISTER_ULONG(Cc+0x100C/4);
+    T->Power[Stage][3]=READ_REGISTER_ULONG(GmuReg(S,0x1F8D0));
+    T->Power[Stage][4]=READ_REGISTER_ULONG(GmuReg(S,R_HFI_CTRL_STATUS));
+    T->Power[Stage][5]=READ_REGISTER_ULONG(GmuReg(S,R_GMU2HOST_INTR_INFO));
+    T->Rscc[Stage][1]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x004);
+    T->Rscc[Stage][2]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x101);
+    T->Rscc[Stage][3]=READ_REGISTER_ULONG(GmuReg(S,0x23B07));
+    T->Rscc[Stage][4]=READ_REGISTER_ULONG(GmuReg(S,0x23B08));
+}
+static BOOLEAN GmuHfiIdle(GMU_TEST* S, volatile ULONG* Cc)
+{
+    // Check reset/GX and RSCC quiescence. RPMh power state is diagnostic only:
+    // no slumber transition was requested, so do not require its pre-HFI value 0xF.
+    // SEQ_BUSY=0 does not prove that persistent CNOC votes have been withdrawn.
+    return READ_REGISTER_ULONG(GmuReg(S,R_CM3_SYSRESET))==1 &&
+           READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x101)==0 &&
+           READ_REGISTER_ULONG(GmuReg(S,0x23B07))==0 &&
+           READ_REGISTER_ULONG(GmuReg(S,0x23B08))==0 &&
+           (READ_REGISTER_ULONG(Cc+0x100C/4)&0x80000001UL)==1 &&
+           (READ_REGISTER_ULONG(GmuReg(S,0x1F8D0))&0xC0)==0xC0;
+}
+static VOID GmuHfiDiag(HANDLE Diag, const GMU_HFI_TRACE* T)
+{
+    EpiSetDword(Diag,L"GpuGmuHfiStatus",static_cast<ULONG>(T->Status));
+    EpiSetDword(Diag,L"GpuGmuHfiCtrlStatus",T->CtrlStatus);
+    EpiSetDword(Diag,L"GpuGmuHfiBwPublished",T->BwPublished ? 1 : 0);
+    EpiSetValue(Diag,L"GpuGmuHfiMessages",REG_BINARY,T->Messages,sizeof(T->Messages));
+    EpiSetValue(Diag,L"GpuGmuHfiQueues",REG_BINARY,T->Queues,sizeof(T->Queues));
+    EpiSetValue(Diag,L"GpuGmuHfiPower",REG_BINARY,T->Power,sizeof(T->Power));
+    EpiSetValue(Diag,L"GpuGmuHfiRscc",REG_BINARY,T->Rscc,sizeof(T->Rscc));
+}
+static NTSTATUS GmuHfiPulse(GMU_TEST* S, HANDLE Params, ULONG Reg, ULONG Step)
+{
+    const NTSTATUS st=GmuStep(Params,Step);
+    if (!NT_SUCCESS(st)) { return st; }
+    WRITE_REGISTER_ULONG(GmuReg(S,Reg),1);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS GmuHfiExchange(GMU_TEST* S, HANDLE Params, ULONG* Words, ULONG Count,
+                              ULONG Id, ULONG Seq, ULONG Step, GMU_HFI_TRACE* T, GMU_HFI_MESSAGE* M)
+{
+    const ULONG mask=0x3FF, padded=(Count+3)&~3UL;
+    Words[0]=(Seq<<20)|(Count<<8)|Id; M->Header=Words[0];
+    volatile ULONG* cmd=GmuHfiHeader(S,0);
+    const ULONG read=cmd[10], write=cmd[11];
+    if (cmd[3]!=0x400 || read>mask || write>mask || ((read|write)&3)!=0 ||
+        cmd[1]!=EPI_GMU_HFI_IOVA+0x1000) { return STATUS_IO_DEVICE_ERROR; }
+    KeMemoryBarrier();
+    if (((read-write-1)&mask)<padded) { return STATUS_DEVICE_BUSY; }
+    NTSTATUS st=GmuStep(Params,Step); if (!NT_SUCCESS(st)) { return st; }
+    volatile ULONG* dst=GmuHfiData(S,0);
+    for (ULONG i=0;i<padded;++i) { dst[(write+i)&mask]=i<Count ? Words[i] : 0xFAFAFAFA; }
+    KeMemoryBarrier();
+    if (Id==3) { T->BwPublished=TRUE; } // even a failed doorbell can leave a command visible to GMU
+    cmd[11]=(write+padded)&mask;
+    KeMemoryBarrier();
+    st=GmuHfiPulse(S,Params,R_HOST2GMU_INTR_SET,Step+1); if (!NT_SUCCESS(st)) { return st; }
+    st=GmuStep(Params,Step+2); if (!NT_SUCCESS(st)) { return st; }
+    BOOLEAN notified=FALSE;
+    for (ULONG tick=0;tick<10000;++tick) // total ACK wait budget: 10000 x 100 us, including empty/rejected messages
+    {
+        if (READ_REGISTER_ULONG(GmuReg(S,R_GMU2HOST_INTR_INFO))&1)
+        {
+            st=GmuHfiPulse(S,Params,R_GMU2HOST_INTR_CLR,Step+3);
+            if (!NT_SUCCESS(st)) { return st; }
+            notified=TRUE;
+        }
+        volatile ULONG* rsp=GmuHfiHeader(S,1);
+        const ULONG r=rsp[10], w=rsp[11];
+        if (rsp[3]!=0x400 || r>mask || w>mask || ((r|w)&3)!=0 ||
+            rsp[1]!=EPI_GMU_HFI_IOVA+0x2000) { return STATUS_IO_DEVICE_ERROR; }
+        KeMemoryBarrier();
+        if (notified && r!=w)
+        {
+            volatile ULONG* src=GmuHfiData(S,1);
+            const ULONG header=src[r], n=(header>>8)&0xFF, occupied=(w-r)&mask;
+            const ULONG advance=(n+3)&~3UL;
+            if (n==0 || n>RTL_NUMBER_OF(M->Ack) || advance>occupied)
+            { M->AckDwords=n; M->Ack[0]=header; return STATUS_IO_DEVICE_ERROR; }
+            ULONG packet[19]={};
+            for (ULONG i=0;i<n;++i) { packet[i]=src[(r+i)&mask]; }
+            KeMemoryBarrier(); rsp[10]=(r+advance)&mask; KeMemoryBarrier();
+            if ((header&0xFF)==100)
+            {
+                if (n<4) { return STATUS_IO_DEVICE_ERROR; }
+                ++M->FwErrors;
+                for (ULONG i=0;i<4;++i) { M->LastFwError[i]=packet[i]; }
+            }
+            else if (n>=3 && ((packet[1]>>20)&0xFFF)==Seq)
+            {
+                M->AckDwords=n;
+                for (ULONG i=0;i<n;++i) { M->Ack[i]=packet[i]; }
+                return packet[1]==Words[0] && packet[2]==0 ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+            }
+            // Preserve the last packet we skipped, including FW error notifications.
+            ++M->Skipped; M->LastSkippedDwords=n;
+            for (ULONG i=0;i<RTL_NUMBER_OF(M->LastSkipped);++i)
+            { M->LastSkipped[i]=i<n ? packet[i] : 0; }
+        }
+        else if (r==w) { rsp[8]=1; KeMemoryBarrier(); } // recheck indices on next pass, avoiding a lost wakeup
+        KeStallExecutionProcessor(100);
+    }
+    return STATUS_IO_TIMEOUT;
+}
+static NTSTATUS GmuHfiTables(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_HFI_TRACE* T)
+{
+    T->Attempted=TRUE;
+    GmuHfiQueues(S,T,0); GmuHfiPower(S,Cc,T,0);
+    NTSTATUS st=GmuHfiPulse(S,Params,R_GMU2HOST_INTR_CLR,0x700);
+    if (!NT_SUCCESS(st)) { return st; }
+    st=GmuHfiPulse(S,Params,R_HFI_CTRL_INIT,0x701); if (!NT_SUCCESS(st)) { return st; }
+    st=GmuStep(Params,0x702); if (!NT_SUCCESS(st)) { return st; }
+    for (ULONG i=0;i<=100;++i)
+    {
+        T->CtrlStatus=READ_REGISTER_ULONG(GmuReg(S,R_HFI_CTRL_STATUS));
+        if (T->CtrlStatus&1) { break; }
+        if (i==100) { return STATUS_IO_TIMEOUT; }
+        KeStallExecutionProcessor(100);
+    }
+    GmuHfiQueues(S,T,1);
+    // 59 dwords: header/counts, sixteen {GX vote, ACD, kHz}, four {CX vote, kHz}.
+    ULONG perf[59]={}; perf[1]=3; perf[2]=2;
+    for (ULONG i=0;i<16;++i) { perf[4+i*3]=0xFFFFFFFF; }
+    perf[6]=0x00400201; perf[8]=315000;
+    perf[9]=0x00800302; perf[11]=450000;
+    perf[53]=0x00400202; perf[54]=200000;
+    st=GmuHfiExchange(S,Params,perf,RTL_NUMBER_OF(perf),4,1,0x710,T,&T->Messages[0]);
+    T->Messages[0].Status=st; GmuHfiQueues(S,T,2);
+    if (!NT_SUCCESS(st)) { return st; }
+    // 160 dwords: counts/masks, CNOC addresses[6]/data[2][6], DDR addresses[8]/data[16][8].
+    ULONG bw[160]={}; bw[1]=1; bw[2]=1; bw[3]=3; bw[4]=1; bw[5]=7;
+    bw[6]=0x5006C; bw[12]=0x40000000; bw[18]=0x60000001;
+    bw[24]=0x50004; bw[25]=0x50000; bw[26]=0x50088;
+    bw[32]=0x40000000; bw[33]=0x40000000; bw[34]=0x40000000;
+    st=GmuHfiExchange(S,Params,bw,RTL_NUMBER_OF(bw),3,2,0x720,T,&T->Messages[1]);
+    T->Messages[1].Status=st; GmuHfiQueues(S,T,3);
+    return st;
+}
 static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length)
 {
     ULONG mismatch=0;
@@ -282,12 +466,37 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetDword(Diag,L"GpuGmuRsccBadIndex",0xFFFFFFFFUL);
     EpiSetDword(Diag,L"GpuGmuRsccRestoreBadIndex",0xFFFFFFFFUL);
     EpiSetDword(Diag,L"GpuGmuRsccRestoreStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetDword(Diag,L"GpuGmuHfiStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetDword(Diag,L"GpuGmuHfiCtrlStatus",0xFFFFFFFF);
+    EpiSetDword(Diag,L"GpuGmuHfiBwPublished",0);
+    EpiSetDword(Diag,L"GpuGmuHfiIdleStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetValue(Diag,L"GpuGmuHfiMessages",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuHfiQueues",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuHfiPower",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuHfiRscc",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     ULONG result=EPI_GMU_OK, configured=0, rsccConfigured=0;
     NTSTATUS st=STATUS_SUCCESS;
     BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE;
-    // No GPU PDC, RSCC handshake, HFI messages or explicit GX requests.
+    GMU_HFI_TRACE hfi={}; hfi.Status=STATUS_NOT_FOUND; hfi.CtrlStatus=0xFFFFFFFF;
+    for (ULONG i=0;i<RTL_NUMBER_OF(hfi.Messages);++i) { hfi.Messages[i].Status=STATUS_NOT_FOUND; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(hfi.Queues);++i)
+    {
+        hfi.Queues[i][0]=i;
+        for (ULONG j=1;j<RTL_NUMBER_OF(hfi.Queues[i]);++j) { hfi.Queues[i][j]=0xFFFFFFFF; }
+    }
+    for (ULONG i=0;i<RTL_NUMBER_OF(hfi.Power);++i)
+    {
+        hfi.Power[i][0]=i;
+        for (ULONG j=1;j<RTL_NUMBER_OF(hfi.Power[i]);++j) { hfi.Power[i][j]=0xFFFFFFFF; }
+    }
+    for (ULONG i=0;i<RTL_NUMBER_OF(hfi.Rscc);++i)
+    {
+        hfi.Rscc[i][0]=i;
+        for (ULONG j=1;j<RTL_NUMBER_OF(hfi.Rscc[i]);++j) { hfi.Rscc[i][j]=0xFFFFFFFF; }
+    }
+    // No GPU PDC, RSCC handshake, CORE_FW_START / START / GX vote requests.
     // Field order is the GpuGmuSetup REG_BINARY diagnostic ABI.
     struct SETTING { ULONG Reg, Original, Value, Readback, CmpMask; } setup[] = {
         {0x23B06,0,0xFFFFFFFF,0xFFFFFFFF,0x3F}, // only six implemented IRQ mask bits
@@ -421,6 +630,13 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         KeStallExecutionProcessor(100);
     }
     if (result==EPI_GMU_E_TIMEOUT) { st=STATUS_IO_TIMEOUT; }
+    if (result==EPI_GMU_OK)
+    {
+        st=GmuHfiTables(s,Params,Cc,&hfi); hfi.Status=st;
+        GmuHfiPower(s,Cc,&hfi,1);
+        GmuText(Text,TextCch,L"gmu_hfi_status",static_cast<ULONG>(st));
+        if (!NT_SUCCESS(st)) { result=EPI_GMU_E_HFI; }
+    }
     {
         const ULONG regs[]={R_CM3_FW_INIT_RESULT,R_CM3_FW_BUSY,R_GMU2HOST_INTR_INFO,R_AO_HOST_INTR,R_GENERAL_0,R_GENERAL_1};
         ULONG values[RTL_NUMBER_OF(regs)]={};
@@ -437,14 +653,32 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     }
 cleanup:
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
+    if (hfi.Attempted) { GmuHfiDiag(Diag,&hfi); }
     if (rsccSaved) { EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,rscc,sizeof(rscc)); }
     if (released)
     {
         // Reset write/readback is mandatory even if breadcrumb persistence fails here.
         GmuStep(Params,0x630);
         WRITE_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET),1);
-        if (READ_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET))!=1) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+        const BOOLEAN reset=READ_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET))==1;
+        if (hfi.Attempted)
+        { GmuHfiQueues(s,&hfi,4); GmuHfiPower(s,Cc,&hfi,2); }
+        if (!reset) { result=EPI_GMU_E_TEARDOWN; goto keep; }
         KeStallExecutionProcessor(100);
+        if (hfi.BwPublished)
+        {
+            // Require RSCC quiescence/GX off; retain RPMh power state as an observation, not a veto.
+            GmuStep(Params,0x730);
+            BOOLEAN idle=FALSE;
+            for (ULONG i=0;i<=100;++i)
+            {
+                if (GmuHfiIdle(s,Cc)) { idle=TRUE; break; }
+                if (i!=100) { KeStallExecutionProcessor(100); }
+            }
+            GmuHfiPower(s,Cc,&hfi,2);
+            EpiSetDword(Diag,L"GpuGmuHfiIdleStatus",static_cast<ULONG>(idle ? STATUS_SUCCESS : STATUS_IO_TIMEOUT));
+            if (!idle) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+        }
     }
     if (smmuAttempted)
     {
@@ -476,6 +710,7 @@ cleanup:
         EpiSetDword(Diag,L"GpuGmuRsccRestoreStatus",static_cast<ULONG>(restoreStatus));
         if (!NT_SUCCESS(restoreStatus)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
     }
+    if (hfi.Attempted) { GmuHfiPower(s,Cc,&hfi,3); GmuHfiDiag(Diag,&hfi); }
     if (s->Smmu!=NULL)
     {
         for (ULONG i=0;i<s->Count;++i)
@@ -499,6 +734,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (hfi.Attempted) { GmuHfiDiag(Diag,&hfi); }
     g_KeptGmu=s; *KeepCx=TRUE;
     EpiSetDword(Diag,L"GpuGmuStatus",result); EpiSetDword(Diag,L"GpuGmuKeepCx",1);
     GmuText(Text,TextCch,L"gmu_keep_cx",1);

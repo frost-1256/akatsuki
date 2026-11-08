@@ -7,7 +7,14 @@ struct EPI_SMMU { bool enabled; };
 NTSTATUS EpiSmmuCreate(HANDLE,EPI_SMMU** c) {
     *c=static_cast<EPI_SMMU*>(ExAllocatePool2(0,sizeof(EPI_SMMU),0)); return *c ? 0 : STATUS_INSUFFICIENT_RESOURCES;
 }
-NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG,PHYSICAL_ADDRESS,SIZE_T,ULONG) {return 0;}
+NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG iova,PHYSICAL_ADDRESS pa,SIZE_T,ULONG) {
+    if(iova==0x60008000) {
+        for(const auto& a:allocations) if(a.second==static_cast<ULONGLONG>(pa.QuadPart))
+            hfiMemory=static_cast<ULONG*>(a.first);
+        assert(hfiMemory);
+    }
+    return 0;
+}
 NTSTATUS EpiSmmuUnmap(EPI_SMMU*,ULONGLONG,SIZE_T) {return 0;}
 NTSTATUS EpiSmmuEnable(EPI_SMMU* c,volatile ULONG*,volatile ULONG*) {
     if(smmuEnableFails) return STATUS_IO_DEVICE_ERROR; c->enabled=true; return 0;
@@ -36,7 +43,7 @@ static void Reset() {
     std::memset(gPages,0,sizeof(gPages)); std::memset(cc,0,sizeof(cc));
     cc[0x106C/4]=0x80000000; cc[0x100C/4]=1; gPages[1][0]=1; gPages[1][0x340/4]=0xC0;
     bootCompletes=true; resetFails=false; smmuEnableFails=false; smmuDisableFails=false;
-    failAfter=-1; diagnostics.clear(); gmuWrites=0;
+    failAfter=-1; diagnostics.clear(); gmuWrites=0; hfiMemory=nullptr;
 }
 static ULONG Run(const std::vector<UCHAR>& f,BOOLEAN* keep) {
     WCHAR text[3072]={};

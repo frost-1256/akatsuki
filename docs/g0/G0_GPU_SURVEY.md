@@ -468,7 +468,7 @@ EpiDiag の診断形式：
 - `GMU_GMU2HOST_INTR_INFO`（0x1F992）の bit0（MSGQ）を待つ（100 µs 間隔、最大 1 s）。マスク（0x1F993）が全部立っていても INFO は読める。
 - `GMU_GMU2HOST_INTR_CLR`（0x1F991）= 1。
 - 応答キューを読む。`read_index == write_index` なら空なので、`rx_request = 1` にしてもう一度待つ。先頭 dword の bit15:8 が dword 数。読んだあと `read_index` を 4 dword 境界に揃えて更新する。
-- 応答の形：`{header（id 126 = ACK）, ret_header（送った header の写し、seqnum は bit31:20）, error, payload[16]}`。id 100 は FW のエラー通知 `{header, code, payload[2]}` で、Linux は記録して読み続ける。seqnum が違うものも読み飛ばす。`error != 0` なら失敗。
+- 応答の形：`{header, ret_header（送った header の写し、seqnum は bit31:20）, error, payload[16]}`。id 126 は ACK の定義値だが、応答判定では必須にしない。id 100 は FW のエラー通知 `{header, code, payload[2]}` として先に処理し、それ以外は3 DWORD以上かつ ret_header の seqnum が一致すれば応答候補とする。成功には ret_header 全体の一致と error=0 を要求する。条件外のパケットは記録して読み飛ばす。
 
 **5. メッセージの順番**（`a6xx_hfi_start` 1060 行。A635 で実際に送られるもの）：
 
@@ -514,6 +514,58 @@ EpiDiag の診断形式：
 3. GX の投票（`GX_BW_PERF_VOTE`）は、GX 側の準備（GX GDSC など）を調べてから。
 - 注意 [U]：BW_TABLE には CNOC の「on」投票（0x60000001）が入っている。GMU が動いている間に RPMh へ投票し、CM3 の reset だけでは取り消されないかもしれない。Linux は止める前に `PREPARE_SLUMBER`（id 33）と OOB の手順を踏む。試験のあとは `rpmh_power_state` などを読んで確かめる。
 - GMU を扱うコードはユーザーが書く。
+
+### 9.11.1 HFI 開始・PERF_TABLE・BW_TABLE の実装（実機未実行）
+
+`EpiGpuProbe=0x80` を拡張した。FW_INIT_RESULT の完了確認後に HFI を開始し、PERF_TABLE（id 4、seq 1、59 DWORD）と BW_TABLE（id 3、seq 2、160 DWORD）を1件ずつ送って ACK を待つ。CORE_FW_START、START、GX_BW_PERF_VOTE、PREPARE_SLUMBER、GBIF QSB 設定は追加していない。キュー ABI の照合元は [本家 a6xx_hfi.h](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.h) と [a6xx_hfi.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.c)（事実のみ、コードの取り込みなし）。
+
+- PERF_TABLE は GX が off / 315000 / 450000 kHz の3段、CX が off / 200000 kHz の2段。投票値は上記の実測 cmd-db に基づく固定値。BW_TABLE は上記7c3固定値を使う。両メッセージとも未使用の投票・アドレス・データは0、GX の ACD は0xFFFFFFFF。
+- HFI_CTRL_INIT=1 の後、HFI_CTRL_STATUS bit0 を100 µs間隔で最大10 ms待つ。共有 RAM は volatile とメモリバリアで読み書きし、4 DWORDへのパディングを含む空きを確認してからコマンドを公開する。キュー位置・サイズ・index・メッセージ長を検証し、破損時は読み進めない。
+- 各応答の待ち時間は100 µs間隔で最大1 s。MSGQ 割り込みをクリアし、応答を読む。id 100 以外で3 DWORD以上、packet[1] の seqnum が一致すれば応答とみなし、ret_header 全体が送信 header と一致し、error=0なら成功。id 126 の条件は設けない。読み飛ばしたパケットは件数・最後の長さ・先頭8 DWORDを記録する。FWエラー通知（id 100）は別途件数と最後の4 DWORDも記録して読み続ける。異常や時間切れでも既存のレジスタ・SMMU fault・ログの採取を行ってから CM3 を reset に戻す。
+- BW_TABLE の write_index 公開後は、doorbell や応答待ちが失敗した場合も投票済みの可能性があると扱う。CM3 reset 後に最大10 ms待ち、CM3 reset の維持、RSCC SEQ_BUSY=0、RSCC_CONTROL_REQ/ACK=0、GX GDSC collapse / PWR_ON=0、GX HM OFF を確認する。rpmh_power_state は診断として記録し、0xFとの一致を条件にしない。上記条件を確認できなければ status 8 / KeepCx=1 とし、SMMU・RSCC・GMU設定・マップ・バッファ・CXを保持する。RSCC が停止していても CNOC投票が取り消された証明にはならない [U]。PREPARE_SLUMBER/OOB での停止は今回の対象外。
+
+EpiDiag の追加診断（REG_BINARY は little endian）：
+
+| 値 | 内容 |
+|---|---|
+| `GpuGmuHfiStatus`（REG_DWORD） | HFI 開始と2件の交換の NTSTATUS。0は両 ACK 成功、STATUS_NOT_FOUNDは未到達。`GpuGmuStatus=10` は HFI 試験失敗。teardown 失敗で status 8 になってもこの値は保持する |
+| `GpuGmuHfiCtrlStatus`（REG_DWORD） | 開始待ちで最後に読んだ HFI_CTRL_STATUS。未読は0xFFFFFFFF |
+| `GpuGmuHfiBwPublished`（REG_DWORD） | BW_TABLE の write_index を公開したら1 |
+| `GpuGmuHfiIdleStatus`（REG_DWORD） | BW公開後、reset後の停止状態確認の NTSTATUS。0は上記条件を観測、STATUS_IO_TIMEOUTは未確認、STATUS_NOT_FOUNDは未試行 |
+| `GpuGmuHfiMessages`（REG_BINARY） | PERF、BWの順で各148バイト、合計296バイト。各37 DWORD：`{SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}`。応答は `{header, ret_header, error, payload[最大16]}`。Skipped はFWエラー通知も含む読み飛ばし件数。LastSkippedDwords は最後に読み飛ばしたパケットの全長（DWORD数）、LastSkipped は先頭最大8 DWORD（短い場合の残りは0）。未送信の NtStatus は STATUS_NOT_FOUND。AckDwords=0は未取得。サイズ不正時は申告された長さと先頭headerを残す場合があるため、NtStatus・AckDwordsを併読する |
+| `GpuGmuHfiQueues`（REG_BINARY） | 5レコード×28バイト＝140バイト。各 `{Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}`。Stage 0=開始前、1=HFI ready、2=PERF交換終了、3=BW交換終了、4=CM3 reset直後。デバッグキューは消費しない |
+| `GpuGmuHfiPower`（REG_BINARY） | 4レコード×24バイト＝96バイト。各 `{Stage, RpmhPowerState, GxGdscr, GxHm, HfiCtrlStatus, Gmu2HostIntrInfo}`。Stage 0=開始前、1=HFI試験終了、2=CM3 reset後（BW公開時は停止待ちの後）、3=GMU/RSCC設定復元後 |
+| `GpuGmuHfiRscc`（REG_BINARY） | 4レコード×20バイト＝80バイト。各 `{Stage, Status0, SeqBusy, ControlReq, ControlAck}`。Stage は Power と同じ。Status0 は RSCC dword 0x004、SeqBusy は0x101、ControlReq/ControlAck は GMU 側0x23B07/0x23B08。未取得フィールドは0xFFFFFFFF |
+
+キュー・電源の未取得フィールドは0xFFFFFFFF。FW起動に失敗して HFI 未到達なら HFI バイナリ診断は空。`GpuGmuStatus=0` は FW起動・2件の ACK・後始末の成功を意味する。`GpuGmuHfiStatus=0` だけでは後始末の成功を意味しないため、`GpuGmuStatus`、`GpuGmuKeepCx`、`GpuCxStatus` を併読する。`GpuCxText` には `gmu_hfi_status` も追記する。
+
+ブレッドクラム：`0x700`=開始前のMSGQクリア、`0x701`=HFI_CTRL_INIT、`0x702`=ready待ち、`0x710/720`=PERF/BWキュー書き込み、`0x711/721`=doorbell、`0x712/722`=ACK待ち、`0x713/723`=応答割り込みクリア、`0x730`=reset後の停止確認。書き込み・doorbell・割り込みクリアの前に保存とflushを確認する。テスト用 shim には最小限のHFI応答を追加したが、今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果 1（2026-11-08、v34-akat、Epinephrine v38 / 20.0.2.38、`EpiGpuProbe=0x80`）：PERF_TABLE の ACK を読み飛ばして時間切れ** [P]。
+
+- `HFI_CTRL_STATUS=1`。PERF_TABLE（header 0x00103B04）はファームウェアが読み（コマンドキュー r/w = 0x3C/0x3C）、4 dword の応答を書いた（応答キュー w=4）。
+- 実装が応答の id に 126 を要求していたため、読み飛ばした（skipped=1）。1 秒で時間切れになり `GpuGmuStatus=10`。BW_TABLE は送っていない。
+- GMU のログに応答の header 0x00010304 が残っていた：id は **元のコマンドの id（4）**、大きさ 3、種類（bit19:16）1。本家 Linux の `a6xx_hfi_wait_for_ack` は id を見ず、id 100 かどうかと ret_header の seqnum だけを見る。
+- `GMU_RPMH_POWER_STATE`（0x1F8EC）は、ファームウェアが動き出すと 0 になり、CM3 を reset に戻したあとも 0 のまま。CX 窓を開いた直後は 0xF。slumber の手順を踏まないかぎり 0xF には戻らないと見られる [U]。そこでアイドル確認は、CM3 の reset、RSCC の `SEQ_BUSY`／`REQ`／`ACK` が 0、GX OFF で判断するように変えた。
+
+**結果 2（v39 / 20.0.2.39、ACK の判定を Linux と同じにした版）：PERF_TABLE と BW_TABLE の両方に ACK（error 0）** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuStatus` / `GpuGmuHfiStatus` / `GpuGmuHfiIdleStatus` | 0 / 0 / 0 |
+| `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 |
+| PERF_TABLE（送信 0x00103B04） | ACK {0x00010304, 0x00103B04, 0} |
+| BW_TABLE（送信 0x0020A003） | ACK {0x00110303, 0x0020A003, 0} |
+| コマンドキュー r/w | 0xDC / 0xDC（60 + 160 dword） |
+| 応答キュー r/w | 0x8 / 0x8 |
+| デバッグキュー r/w | 0 / 0 |
+| RSCC `SEQ_BUSY` / `REQ` / `ACK` | 最初から最後まで 0 |
+| GX GDSC | OFF のまま |
+| SMMU `FSR` | 0x400（fault なし） |
+
+- ファームウェアの ACK の header は `(ファームウェア側の seq << 20) | (1 << 16) | (3 << 8) | 元のコマンドの id`。seq は 0 から数える。2 dword 目は送った header の写し、3 dword 目は error。
+- BW_TABLE を受け取っても、RSCC のシーケンサは動かなかった。
+- 次は CORE_FW_START（id 14）と START（id 10）。GX の投票はまだ入れない。
 
 ## 参照
 

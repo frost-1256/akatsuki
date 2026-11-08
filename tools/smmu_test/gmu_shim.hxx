@@ -23,6 +23,7 @@ static ULONG gPages[6][4096];
 static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
+static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG) {
     const ULONGLONG bases[]={0x03D7D000,0x03D7E000,0x03D8E000,0x03D6D000,0x03D71000,0x03DE0000};
@@ -33,7 +34,20 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     if(p==gPages[1] && v==1 && resetFails) return;
     *p=v;
-    if(p==gPages[1] && v==0 && bootCompletes) gPages[1][0x1C]=0x100;
+    if(p==gPages[1] && v==0 && bootCompletes) {
+        gPages[1][0x1C]=0x100; gPages[1][0xEC]=0xF;
+    }
+    // Minimal firmware peer for the existing host smoke tests; no hardware access.
+    if(p==gPages[1]+0x186 && v==1) gPages[1][0x180]=1;
+    if(p==gPages[1]+0x191) gPages[1][0x192]&=~v;
+    if(p==gPages[1]+0x194 && v==1 && hfiMemory) {
+        ULONG* cmd=hfiMemory+6; ULONG* rsp=hfiMemory+18;
+        const ULONG header=hfiMemory[0x400+cmd[10]], w=rsp[11];
+        ULONG* data=hfiMemory+0x800;
+        data[w]=(1UL<<16)|(3UL<<8)|126;
+        data[(w+1)&0x3FF]=header; data[(w+2)&0x3FF]=0; data[(w+3)&0x3FF]=0xFAFAFAFA;
+        cmd[10]=cmd[11]; rsp[11]=(w+4)&0x3FF; gPages[1][0x192]|=1;
+    }
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) { diagnostics[name]=v; return 0; }
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t*,ULONG,const void*,ULONG) { return 0; }
