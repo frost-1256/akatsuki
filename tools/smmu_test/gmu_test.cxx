@@ -25,6 +25,15 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* c) {
 NTSTATUS EpiSmmuDestroy(EPI_SMMU* c) {assert(!c->enabled); ExFreePoolWithTag(c,0); return 0;}
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU*,ULONG* fsr,ULONGLONG* addr,ULONG* syn) {*fsr=2;*addr=0x4000;*syn=0;return 0;}
 NTSTATUS EpiSmmuQueryLastError(EPI_SMMU*,ULONG*,ULONG*,ULONG*,ULONG*) {return STATUS_NOT_FOUND;}
+NTSTATUS EpiSmmuQueryCbar(EPI_SMMU* c,ULONG* value) {
+    if(!c || !value) return STATUS_INVALID_PARAMETER;
+    if(!c->enabled) return STATUS_INVALID_DEVICE_STATE;
+    *value=0x1F300; return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuQueryDisableWrites(EPI_SMMU*,EPI_SMMU_DISABLE_WRITE*,ULONG,ULONG* count) {
+    if(!count) return STATUS_INVALID_PARAMETER;
+    *count=0; return STATUS_NOT_FOUND;
+}
 static void Block(std::vector<UCHAR>& fw,ULONG a,ULONG s,ULONG t,ULONG v,const void* data=nullptr) {
     ULONG h[]={a,s,t,v}; SIZE_T o=fw.size(); fw.resize(o+16+s);
     std::memcpy(fw.data()+o,h,16); if(s && data) std::memcpy(fw.data()+o+16,data,s);

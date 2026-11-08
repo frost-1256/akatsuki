@@ -35,8 +35,12 @@
 // Setup index 18 is GMU_RPMH_CTRL (0x1F8E8), value 0xF11, full comparison mask.
 // GpuGmuRsccSetup (REG_BINARY): ten 20-byte records {Dword, Original, Value, Readback, Restored}.
 // Dword is relative to RSCC 0x03DE0000; unread Readback/Restored fields are 0xFFFFFFFF.
+// Restoration compares only bit24 (mask 0x01000000) for STATUS0 dword 0x004; other targets compare all bits.
+// Restored always records the raw, unmasked value; the diagnostic record layout is unchanged.
 // GpuGmuRsccBadIndex / GpuGmuRsccRestoreBadIndex (REG_DWORD): first failing index, or 0xFFFFFFFF.
 // GpuGmuRsccRestoreStatus (REG_DWORD): NTSTATUS of restoration, STATUS_NOT_FOUND if not attempted.
+// GpuGmuRsccEntry: 16 bytes {Status0, SeqBusy, ControlReq, ControlAck} before RSCC writes.
+// No rpmh_start: require initially collapsed CX and reject residual RSCC sleep/busy/requests at entry.
 // HFI: GpuGmuHfiStatus / GpuGmuHfiIdleStatus (REG_DWORD NTSTATUS), STATUS_NOT_FOUND if not attempted.
 // GpuGmuHfiCtrlStatus: startup HFI_CTRL_STATUS; GpuGmuHfiBwPublished: BW command was exposed to GMU.
 // GpuGmuHfiMessages (REG_BINARY): six 148-byte records (PERF, BW, CORE_FW_START, START, GX vote, SLUMBER), 888 bytes total:
@@ -51,6 +55,8 @@
 // GpuGmuHfiRscc: four 20-byte records {Stage, Status0, SeqBusy, ControlReq, ControlAck}; same stages as Power.
 // Uncaptured queue/power fields are 0xFFFFFFFF. HFI binaries are empty if FW init did not succeed.
 // After BW publication, require CM3 reset, RSCC SeqBusy/ControlReq/ControlAck=0, and GX off before teardown.
+// If this run issued rpmh_stop, SeqBusy=1 is also accepted with Status0 bit16=1, ControlReq=0,
+// GX off and CM3 reset; ControlAck=0 is required only for the ordinary SeqBusy=0 path.
 // RPMh power state is recorded without requiring 0xF; RSCC quiescence does not prove CNOC vote withdrawal.
 // In 0x680 only, GpuGmuHfiExtra: five 48-byte records (240 bytes), each:
 // {Stage, GccVote, TcsStatus[4], CxBusy, CxBusy2, GbifQsb[4]}.
@@ -75,6 +81,10 @@
 // Stages: 0 before OOB, 1 after OOB wait, 2 after release/slumber, 3 after reset/rpmh_stop, 4 after idle check.
 // Status fields are NTSTATUS; not-attempted statuses=STATUS_NOT_FOUND, unread values=0xFFFFFFFF.
 // BreadcrumbStatus keeps the first persistence failure. Attempted/PowerCounterSaved and QueueEmpty use 0/1.
+// GpuSmmuCbar: five 12-byte records {Stage, QueryStatus, Cbar0}, using the same GX Snap stages.
+// GpuSmmuDisableWrites: up to eleven 28-byte records {Step, Offset, Value, Readback, CmpMask, Status, Written}.
+// All ConfigOffsets restore attempts are recorded. No-write records have Written=0 and Readback=0xFFFFFFFF.
+// Mismatches after stream/CB disable and TLB sync do not stop this sweep; any failure still retains CX/ctx.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.

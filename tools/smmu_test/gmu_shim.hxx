@@ -49,7 +49,9 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         gPages[1][0xD0]=0; gPages[1][0xEC]=0;
     }
     if(p==gPages[6]+0x45) gPages[6][0x46]=v; // CX GBIF HALT ACK, including clear
-    if(p==gPages[2]+0x307 && v==1) gPages[5][4]|=1UL<<16; // RSCC sleep completion
+    if(p==gPages[2]+0x307 && v==1) {
+        gPages[5][4]|=1UL<<16; gPages[5][0x101]=1; // sleeping RSCC remains busy after REQ clears
+    }
     if(p==gPages[1]+0x194 && v==1 && hfiMemory) {
         ULONG* cmd=hfiMemory+6; ULONG* rsp=hfiMemory+18;
         const ULONG header=hfiMemory[0x400+cmd[10]], w=rsp[11];

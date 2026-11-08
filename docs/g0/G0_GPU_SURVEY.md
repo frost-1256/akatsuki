@@ -898,6 +898,106 @@ Snap（`GxGdscr`、`GxHm`=0x1F8D0、`RpmhPower`、TCS0〜3、`SeqBusy`、`Status
 - 後片付けは KeepCx で止まったので、SMMU の disable、クロック・GBIF・RSCC・setup の復元は実行していない（各 RestoreStatus は 0xC0000225）。CX は ON のまま、CM3 は reset のまま、RSCC は sleep 状態。
 - 次：rpmh_stop のあとの idle 確認を Linux に合わせて変える案（STATUS0 bit16 が立ち、REQ=0、GX OFF、CM3 reset なら SEQ_BUSY=1 を許す）。次の起動の前に rpmh_start の手順を入れるかどうかも決める。試験の前に電話を再起動し、RSCC と CX の状態を消しておく。
 
+### 9.13.2 rpmh_stop 後の sleep 許容と次回起動の扱い（実機未実行）
+
+v43の停止結果に合わせ、今回の実行で `RSCC_CONTROL_REQ=1` を実際に書いた場合だけ、idle確認でRSCCのsleep状態を許容するよう変更した。REQ書き込み前にブレッドクラム保存が失敗した場合や、OOB/rpmh_stopを実行していないモードには適用しない。rpmh_stopの待ちが時間切れでも、その後のidle待ち中に下記条件が成立すれば受け入れる。
+
+- 共通条件：CM3_SYSRESET=1、REQ=0、GX GDSCRのPWR_ON=0・SW_COLLAPSE=1、GX HMのbit6/7がともに1。
+- 通常経路：従来どおりSEQ_BUSY=0かつACK=0。
+- sleep経路：今回rpmh_stopの要求を発行済み、SEQ_BUSY=1、STATUS0 bit16=1。共通条件は緩めず、sleep経路ではACK=0を追加条件にしない。SEQ_BUSYの他の値や、sleep完了bit16がない状態は許容しない。
+
+この条件でidle確認が通れば、SMMU Disable、クロック・GMU setup・GBIF・RSCCの復元へ進む。復元の順番・比較・失敗時のKeepCxは変更していない。v43で止まっていたidle判定を修正するものであり、未実行だった復元処理が実機で成功するかは別途確認する必要がある。
+
+次回起動に `rpmh_start` は追加しない。現在のプローブは `EpiGpuCxTest` が開始時にCX collapseを要求する単発試験で、CXを保持したまま再開する運用は扱わない。一方、CX collapseでRSCCのsleep状態も消えることは仮定せず、RSCC初期化の前に読み取りで確認する。
+
+追加診断 `GpuGmuRsccEntry`（REG_BINARY、little endian、16バイト）は `{Status0, SeqBusy, ControlReq, ControlAck}`。ブレッドクラム0x680で採取し、STATUS0 bit16=0・SEQ_BUSY=0・REQ=0・ACK=0がそろわなければ、RSCCへ書く前に `EPI_GMU_E_PRECOND=1` / STATUS_INVALID_DEVICE_STATEで停止する。未到達なら空データ。これにより、再起動やCXの再投入後にもsleepが残った場合、未実装のwake手順で上書きせずに状態を記録できる。warm resumeが必要になった場合に、REQ bit1→ACK bit1→SEQ_BUSY=0→REQ=0を別の変更として実装する。
+
+既存のGpuGmuGx（340バイト）、Messages（888バイト）、Queues（252バイト）の形式は維持する。Gx Snap 3/4とHfiRscc stage 2で、sleepの状態とidle判定後の状態を比較できる。shimもrpmh_stop後にSEQ_BUSY=1を保持するよう変更した。今回、電話の再起動・テスト・ビルド・署名・配置・実機実行は行っていない。
+
+### 9.13.3 RSCC STATUS0 の復元比較マスク（実機未実行）
+
+RSCC復元（0x6B0以降）のSTATUS0（dword 0x004）だけ、比較マスクを0x01000000に変更した。今回変更したbit24が元の値に戻ったことを確認し、sleep後のbit16/bit2/bit1などの状態ビットの差は復元失敗としない。他の9項目は従来どおり全ビットで比較する。初期化時の比較は変更しない。
+
+`GpuGmuRsccSetup` のRestoredにはマスク前の生値を保存する。10レコード×20バイト＝200バイトの形式、元値を書き戻す処理、失敗時のKeepCxの扱いは維持する。例えば元値0に対する読み戻し0x00010006は比較成功、bit24が残った0x01010006は比較失敗となる。眠っているRSCCへの復元書き込みの実際の挙動は、まだ検証していない。今回、電話の再起動・テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat を再起動した直後、Epinephrine v44 / 20.0.2.44、`EpiGpuProbe=0x1E80`）：idle の判定は通った。SMMU の Disable で失敗して KeepCx** [P]。
+
+- `GpuGmuRsccEntry` = {0, 0, 0, 0}。電話を再起動すると、RSCC は起きた状態に戻っていた。
+- GX の ON→OFF、HFI の 6 通の ACK、Snap 0〜4 は v43 とまったく同じ値で、再現した。
+- rpmh_stop のあとは SEQ_BUSY=1、STATUS0=0x01010006。sleep の経路で idle と判定された（`GpuGmuHfiIdleStatus=0`）。
+- そのあと `EpiSmmuDisable` が 0xC0000185（STATUS_IO_DEVICE_ERROR）で失敗した。`GpuGmuStatus=8`、`KeepCx=1`。WindowReady の失敗（0xC0000184）でも Sync の時間切れ（0xC00000B5）でもないので、Disable の中の Write の読み戻しが合わなかったと見られる。v37〜v42 では同じ Disable が通っていた。
+- `GpuSmmuBadWrite` は Enable が失敗したときにしか保存されないので、どのレジスタかはわからない。ブレッドクラムも 0xFFFF で上書きされている。
+- そのため、クロック、GBIF、RSCC、setup の復元は実行されていない。SMMU `FSR` は 0x400（fault なし）。
+- 次：Disable が失敗したときも `EpiSmmuQueryLastError` の内容を `GpuSmmuBadWrite` に保存する。実行の前には電話を再起動する。
+
+**結果（v45 / 20.0.2.45、再起動直後、`EpiGpuProbe=0x1E80`、Disable が失敗したときの `GpuSmmuBadWrite` を追加した版）：Disable は CBAR0 の書き戻しで失敗** [P]。
+
+- `GpuSmmuBadWrite` = {Step 0x531, Offset 0x1000, Value 0, Readback 0x0001F300}。
+- 0x1000 は SMMU の GR1 の `CBAR0`（`ConfigOffsets[1]`）。Enable で書いた 0x1F300 を元の値 0 に戻そうとしたが、書き込みが効かず 0x1F300 のまま読めた。
+- その前の SMR の無効化（0x520）、SCTLR=0（0x521）、TLB の Sync（0x522）、`CBA2R0`（0x1800）の書き戻し（0x530）は通っている。
+- `CBAR0` の書き戻しは v37〜v42 では通っていた。GX の ON/OFF、slumber、rpmh_stop のどれかのあとで、`CBAR0` だけが書けなくなったと見られる [I]。ハイパーバイザが `CBAR` を管理していて、条件によって書き込みを止めている可能性がある [U]。
+- RSCC の状態、GX の ON→OFF、HFI の結果は v44 と同じ。`GpuGmuRsccEntry` = 0。SMMU `FSR` は 0x400。
+
+### 9.13.4 CBAR0の段階別読み取りとDisable復元全項目の診断（実機未実行）
+
+CBAR0をいつ書けなくなるか切り分けるため、既存のGX Snapと同じ5段階（0=OOB前、1=GX ONのACK待ち終了後、2=slumber後、3=reset/rpmh_stop後、4=idle確認後）で読む。`EpiSmmuQueryCbar()` はSMMUの生きた写像とCX/ブランチを確認してからCBAR0（SMMUバイトoffset 0x1000）を読むだけで、状態を変えない。段階途中にCBAR0を書き直す試験は入れていない。
+
+Disableは、WindowReady、SMR0の無効化（0x520）、CB0停止（0x521）、TLB同期（0x522）がすべて成功した後に限り、ConfigOffsetsの11項目を最後まで復元して結果を記録する。CBAR0で読み戻しが合わなくても残り9項目へ進む。変更するoffsetと値は従来と同じで、TCR2の比較マスクも維持する。書き込み前のブレッドクラム保存・flushが失敗した場合は、書き込みを続けず停止する。
+
+読み戻し不一致は最初の失敗statusを返し、1項目でも失敗したら最後のSCTLR/SMR復元（0x53B/0x53C）やReleaseHardwareは実行しない。CB/streamは停止したまま、ctx・ページテーブル・データ・CXを保持してstatus 8 / KeepCxへ進む。停止境界や同期の失敗でも従来どおり即停止する。これは翻訳が止まった状態で既存の設定レジスタへの復元だけを続ける変更で、全不一致を成功扱いにする変更ではない。
+
+追加診断（EpiDiag、REG_BINARY、little endian）：
+
+| 値 | 内容 |
+|---|---|
+| `GpuSmmuCbar` | 5レコード×12バイト＝60バイト。各 `{Stage, QueryStatus, Cbar0}`。QueryStatusはNTSTATUS、未到達はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。0x1E80のcleanup/keepの両経路で保存する。GPU/GX診断の既存構造体サイズは変更しない |
+| `GpuSmmuDisableWrites` | 最後に到達したConfigOffsets復元の試行を、成功も含めて最大11レコード×28バイト＝308バイトで保存する。各 `{Step, Offset, Value, Readback, CmpMask, Status, Written}`。OffsetはSMMU 0x03DA0000からのバイト、StatusはNTSTATUS。Written=1が実際に書いた項目、0は書き込み前に停止した項目でReadback=0xFFFFFFFF。復元ループ未到達なら空 |
+
+レコード順はCBA2R0（0x1800）、CBAR0（0x1000）、TCR2（0x10010）、TCR（0x10030）、TTBR0 LO/HI（0x10020/24）、TTBR1 LO/HI（0x10028/2C）、MAIR0/1（0x10038/3C）、S2CR0（0xC00）。失敗行はStatusで抽出でき、マスクで許容された生値の差もReadback/CmpMaskで確認できる。初期停止や最後のSCTLR/SMRで止まった場合の最初の不一致は、従来の `GpuSmmuBadWrite` に残す。
+
+`EpiSmmuQueryDisableWrites()` は保持した記録をソフトウェアだけでコピーするAPIで、成功したDisable後もctx破棄までは取得できる。Enable内のrollbackの記録も、Enable失敗時に保存する。`GpuSmmuBadWrite` は引き続きctx寿命中の最初の不一致だけを保持する。Enable成功後の通常Disableでは、今回の復元記録から各項目を確認する。
+
+rpmh_stopを省く試験、OOBだけでslumberを省く試験、GX/RBBM/CPやPDCへの新しいアクセスは追加していない。テスト用GMU stubには新しいquery APIの受け口を追加した。今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat を再起動した直後、Epinephrine v46 / 20.0.2.46、`EpiGpuProbe=0x1E80`）：書き戻せないのは `CBAR0` だけ。値はどの時点でも変わらない** [P]。
+
+- `GpuSmmuCbar`：5 つの時点（Stage 0〜4）とも、Query は成功、`CBAR0` = 0x0001F300（Enable で書いた値）。GX の ON/OFF、slumber、rpmh_stop のどれでも変わらない。
+- `GpuSmmuDisableWrites`：11 項目のうち、合わなかったのは 0x531（`CBAR0`、元の値 0 → 読み戻し 0x1F300）だけ。ほかの 10 項目は元の値どおりに読み戻せた。
+- 元の値は、`CBA2R0` が 0、`CBAR0` が 0。CB0 のほかのレジスタは 0x40030077、0x18B3028B、0xD7BBEEFB などで、規則性のない値だった。リセットのあとに初期化されていない値と見られる [I]。
+- **見直し**：失敗した v44〜v46 は、どれも電話を再起動した直後の実行で、`CBAR0` の元の値は 0 だった。`CBAR0` の書き戻しが通った v32〜v42 は、同じ起動の中で続けて実行したもので、そのときの元の値は記録していない。
+- `CBAR` = 0 は TYPE（bit17:16）= 0、つまり stage 2 の context を意味する。この SMMU は stage 1 だけ（IDR0 = 0x4C017E06）なので、0 という値を受け付けず、書き込みが無視されていると考えられる。この場合、原因は GX ではない [I]。
+- 確かめ方：再起動した直後に、GX を使わない `0xE80` を 1 回実行する。Disable がまた 0x531 で失敗すれば、GX とは無関係だとわかる。
+
+**確認（v46、再起動直後、`EpiGpuProbe=0xE80`、GX なし）：同じく 0x531 の `CBAR0` で失敗。GX とは関係ない** [P]。
+
+- `GpuSmmuBadWrite` = {0x531, 0x1000, 0, 0x1F300}。ほかの 10 項目は通った。HFI と idle の判定は 0、`GpuGmuStatus=8`、`KeepCx=1`。
+- CB0 の元の値は、一部のビットが v46 の `0x1E80` のときと違っていた（TCR 0x18B3028B → 0x18BF0A83 など）。初期化されていない値であることと合う [I]。
+- 結論：電話を再起動した直後の 1 回目は、`CBAR0` の元の値が 0（TYPE=0）なので、書き戻しが必ず失敗する。v32〜v42 で通ったのは、同じ起動の中で続けて実行していたためと見られる [I]。GX の ON/OFF、slumber、rpmh_stop の手順は、後片付けの失敗の原因ではない。
+
+### 9.13.5 CBAR0の復元元がTYPE=0の場合の扱い（実機未実行）
+
+案1を採用し、DisableのConfigOffsets復元で、CBAR0（SMMUバイトoffset 0x1000）の保存値がTYPE=0の場合だけ比較マスクを0にする。TYPEはbit17:16（マスク0x00030000、照合元は [Linux arm-smmu.h](https://kernel.googlesource.com/pub/scm/linux/kernel/git/lpieralisi/linux/+/bc139119a1708ae3db1ebb379630f286e28d06e8/drivers/iommu/arm-smmu.h) の定義）。このデバイスは確認済みのS1専用レイアウトを前提にしており、TYPE=0への読み戻し不一致を失敗にしない。
+
+元の値を書いて読み戻す処理は維持する。`GpuSmmuDisableWrites` の該当行に Value=保存値、Readback=生値、CmpMask=0、Written=1、Status=0を残すため、値が変わらなかったことも確認できる。Enable時や元のTYPEが0以外の場合、他の10項目、SMR無効化・SCTLR停止・TLB同期の条件は変更しない。書き込み前のブレッドクラム保存・flush失敗は引き続き失敗として止め、未書き込み行はWritten=0で記録する。SCTLR/SMRの最後の復元や資源解放は、許容対象以外の比較と処理がすべて成功した場合だけ行う。
+
+`GpuSmmuBadWrite` は許容された差分をエラーにせず、その他の最初の不一致を従来どおり保持する。既存診断の形式・サイズは変更しない。今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat を再起動した直後、Epinephrine v47 / 20.0.2.47、`EpiGpuProbe=0x1E80`）：GX の ON→OFF から後片付けまで、すべて成功** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | **0 / 0 / 0** |
+| `GpuGmuHfiStatus` / `GpuGmuHfiIdleStatus` | 0 / 0（sleep の経路） |
+| `GpuGmuDisableStatus` | 0 |
+| RSCC / GBIF / クロックの復元 | すべて 0 |
+| `GpuGmuRsccEntry` | {0, 0, 0, 0} |
+
+- GX：Snap 1 で GDSCR 0xF8222800、0x1F8D0 = 0（ON）。Snap 2 で 0x00222801、0xC0、`RPMH_POWER_STATE` = 0xF（OFF）。v43〜v46 と同じ値。
+- `GpuSmmuDisableWrites`：0x531 の `CBAR0` は、比較マスク 0（TYPE=0 の元の値）で通った。読み戻しは 0x1F300 のまま。ほかの 10 項目は全ビットが一致した。
+- RSCC の STATUS0 の復元：読み戻しは 0x00010006。比較するのは bit24 だけなので通った。
+- 電話を再起動した直後の 1 回目で、GMU の起動 → HFI 6 通 → GX ON → slumber で GX OFF → rpmh_stop → SMMU Disable → 全復元 → CX OFF まで、初めて最後まで通った。
+- 次：GX が ON の間に、GX 側のレジスタ（chip id など）を読むだけの試験。GPU 本体のレジスタに触れるのは初めてになる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

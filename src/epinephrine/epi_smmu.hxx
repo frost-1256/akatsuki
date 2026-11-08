@@ -27,6 +27,8 @@ NTSTATUS EpiSmmuUnmap(EPI_SMMU* Context, ULONGLONG Iova, SIZE_T Size);
 // remain mapped/powered until Disable SUCCEEDS. CM3 must be reset, GX off.
 // Enable snapshots registers, installs stream 5 / mask 0x400 -> CB0 and syncs TLB.
 // Disable requires CM3 reset again; restores saved registers and syncs TLB.
+// After verified stream/CB disable and TLB sync, attempt all ConfigOffsets restores on readback mismatches.
+// Any failure retains ownership/tables; final SCTLR/SMR restores run only if every config restore succeeded.
 // On failed Enable, call Disable too: failed rollback retains ownership/tables.
 // On failed Disable: retain ctx, data, mappings and CX power; retry or recover
 // by device reset. Never free memory/collapse CX on an unsuccessful teardown.
@@ -38,6 +40,22 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* Context);
 // Offset is in bytes from the SMMU register base (0x03DA0000).
 // All outputs required. STATUS_NOT_FOUND if no mismatch; outputs unchanged on failure.
 NTSTATUS EpiSmmuQueryLastError(EPI_SMMU* Context, ULONG* Step, ULONG* Offset, ULONG* Value, ULONG* Readback);
+
+// Read CBAR0 only; requires the live register mapping and powered CX/branches. Does not write or clear state.
+NTSTATUS EpiSmmuQueryCbar(EPI_SMMU* Context, ULONG* Value);
+
+#define EPI_SMMU_DISABLE_WRITE_MAX 11
+struct EPI_SMMU_DISABLE_WRITE {
+    ULONG Step, Offset, Value, Readback, CmpMask;
+    NTSTATUS Status;
+    ULONG Written;
+};
+static_assert(sizeof(EPI_SMMU_DISABLE_WRITE)==28,"SMMU disable diagnostic ABI");
+// Software-only copy of the last ConfigOffsets restoration sweep, including successes and mismatches.
+// CBAR0 restoration uses CmpMask=0 when its saved TYPE[17:16]=0 on this S1-only device; raw readback is retained.
+// Other comparisons and pre-write persistence failures are unchanged.
+// Count receives the available record count; capacity must cover it. STATUS_NOT_FOUND if no sweep reached.
+NTSTATUS EpiSmmuQueryDisableWrites(EPI_SMMU* Context, EPI_SMMU_DISABLE_WRITE* Writes, ULONG Capacity, ULONG* Count);
 
 // Read-only, valid while enabled, including while CM3 runs. Does not clear faults.
 // Caller keeps CX/branches on and serializes against Disable/CX teardown.

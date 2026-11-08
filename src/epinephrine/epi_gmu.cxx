@@ -126,6 +126,7 @@ struct GMU_TEST {
     ULONG Count;
     EPI_SMMU* Smmu;
     PVOID Maps[8]; // control C/A/B, ITCM, DTCM, RSCC, optional GBIF/GCC vote; retained on failed teardown
+    ULONG SmmuCbar[5][3]; // GX snapshot stages: {stage, query NTSTATUS, CBAR0}
 };
 static GMU_TEST* g_KeptGmu = NULL; // debugger-visible ownership of quarantined allocations
 
@@ -453,6 +454,13 @@ static VOID GmuText(PWCHAR Text, SIZE_T Cch, PCWSTR Name, ULONG Value)
     RtlStringCchPrintfW(line,RTL_NUMBER_OF(line),L"%s=%08X; ",Name,Value);
     RtlStringCchCatW(Text,Cch,line);
 }
+static VOID GmuSmmuDisableDiag(EPI_SMMU* Context, HANDLE Diag)
+{
+    EPI_SMMU_DISABLE_WRITE writes[EPI_SMMU_DISABLE_WRITE_MAX]={};
+    ULONG count=0;
+    if (NT_SUCCESS(EpiSmmuQueryDisableWrites(Context,writes,EPI_SMMU_DISABLE_WRITE_MAX,&count)))
+    { EpiSetValue(Diag,L"GpuSmmuDisableWrites",REG_BINARY,writes,static_cast<ULONG>(count*sizeof(writes[0]))); }
+}
 
 // Non-legacy HFI wire facts: G0_GPU_SURVEY.md section 9.11 and mainline a6xx_hfi.h.
 // Volatile accesses + barriers publish non-cached shared RAM; command/W1C registers are not compared.
@@ -524,17 +532,18 @@ static VOID GmuHfiPower(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_HFI_
     T->Rscc[Stage][4]=READ_REGISTER_ULONG(GmuReg(S,0x23B08));
     if (T->ExtraEnabled) { GmuHfiExtra(S,Params,T,Stage); }
 }
-static BOOLEAN GmuHfiIdle(GMU_TEST* S, volatile ULONG* Cc)
+static BOOLEAN GmuHfiIdle(GMU_TEST* S, volatile ULONG* Cc, BOOLEAN RpmhStopIssued = FALSE)
 {
-    // Check reset/GX and RSCC quiescence. RPMh power state is diagnostic only:
-    // no slumber transition was requested, so do not require its pre-HFI value 0xF.
-    // SEQ_BUSY=0 does not prove that persistent CNOC votes have been withdrawn.
-    return READ_REGISTER_ULONG(GmuReg(S,R_CM3_SYSRESET))==1 &&
-           READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x101)==0 &&
-           READ_REGISTER_ULONG(GmuReg(S,0x23B07))==0 &&
-           READ_REGISTER_ULONG(GmuReg(S,0x23B08))==0 &&
-           (READ_REGISTER_ULONG(Cc+0x100C/4)&0x80000001UL)==1 &&
-           (READ_REGISTER_ULONG(GmuReg(S,0x1F8D0))&0xC0)==0xC0;
+    // Reset/GX off and a cleared request remain mandatory in both awake and sleeping RSCC states.
+    if (READ_REGISTER_ULONG(GmuReg(S,R_CM3_SYSRESET))!=1 ||
+        READ_REGISTER_ULONG(GmuReg(S,0x23B07))!=0 ||
+        (READ_REGISTER_ULONG(Cc+0x100C/4)&0x80000001UL)!=1 ||
+        (READ_REGISTER_ULONG(GmuReg(S,0x1F8D0))&0xC0)!=0xC0) { return FALSE; }
+    const ULONG busy=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x101);
+    if (RpmhStopIssued && busy==1 &&
+        (READ_REGISTER_ULONG(static_cast<volatile ULONG*>(S->Maps[5])+0x004)&(1UL<<16)))
+    { return TRUE; } // sleep completion: unlike rpmh_start, rpmh_stop does not wait for SEQ_BUSY=0
+    return busy==0 && READ_REGISTER_ULONG(GmuReg(S,0x23B08))==0;
 }
 static VOID GmuHfiDiag(HANDLE Diag, const GMU_HFI_TRACE* T)
 {
@@ -710,6 +719,9 @@ static VOID GmuGxSnap(GMU_TEST* S, volatile ULONG* Cc, GMU_GX_TRACE* T, ULONG St
     for (ULONG i=0;i<RTL_NUMBER_OF(offsets);++i) { v[4+i]=READ_REGISTER_ULONG(r+offsets[i]/4); }
     v[8]=READ_REGISTER_ULONG(r+0x101); v[9]=READ_REGISTER_ULONG(r+0x004);
     v[10]=READ_REGISTER_ULONG(GmuReg(S,0x23B0C)); v[11]=READ_REGISTER_ULONG(Cc);
+    ULONG cbar=0xFFFFFFFF;
+    S->SmmuCbar[Stage][1]=static_cast<ULONG>(EpiSmmuQueryCbar(S->Smmu,&cbar));
+    S->SmmuCbar[Stage][2]=cbar;
 }
 static NTSTATUS GmuGxWait(volatile ULONG* Reg, ULONG Mask, ULONG Value, ULONG DelayUs, ULONG Limit,
                            ULONG* Polls, ULONG* Last)
@@ -793,18 +805,21 @@ static NTSTATUS GmuGxSlumber(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
     GmuHfiQueues(S,Hfi,7); GmuGxSnap(S,Cc,T,2);
     return T->SlumberStatus;
 }
-static VOID GmuGxRpmhStop(GMU_TEST* S, HANDLE Params, GMU_GX_TRACE* T)
+static BOOLEAN GmuGxRpmhStop(GMU_TEST* S, HANDLE Params, GMU_GX_TRACE* T)
 {
+    BOOLEAN issued=FALSE;
     NTSTATUS st=GmuGxStep(Params,0x7F4,T);
     if (NT_SUCCESS(st))
     {
         WRITE_REGISTER_ULONG(GmuReg(S,0x23B07),1);
+        issued=TRUE;
         GmuGxStep(Params,0x7F5,T);
         st=GmuGxWait(static_cast<volatile ULONG*>(S->Maps[5])+0x004,1UL<<16,1UL<<16,
                       100,100,&T->RpmhStopPolls,&T->RpmhStopLast);
     }
     T->RpmhStopStatus=st;
     GmuGxStep(Params,0x7F6,T); WRITE_REGISTER_ULONG(GmuReg(S,0x23B07),0);
+    return issued;
 }
 static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length)
 {
@@ -860,7 +875,10 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetDword(Diag,L"GpuGmuBadIndex",0xFFFFFFFFUL);
     EpiSetValue(Diag,L"GpuGmuSetup",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuSmmuDisableWrites",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuSmmuCbar",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuRsccEntry",REG_BINARY,NULL,0);
     EpiSetDword(Diag,L"GpuGmuRsccBadIndex",0xFFFFFFFFUL);
     EpiSetDword(Diag,L"GpuGmuRsccRestoreBadIndex",0xFFFFFFFFUL);
     EpiSetDword(Diag,L"GpuGmuRsccRestoreStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -887,9 +905,14 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(s->SmmuCbar);++i)
+    {
+        s->SmmuCbar[i][0]=i; s->SmmuCbar[i][1]=static_cast<ULONG>(STATUS_NOT_FOUND);
+        s->SmmuCbar[i][2]=0xFFFFFFFF;
+    }
     ULONG result=EPI_GMU_OK, configured=0, rsccConfigured=0;
     NTSTATUS st=STATUS_SUCCESS;
-    BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE;
+    BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE, rpmhStopIssued=FALSE;
     GMU_GX_TRACE gx={};
     gx.OobStatus=STATUS_NOT_FOUND; gx.HaltStatus=STATUS_NOT_FOUND; gx.SlumberStatus=STATUS_NOT_FOUND;
     gx.BusyStatus=STATUS_NOT_FOUND; gx.RpmhStopStatus=STATUS_NOT_FOUND; gx.IdleStatus=STATUS_NOT_FOUND;
@@ -1024,9 +1047,15 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     for (ULONG i=0;i<RTL_NUMBER_OF(setup);++i) { setup[i].Original=READ_REGISTER_ULONG(GmuReg(s,setup[i].Reg)); }
     st=GmuStep(Params,0x680);
     if (!NT_SUCCESS(st)) { result=EPI_GMU_E_RSCC; goto cleanup; }
-    if (READ_REGISTER_ULONG(GmuReg(s,0x23B07))!=0 || READ_REGISTER_ULONG(GmuReg(s,0x23B08))!=0 ||
-        READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+0x101)!=0)
-    { st=STATUS_INVALID_DEVICE_STATE; result=EPI_GMU_E_PRECOND; goto cleanup; }
+    {
+        // Cold-start probes only: do not assume CX collapse erased RSCC sleep state, and do not wake it here.
+        const ULONG entry[]={READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+0x004),
+                             READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+0x101),
+                             READ_REGISTER_ULONG(GmuReg(s,0x23B07)),READ_REGISTER_ULONG(GmuReg(s,0x23B08))};
+        EpiSetValue(Diag,L"GpuGmuRsccEntry",REG_BINARY,entry,sizeof(entry));
+        if ((entry[0]&(1UL<<16)) || entry[1]!=0 || entry[2]!=0 || entry[3]!=0)
+        { st=STATUS_INVALID_DEVICE_STATE; result=EPI_GMU_E_PRECOND; goto cleanup; }
+    }
     for (ULONG i=0;i<RTL_NUMBER_OF(rscc);++i)
     { rscc[i].Original=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword); }
     rsccSaved=TRUE;
@@ -1087,6 +1116,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         ULONG badWrite[4]={};
         if (NT_SUCCESS(EpiSmmuQueryLastError(s->Smmu,&badWrite[0],&badWrite[1],&badWrite[2],&badWrite[3])))
         { EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,badWrite,sizeof(badWrite)); }
+        GmuSmmuDisableDiag(s->Smmu,Diag); // Enable may have attempted an internal rollback
         result=EPI_GMU_E_SMMU_ENABLE; goto cleanup;
     }
     // No release unless SMMU and all buffers are ready; clear stale init result first.
@@ -1144,7 +1174,11 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     }
 cleanup:
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
-    if (GxOn) { EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,&gx,sizeof(gx)); }
+    if (GxOn)
+    {
+        EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,&gx,sizeof(gx));
+        EpiSetValue(Diag,L"GpuSmmuCbar",REG_BINARY,s->SmmuCbar,sizeof(s->SmmuCbar));
+    }
     if (clocks.Attempted) { GmuClockDiag(Diag,&clocks); }
     if (gbif.Attempted) { GmuGbifDiag(Diag,&gbif); }
     if (hfi.Attempted) { GmuHfiDiag(Diag,&hfi); }
@@ -1160,15 +1194,15 @@ cleanup:
         if (!reset) { result=EPI_GMU_E_TEARDOWN; goto keep; }
         KeStallExecutionProcessor(100);
         if (GxOn && gx.Attempted)
-        { GmuGxRpmhStop(s,Params,&gx); GmuGxSnap(s,Cc,&gx,3); }
+        { rpmhStopIssued=GmuGxRpmhStop(s,Params,&gx); GmuGxSnap(s,Cc,&gx,3); }
         if (hfi.BwPublished)
         {
-            // Require RSCC quiescence/GX off; retain RPMh power state as an observation, not a veto.
+            // Accept confirmed RSCC sleep only after this run actually issued rpmh_stop.
             GmuStep(Params,0x730);
             BOOLEAN idle=FALSE;
             for (ULONG i=0;i<=100;++i)
             {
-                if (GmuHfiIdle(s,Cc)) { idle=TRUE; break; }
+                if (GmuHfiIdle(s,Cc,rpmhStopIssued)) { idle=TRUE; break; }
                 if (i!=100) { KeStallExecutionProcessor(100); }
             }
             GmuHfiPower(s,Params,Cc,&hfi,2);
@@ -1178,12 +1212,24 @@ cleanup:
             if (!idle) { result=EPI_GMU_E_TEARDOWN; goto keep; }
         }
     }
-    if (GxOn) { EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,&gx,sizeof(gx)); }
+    if (GxOn)
+    {
+        EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,&gx,sizeof(gx));
+        EpiSetValue(Diag,L"GpuSmmuCbar",REG_BINARY,s->SmmuCbar,sizeof(s->SmmuCbar));
+    }
     if (smmuAttempted)
     {
         st=EpiSmmuDisable(s->Smmu);
+        GmuSmmuDisableDiag(s->Smmu,Diag);
         EpiSetDword(Diag,L"GpuGmuDisableStatus",static_cast<ULONG>(st));
-        if (!NT_SUCCESS(st)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+        if (!NT_SUCCESS(st))
+        {
+            // Preserve the first SMMU mismatch on Disable too; do not replace its failure status in st.
+            ULONG badWrite[4]={};
+            if (NT_SUCCESS(EpiSmmuQueryLastError(s->Smmu,&badWrite[0],&badWrite[1],&badWrite[2],&badWrite[3])))
+            { EpiSetValue(Diag,L"GpuSmmuBadWrite",REG_BINARY,badWrite,sizeof(badWrite)); }
+            result=EPI_GMU_E_TEARDOWN; goto keep;
+        }
     }
     if (clocks.Saved && (clocks.Changed[0] || clocks.Changed[1] || clocks.Gcc[6]))
     {
@@ -1217,7 +1263,10 @@ cleanup:
             st=GmuStep(Params,0x6B0+i);
             WRITE_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword,rscc[i].Original);
             rscc[i].Restored=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[5])+rscc[i].Dword);
-            if (rscc[i].Restored!=rscc[i].Original) { st=STATUS_IO_DEVICE_ERROR; }
+            // STATUS0 contains live sleep/status bits; compare only the bit24 control we changed.
+            // Keep the unmasked readback above in GpuGmuRsccSetup for diagnosis.
+            const ULONG cmpMask=rscc[i].Dword==0x004 ? 0x01000000UL : 0xFFFFFFFFUL;
+            if ((rscc[i].Restored&cmpMask)!=(rscc[i].Original&cmpMask)) { st=STATUS_IO_DEVICE_ERROR; }
             if (!NT_SUCCESS(st) && NT_SUCCESS(restoreStatus))
             { restoreStatus=st; EpiSetDword(Diag,L"GpuGmuRsccRestoreBadIndex",i); }
         }
@@ -1249,6 +1298,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (GxOn) { EpiSetValue(Diag,L"GpuSmmuCbar",REG_BINARY,s->SmmuCbar,sizeof(s->SmmuCbar)); }
     if (GxOn) { EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,&gx,sizeof(gx)); }
     if (clocks.Attempted) { GmuClockDiag(Diag,&clocks); }
     if (gbif.Attempted) { GmuGbifDiag(Diag,&gbif); }

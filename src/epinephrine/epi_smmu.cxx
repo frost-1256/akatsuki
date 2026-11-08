@@ -34,7 +34,10 @@ struct EPI_SMMU {
     BOOLEAN Saved, Enabled;
     ULONG BadWriteStep, BadWriteOffset, BadWriteValue, BadWriteReadback;
     BOOLEAN HasBadWrite; // first mismatch for this context's lifetime; Disable must not overwrite it
+    EPI_SMMU_DISABLE_WRITE DisableWrites[EPI_SMMU_DISABLE_WRITE_MAX];
+    ULONG DisableWriteCount;
 };
+static_assert(RTL_NUMBER_OF(ConfigOffsets)==EPI_SMMU_DISABLE_WRITE_MAX,"SMMU disable diagnostic capacity");
 static PVOID volatile Owner = NULL;
 
 static NTSTATUS AllocateTable(EPI_TABLE* T)
@@ -195,8 +198,9 @@ static ULONG ConfigCompareMask(ULONG Offset)
     return Offset == Cb+0x10 ? 0xFFFFFF9FUL : 0xFFFFFFFFUL;
 }
 static NTSTATUS Write(EPI_SMMU* C, ULONG Offset, ULONG Value, ULONG Step,
-                      ULONG CmpMask = 0xFFFFFFFFUL)
+                      ULONG CmpMask = 0xFFFFFFFFUL, ULONG* Readback = NULL, BOOLEAN* Written = NULL)
 {
+    if (Written != NULL) { *Written = FALSE; }
     if (C->Params != NULL)
     {
         NTSTATUS st = EpiSetDword(C->Params, L"EpiGpuProbeStep", Step);
@@ -205,6 +209,8 @@ static NTSTATUS Write(EPI_SMMU* C, ULONG Offset, ULONG Value, ULONG Step,
     }
     WRITE_REGISTER_ULONG(C->Regs+Offset/4, Value);
     const ULONG readback = READ_REGISTER_ULONG(C->Regs+Offset/4);
+    if (Written != NULL) { *Written = TRUE; }
+    if (Readback != NULL) { *Readback = readback; }
     if ((readback & CmpMask) == (Value & CmpMask)) { return STATUS_SUCCESS; }
     if (!C->HasBadWrite)
     {
@@ -222,6 +228,24 @@ NTSTATUS EpiSmmuQueryLastError(EPI_SMMU* C, ULONG* Step, ULONG* Offset, ULONG* V
     if (!C->HasBadWrite) { return STATUS_NOT_FOUND; }
     *Step = C->BadWriteStep; *Offset = C->BadWriteOffset;
     *Value = C->BadWriteValue; *Readback = C->BadWriteReadback;
+    return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuQueryCbar(EPI_SMMU* C, ULONG* Value)
+{
+    PAGED_CODE();
+    if (C == NULL || Value == NULL) { return STATUS_INVALID_PARAMETER; }
+    if (C->Regs == NULL || !WindowReady(C, FALSE)) { return STATUS_INVALID_DEVICE_STATE; }
+    *Value = READ_REGISTER_ULONG(C->Regs+0x1000/4);
+    return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuQueryDisableWrites(EPI_SMMU* C, EPI_SMMU_DISABLE_WRITE* Writes, ULONG Capacity, ULONG* Count)
+{
+    PAGED_CODE();
+    if (C == NULL || Count == NULL) { return STATUS_INVALID_PARAMETER; }
+    *Count = C->DisableWriteCount;
+    if (*Count == 0) { return STATUS_NOT_FOUND; }
+    if (Writes == NULL || Capacity < *Count) { return STATUS_INVALID_PARAMETER; }
+    for (ULONG i=0;i<*Count;++i) { Writes[i]=C->DisableWrites[i]; }
     return STATUS_SUCCESS;
 }
 static NTSTATUS Sync(EPI_SMMU* C, ULONG Step)
@@ -262,11 +286,29 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
     st = Write(C, Cb, 0, 0x521); if (!NT_SUCCESS(st)) { return st; }
     C->Enabled = FALSE;
     st = Sync(C, 0x522); if (!NT_SUCCESS(st)) { return st; }
+    // Stream invalid, CB disabled, TLB sync complete: remaining config writes cannot start translation.
+    // Continue only through MMIO readback mismatches. Persistence failures still stop the sweep.
+    NTSTATUS restoreStatus = STATUS_SUCCESS;
+    C->DisableWriteCount = 0;
     for (ULONG i = 0; i < RTL_NUMBER_OF(ConfigOffsets); ++i)
     {
-        st = Write(C, ConfigOffsets[i], C->Original[i], 0x530+i, ConfigCompareMask(ConfigOffsets[i]));
-        if (!NT_SUCCESS(st)) { return st; }
+        EPI_SMMU_DISABLE_WRITE* w = &C->DisableWrites[i];
+        w->Step=0x530+i; w->Offset=ConfigOffsets[i]; w->Value=C->Original[i];
+        w->Readback=0xFFFFFFFF; w->CmpMask=ConfigCompareMask(w->Offset);
+        // Allow retained CBAR0 bits when its saved TYPE[17:16]=0 on this S1-only device; stream/CB are stopped.
+        // Still write the original and record raw readback, but do not fail this inactive TYPE=0 restoration.
+        if (w->Offset==0x1000 && (w->Value&0x00030000UL)==0) { w->CmpMask=0; }
+        BOOLEAN written=FALSE;
+        st = Write(C,w->Offset,w->Value,w->Step,w->CmpMask,&w->Readback,&written);
+        w->Status=st; w->Written=written ? 1 : 0; C->DisableWriteCount=i+1;
+        if (!NT_SUCCESS(st))
+        {
+            if (NT_SUCCESS(restoreStatus)) { restoreStatus=st; }
+            if (!written) { return restoreStatus; }
+        }
     }
+    // Any mismatch keeps the CB/stream disabled and ownership/tables pinned; do not run the final restores.
+    if (!NT_SUCCESS(restoreStatus)) { return restoreStatus; }
     st = Write(C, Cb, C->Sctlr, 0x53B); if (!NT_SUCCESS(st)) { return st; }
     st = Write(C, 0x800, C->Smr, 0x53C); if (!NT_SUCCESS(st)) { return st; }
     ReleaseHardware(C); return STATUS_SUCCESS;
