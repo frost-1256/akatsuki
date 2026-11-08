@@ -1,12 +1,10 @@
 # Akatsuki Project
 
-Akatsuki Project, 以下Akatsukiは俺がWoA移植のGPUドライバに対して殺意を感じたから作ろうと考えているフリーで多分権利的に安全なように作るAdreno用ドライバ  
-ドライバ名は何か、Epinephrineね
-以下はなんか適当にMuseに書かせたやつ、読みたかったら読んでね♡
-あと一応Claude, Codexを使用して作ってるもろバイブコーディングなので嫌な人は使わないでね♡
+~~プロプラドライバに殺意が湧いて~~ オープンソースのWindows用Adrenoドライバーを作るプロジェクト  
+Akatsuki Ephinephrineって言います、Akatsukiは特に由来無くて、EphinephrineはAdrenoの語源がAdrenalineで国際一般名がEphinephrineだから。かっこいいしね。  
 
-
-土台にあるのは、Nothing Phone (1)「spacewar」(SM7325) へ Windows 11 を移植してきた調査の蓄積と、freedreno / Turnip の公開知見です。
+大元はもれがNothing Phone (1)「spacewar」にWin11を移植しようとしたときに苦しみながらGPUドライバを動作させようとしたときのいろいろな情報から。  
+現状としては普通にまず動作させることを第一目標としているからまぁバイブコーディングだけど今後としては普通に勉強とかしてちゃんと書きたい。  
 
 ## 現在の状態（2026-11-08）
 
