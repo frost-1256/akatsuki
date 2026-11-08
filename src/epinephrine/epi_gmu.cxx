@@ -19,12 +19,13 @@
 //      HFI table, AHB fence range, CM3_CFG, chip id, log buffer, bus/cache config, inter-frame control.
 //   5. EpiSmmuEnable, then release the CM3 (SYSRESET 1, CP_RESP 0, SYSRESET 0) and poll FW_INIT_RESULT. This
 //      firmware is newer than 0x20010004, so the done value is (v & 0x1FF) == 0x100. Up to 100 ms.
-//   6. After successful FW init, start HFI and send PERF_TABLE / BW_TABLE only. Record ACKs/queue indices,
+//   6. After successful FW init, start HFI and send PERF_TABLE / BW_TABLE; bit9 adds CORE_FW_START / START.
+//      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset and check RPMh/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls and RSCC, then Unmap / Destroy / free. A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
 // Not done here (later steps): rpmh_start/stop, GPU PDC (reading it reset the phone on 2026-11-07),
-// GBIF QSB settings, CORE_FW_START / START / GX_BW_PERF_VOTE / PREPARE_SLUMBER.
+// GBIF QSB settings, GX_BW_PERF_VOTE / PREPARE_SLUMBER.
 // Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
 #ifdef EPI_GMU_HOST_TEST
@@ -249,8 +250,8 @@ struct GMU_HFI_TRACE {
     BOOLEAN Attempted, BwPublished;
     NTSTATUS Status;
     ULONG CtrlStatus;
-    GMU_HFI_MESSAGE Messages[2];
-    ULONG Queues[5][7]; // stage, then {read_index, write_index} for command/response/debug
+    GMU_HFI_MESSAGE Messages[4];
+    ULONG Queues[7][7]; // stage, then {read_index, write_index} for command/response/debug
     ULONG Power[4][6];  // stage, RPMh power, GX GDSCR, GX HM, HFI status, interrupt info
     ULONG Rscc[4][5];   // same stages as Power: stage, status0, seq_busy, control_req, control_ack
 };
@@ -378,7 +379,8 @@ static NTSTATUS GmuHfiExchange(GMU_TEST* S, HANDLE Params, ULONG* Words, ULONG C
     }
     return STATUS_IO_TIMEOUT;
 }
-static NTSTATUS GmuHfiTables(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_HFI_TRACE* T)
+static NTSTATUS GmuHfiTables(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_HFI_TRACE* T,
+                            BOOLEAN StartFirmware)
 {
     T->Attempted=TRUE;
     GmuHfiQueues(S,T,0); GmuHfiPower(S,Cc,T,0);
@@ -410,6 +412,14 @@ static NTSTATUS GmuHfiTables(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU
     bw[32]=0x40000000; bw[33]=0x40000000; bw[34]=0x40000000;
     st=GmuHfiExchange(S,Params,bw,RTL_NUMBER_OF(bw),3,2,0x720,T,&T->Messages[1]);
     T->Messages[1].Status=st; GmuHfiQueues(S,T,3);
+    if (!NT_SUCCESS(st) || !StartFirmware) { return st; }
+    ULONG coreStart[2]={}; // header, handle=0; header 0x0030020E, padded to four DWORDs
+    st=GmuHfiExchange(S,Params,coreStart,RTL_NUMBER_OF(coreStart),14,3,0x740,T,&T->Messages[2]);
+    T->Messages[2].Status=st; GmuHfiQueues(S,T,4);
+    if (!NT_SUCCESS(st)) { return st; }
+    ULONG start[1]={}; // header only: 0x0040010A, padded to four DWORDs
+    st=GmuHfiExchange(S,Params,start,RTL_NUMBER_OF(start),10,4,0x750,T,&T->Messages[3]);
+    T->Messages[3].Status=st; GmuHfiQueues(S,T,5);
     return st;
 }
 static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length)
@@ -449,7 +459,7 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 }
 
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
-                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx)
+                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
@@ -496,7 +506,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         hfi.Rscc[i][0]=i;
         for (ULONG j=1;j<RTL_NUMBER_OF(hfi.Rscc[i]);++j) { hfi.Rscc[i][j]=0xFFFFFFFF; }
     }
-    // No GPU PDC, RSCC handshake, CORE_FW_START / START / GX vote requests.
+    // No GPU PDC, RSCC handshake or GX vote requests. StartHfi opts into CORE_FW_START / START.
     // Field order is the GpuGmuSetup REG_BINARY diagnostic ABI.
     struct SETTING { ULONG Reg, Original, Value, Readback, CmpMask; } setup[] = {
         {0x23B06,0,0xFFFFFFFF,0xFFFFFFFF,0x3F}, // only six implemented IRQ mask bits
@@ -632,7 +642,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (result==EPI_GMU_E_TIMEOUT) { st=STATUS_IO_TIMEOUT; }
     if (result==EPI_GMU_OK)
     {
-        st=GmuHfiTables(s,Params,Cc,&hfi); hfi.Status=st;
+        st=GmuHfiTables(s,Params,Cc,&hfi,StartHfi); hfi.Status=st;
         GmuHfiPower(s,Cc,&hfi,1);
         GmuText(Text,TextCch,L"gmu_hfi_status",static_cast<ULONG>(st));
         if (!NT_SUCCESS(st)) { result=EPI_GMU_E_HFI; }
@@ -662,7 +672,7 @@ cleanup:
         WRITE_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET),1);
         const BOOLEAN reset=READ_REGISTER_ULONG(GmuReg(s,R_CM3_SYSRESET))==1;
         if (hfi.Attempted)
-        { GmuHfiQueues(s,&hfi,4); GmuHfiPower(s,Cc,&hfi,2); }
+        { GmuHfiQueues(s,&hfi,6); GmuHfiPower(s,Cc,&hfi,2); }
         if (!reset) { result=EPI_GMU_E_TEARDOWN; goto keep; }
         KeStallExecutionProcessor(100);
         if (hfi.BwPublished)

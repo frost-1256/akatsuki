@@ -517,7 +517,7 @@ EpiDiag の診断形式：
 
 ### 9.11.1 HFI 開始・PERF_TABLE・BW_TABLE の実装（実機未実行）
 
-`EpiGpuProbe=0x80` を拡張した。FW_INIT_RESULT の完了確認後に HFI を開始し、PERF_TABLE（id 4、seq 1、59 DWORD）と BW_TABLE（id 3、seq 2、160 DWORD）を1件ずつ送って ACK を待つ。CORE_FW_START、START、GX_BW_PERF_VOTE、PREPARE_SLUMBER、GBIF QSB 設定は追加していない。キュー ABI の照合元は [本家 a6xx_hfi.h](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.h) と [a6xx_hfi.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.c)（事実のみ、コードの取り込みなし）。
+`EpiGpuProbe=0x80` を拡張した。FW_INIT_RESULT の完了確認後に HFI を開始し、PERF_TABLE（id 4、seq 1、59 DWORD）と BW_TABLE（id 3、seq 2、160 DWORD）を1件ずつ送って ACK を待つ。`0x80` 単独ではここまで。CORE_FW_START と START は追加の bit9 を指定した `0x280` で送る（§9.11.2）。GX_BW_PERF_VOTE、PREPARE_SLUMBER、GBIF QSB 設定は追加していない。キュー ABI の照合元は [本家 a6xx_hfi.h](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.h) と [a6xx_hfi.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_hfi.c)（事実のみ、コードの取り込みなし）。
 
 - PERF_TABLE は GX が off / 315000 / 450000 kHz の3段、CX が off / 200000 kHz の2段。投票値は上記の実測 cmd-db に基づく固定値。BW_TABLE は上記7c3固定値を使う。両メッセージとも未使用の投票・アドレス・データは0、GX の ACD は0xFFFFFFFF。
 - HFI_CTRL_INIT=1 の後、HFI_CTRL_STATUS bit0 を100 µs間隔で最大10 ms待つ。共有 RAM は volatile とメモリバリアで読み書きし、4 DWORDへのパディングを含む空きを確認してからコマンドを公開する。キュー位置・サイズ・index・メッセージ長を検証し、破損時は読み進めない。
@@ -528,16 +528,16 @@ EpiDiag の追加診断（REG_BINARY は little endian）：
 
 | 値 | 内容 |
 |---|---|
-| `GpuGmuHfiStatus`（REG_DWORD） | HFI 開始と2件の交換の NTSTATUS。0は両 ACK 成功、STATUS_NOT_FOUNDは未到達。`GpuGmuStatus=10` は HFI 試験失敗。teardown 失敗で status 8 になってもこの値は保持する |
+| `GpuGmuHfiStatus`（REG_DWORD） | HFI 開始と指定された全メッセージの交換の NTSTATUS。0は全 ACK 成功、STATUS_NOT_FOUNDは未到達。`GpuGmuStatus=10` は HFI 試験失敗。teardown 失敗で status 8 になってもこの値は保持する |
 | `GpuGmuHfiCtrlStatus`（REG_DWORD） | 開始待ちで最後に読んだ HFI_CTRL_STATUS。未読は0xFFFFFFFF |
 | `GpuGmuHfiBwPublished`（REG_DWORD） | BW_TABLE の write_index を公開したら1 |
 | `GpuGmuHfiIdleStatus`（REG_DWORD） | BW公開後、reset後の停止状態確認の NTSTATUS。0は上記条件を観測、STATUS_IO_TIMEOUTは未確認、STATUS_NOT_FOUNDは未試行 |
-| `GpuGmuHfiMessages`（REG_BINARY） | PERF、BWの順で各148バイト、合計296バイト。各37 DWORD：`{SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}`。応答は `{header, ret_header, error, payload[最大16]}`。Skipped はFWエラー通知も含む読み飛ばし件数。LastSkippedDwords は最後に読み飛ばしたパケットの全長（DWORD数）、LastSkipped は先頭最大8 DWORD（短い場合の残りは0）。未送信の NtStatus は STATUS_NOT_FOUND。AckDwords=0は未取得。サイズ不正時は申告された長さと先頭headerを残す場合があるため、NtStatus・AckDwordsを併読する |
-| `GpuGmuHfiQueues`（REG_BINARY） | 5レコード×28バイト＝140バイト。各 `{Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}`。Stage 0=開始前、1=HFI ready、2=PERF交換終了、3=BW交換終了、4=CM3 reset直後。デバッグキューは消費しない |
+| `GpuGmuHfiMessages`（REG_BINARY） | PERF、BW、CORE_FW_START、STARTの順で各148バイト、合計592バイト。各37 DWORD：`{SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}`。応答は `{header, ret_header, error, payload[最大16]}`。Skipped はFWエラー通知も含む読み飛ばし件数。LastSkippedDwords は最後に読み飛ばしたパケットの全長（DWORD数）、LastSkipped は先頭最大8 DWORD（短い場合の残りは0）。未送信の NtStatus は STATUS_NOT_FOUND。AckDwords=0は未取得。サイズ不正時は申告された長さと先頭headerを残す場合があるため、NtStatus・AckDwordsを併読する |
+| `GpuGmuHfiQueues`（REG_BINARY） | 7レコード×28バイト＝196バイト。各 `{Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}`。Stage 0=開始前、1=HFI ready、2=PERF交換終了、3=BW交換終了、4=CORE_FW_START交換終了、5=START交換終了、6=CM3 reset直後。デバッグキューは消費しない |
 | `GpuGmuHfiPower`（REG_BINARY） | 4レコード×24バイト＝96バイト。各 `{Stage, RpmhPowerState, GxGdscr, GxHm, HfiCtrlStatus, Gmu2HostIntrInfo}`。Stage 0=開始前、1=HFI試験終了、2=CM3 reset後（BW公開時は停止待ちの後）、3=GMU/RSCC設定復元後 |
 | `GpuGmuHfiRscc`（REG_BINARY） | 4レコード×20バイト＝80バイト。各 `{Stage, Status0, SeqBusy, ControlReq, ControlAck}`。Stage は Power と同じ。Status0 は RSCC dword 0x004、SeqBusy は0x101、ControlReq/ControlAck は GMU 側0x23B07/0x23B08。未取得フィールドは0xFFFFFFFF |
 
-キュー・電源の未取得フィールドは0xFFFFFFFF。FW起動に失敗して HFI 未到達なら HFI バイナリ診断は空。`GpuGmuStatus=0` は FW起動・2件の ACK・後始末の成功を意味する。`GpuGmuHfiStatus=0` だけでは後始末の成功を意味しないため、`GpuGmuStatus`、`GpuGmuKeepCx`、`GpuCxStatus` を併読する。`GpuCxText` には `gmu_hfi_status` も追記する。
+キュー・電源の未取得フィールドは0xFFFFFFFF。FW起動に失敗して HFI 未到達なら HFI バイナリ診断は空。`GpuGmuStatus=0` は FW起動・指定された全メッセージの ACK・後始末の成功を意味する。`GpuGmuHfiStatus=0` だけでは後始末の成功を意味しないため、`GpuGmuStatus`、`GpuGmuKeepCx`、`GpuCxStatus` を併読する。`GpuCxText` には `gmu_hfi_status` も追記する。
 
 ブレッドクラム：`0x700`=開始前のMSGQクリア、`0x701`=HFI_CTRL_INIT、`0x702`=ready待ち、`0x710/720`=PERF/BWキュー書き込み、`0x711/721`=doorbell、`0x712/722`=ACK待ち、`0x713/723`=応答割り込みクリア、`0x730`=reset後の停止確認。書き込み・doorbell・割り込みクリアの前に保存とflushを確認する。テスト用 shim には最小限のHFI応答を追加したが、今回テスト・ビルド・署名・配置・実機実行は行っていない。
 
@@ -566,6 +566,44 @@ EpiDiag の追加診断（REG_BINARY は little endian）：
 - ファームウェアの ACK の header は `(ファームウェア側の seq << 20) | (1 << 16) | (3 << 8) | 元のコマンドの id`。seq は 0 から数える。2 dword 目は送った header の写し、3 dword 目は error。
 - BW_TABLE を受け取っても、RSCC のシーケンサは動かなかった。
 - 次は CORE_FW_START（id 14）と START（id 10）。GX の投票はまだ入れない。
+
+### 9.11.2 CORE_FW_START / START の追加試験
+
+`EpiGpuProbe` の bit9（0x200）を追加した。`0x280 = 0x80 | 0x200` のときだけ、BW_TABLE の応答成功後に CORE_FW_START、START を順に送る。`0x80` は PERF/BW までの従来動作を維持する。bit9 単独は `GpuProbeStatus=6` としてハードウェアアクセス前に拒否する。bit9 使用時はワンショット解除・flush の成功を確認してから進み、保存に失敗した場合は `GpuProbeStatus=7` で止める。
+
+| メッセージ | id | seq | DWORD数 | 内容 | 送信header | ブレッドクラム |
+|---|---|---|---|---|---|---|
+| CORE_FW_START | 14 | 3 | 2 | header、handle=0 | 0x0030020E | 0x740=キュー書き込み、0x741=doorbell、0x742=応答待ち、0x743=割り込みクリア |
+| START | 10 | 4 | 1 | headerのみ | 0x0040010A | 0x750=キュー書き込み、0x751=doorbell、0x752=応答待ち、0x753=割り込みクリア |
+
+どちらも既存の `GmuHfiExchange()` を使い、4 DWORD境界まで0xFAFAFAFAで埋める。失敗した場合は後続を送らず、状態・ログを採取して既存の後始末へ進む。FW側の応答headerは予測値を条件にせず、従来どおり ret_header の一致と error=0で成功を判定する。
+
+HFI 到達時の診断サイズは `0x80` / `0x280` ともに Messages が592バイト、Queues が196バイト。`0x80` の追加2メッセージは NtStatus=STATUS_NOT_FOUND、Queue stage 4/5は未取得（0xFFFFFFFF）。CM3 reset 後のキューは両モードとも stage 6に記録する。Power / Rscc の形式は維持し、stage 1は指定されたHFI試験全体の終了後、stage 2はreset・停止確認後となる。
+
+実機ではコマンドキュー index が 0xDC→0xE0→0xE4 と進むか、応答・デバッグキューに自発メッセージが増えるか、GX GDSC と RPMH_POWER_STATE、GMUログの変化を確認する。START が GX の電源状態を変えるかは未確認 [U]。GX_BW_PERF_VOTE は送らず、後始末は従来どおり CM3 reset、RSCC/GXの停止確認、SMMU Disable、GMU/RSCC復元を使う。条件不成立なら status 8 / KeepCx=1となる。今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat、Epinephrine v40 / 20.0.2.40、`EpiGpuProbe=0x280`）：4 つのメッセージすべてに ACK（error 0）** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuStatus` / `GpuGmuHfiStatus` / `GpuGmuHfiIdleStatus` | 0 / 0 / 0 |
+| `GpuGmuKeepCx` / `GpuCxStatus` / `GpuProbeStatus` | 0 / 0 / 0 |
+| CORE_FW_START（送信 0x0030020E） | ACK {0x0021030E, 0x0030020E, 0} |
+| START（送信 0x0040010A） | ACK {0x0031030A, 0x0040010A, 0} |
+| コマンドキュー r/w | 0xDC → 0xE0 → 0xE4（どちらも 4 dword ずつ） |
+| 応答キュー r/w | 0x8 → 0xC → 0x10（ACK の分だけ） |
+| デバッグキュー r/w | 0 / 0 のまま |
+| GX GDSCR / GX HM | 0x00222001 / 0xC0（OFF のまま、全 stage） |
+| `RPMH_POWER_STATE` | 0（stage 0〜3） |
+| RSCC `SEQ_BUSY` / `REQ` / `ACK` | 最初から最後まで 0 |
+| SMMU `FSR` | 0x400（fault なし） |
+
+- ACK の header は予想どおり `(ファームウェア側の seq << 20) | (1 << 16) | (3 << 8) | id`。自発的なメッセージは届かず、読み飛ばしも 0 件。
+- GMU のログ（19.2 MHz とすると）：
+  - CORE_FW_START を受けたあと（0x21, 2, 0x0030020E）、0x23 の記録が 5 件（番号 4、5、6、0x12、7、値はどれも 0xDEADBA55）と、新しい ID 0x30 の記録（番号 0、値 0x7476A2A1）が 1 件。そのあと ACK（0x21, 3, 0x0021030E）。受信から ACK まで約 0.7 ms。0x23 の続き番号は起動時の 1〜3、0x3A に続くもので、CORE_FW_START で残りの初期化が進んだと見られる [U]。0x30 の値の意味は不明 [U]。
+  - START を受けたあと（0x21, 2, 0x0040010A）、ID 0x1E の記録（番号 0、値 0）が 1 件。そのあと ACK（0x21, 3, 0x0031030A）。
+- START を受けても、ファームウェアは GX の電源を入れにいかず、RSCC のシーケンサも動かなかった。後片付けはすべて成功した。
+- 次の候補：GX の投票（`GX_BW_PERF_VOTE`、id 30）。その前に、GX GDSC を入れるための準備（GBIF QSB の設定、GMU のクロック、止めるときの `PREPARE_SLUMBER`／OOB）を調べる。
 
 ## 参照
 
