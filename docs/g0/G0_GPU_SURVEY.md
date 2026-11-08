@@ -532,8 +532,8 @@ EpiDiag の追加診断（REG_BINARY は little endian）：
 | `GpuGmuHfiCtrlStatus`（REG_DWORD） | 開始待ちで最後に読んだ HFI_CTRL_STATUS。未読は0xFFFFFFFF |
 | `GpuGmuHfiBwPublished`（REG_DWORD） | BW_TABLE の write_index を公開したら1 |
 | `GpuGmuHfiIdleStatus`（REG_DWORD） | BW公開後、reset後の停止状態確認の NTSTATUS。0は上記条件を観測、STATUS_IO_TIMEOUTは未確認、STATUS_NOT_FOUNDは未試行 |
-| `GpuGmuHfiMessages`（REG_BINARY） | PERF、BW、CORE_FW_START、START、GX_BW_PERF_VOTEの順で各148バイト、合計740バイト。各37 DWORD：`{SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}`。応答は `{header, ret_header, error, payload[最大16]}`。Skipped はFWエラー通知も含む読み飛ばし件数。LastSkippedDwords は最後に読み飛ばしたパケットの全長（DWORD数）、LastSkipped は先頭最大8 DWORD（短い場合の残りは0）。未送信の NtStatus は STATUS_NOT_FOUND。AckDwords=0は未取得。サイズ不正時は申告された長さと先頭headerを残す場合があるため、NtStatus・AckDwordsを併読する |
-| `GpuGmuHfiQueues`（REG_BINARY） | 8レコード×28バイト＝224バイト。各 `{Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}`。Stage 0=開始前、1=HFI ready、2=PERF交換終了、3=BW交換終了、4=CORE_FW_START交換終了、5=START交換終了、6=VOTE交換終了、7=CM3 reset直後。デバッグキューは消費しない |
+| `GpuGmuHfiMessages`（REG_BINARY） | PERF、BW、CORE_FW_START、START、GX_BW_PERF_VOTE、PREPARE_SLUMBERの順で各148バイト、合計888バイト。各37 DWORD：`{SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}`。応答は `{header, ret_header, error, payload[最大16]}`。Skipped はFWエラー通知も含む読み飛ばし件数。LastSkippedDwords は最後に読み飛ばしたパケットの全長（DWORD数）、LastSkipped は先頭最大8 DWORD（短い場合の残りは0）。未送信の NtStatus は STATUS_NOT_FOUND。AckDwords=0は未取得。サイズ不正時は申告された長さと先頭headerを残す場合があるため、NtStatus・AckDwordsを併読する |
+| `GpuGmuHfiQueues`（REG_BINARY） | 9レコード×28バイト＝252バイト。各 `{Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}`。Stage 0=開始前、1=HFI ready、2=PERF交換終了、3=BW交換終了、4=CORE_FW_START交換終了、5=START交換終了、6=VOTE交換終了、7=slumber/BUSY/キュー確認後、8=CM3 reset直後。デバッグキューは消費しない |
 | `GpuGmuHfiPower`（REG_BINARY） | 4レコード×24バイト＝96バイト。各 `{Stage, RpmhPowerState, GxGdscr, GxHm, HfiCtrlStatus, Gmu2HostIntrInfo}`。Stage 0=開始前、1=HFI試験終了、2=CM3 reset後（BW公開時は停止待ちの後）、3=GMU/RSCC設定復元後 |
 | `GpuGmuHfiRscc`（REG_BINARY） | 4レコード×20バイト＝80バイト。各 `{Stage, Status0, SeqBusy, ControlReq, ControlAck}`。Stage は Power と同じ。Status0 は RSCC dword 0x004、SeqBusy は0x101、ControlReq/ControlAck は GMU 側0x23B07/0x23B08。未取得フィールドは0xFFFFFFFF |
 
@@ -578,7 +578,7 @@ EpiDiag の追加診断（REG_BINARY は little endian）：
 
 どちらも既存の `GmuHfiExchange()` を使い、4 DWORD境界まで0xFAFAFAFAで埋める。失敗した場合は後続を送らず、状態・ログを採取して既存の後始末へ進む。FW側の応答headerは予測値を条件にせず、従来どおり ret_header の一致と error=0で成功を判定する。
 
-HFI 到達時の診断サイズは、現在は全モードとも Messages が740バイト、Queues が224バイト（§9.12.1 の VOTE 追加で拡張）。`0x80` の追加3メッセージ、`0x280` のVOTEは NtStatus=STATUS_NOT_FOUND、対応する Queue stage は未取得（0xFFFFFFFF）。CM3 reset 後のキューは stage 7に記録する。Power / Rscc の形式は維持し、stage 1は指定されたHFI試験全体の終了後、stage 2はreset・停止確認後となる。v40 の実測時点では592バイト・196バイトで、reset は stage 6だった。
+HFI 到達時の診断サイズは、現在は全モードとも Messages が888バイト、Queues が252バイト（§9.13.1 のSLUMBER追加で拡張）。指定されないメッセージは NtStatus=STATUS_NOT_FOUND、対応する Queue stage は未取得（0xFFFFFFFF）。CM3 reset 後のキューは stage 8に記録する。Power / Rscc の形式は維持し、stage 1は指定された試験全体の終了後（0x1E80はslumber後）、stage 2はreset・停止確認後となる。v40 の実測時点では592バイト・196バイトで、reset は stage 6だった。
 
 実機ではコマンドキュー index が 0xDC→0xE0→0xE4 と進むか、応答・デバッグキューに自発メッセージが増えるか、GX GDSC と RPMH_POWER_STATE、GMUログの変化を確認する。START が GX の電源状態を変えるかは未確認 [U]。GX_BW_PERF_VOTE は送らず、後始末は従来どおり CM3 reset、RSCC/GXの停止確認、SMMU Disable、GMU/RSCC復元を使う。条件不成立なら status 8 / KeepCx=1となる。今回テスト・ビルド・署名・配置・実機実行は行っていない。
 
@@ -762,6 +762,141 @@ bit11（0x800）を追加し、`EpiGpuProbe=0xE80 = 0x80 | 0x200 | 0x400 | 0x800
 - VOTE の処理中のログの記録は、v41 の約 50 件から約 25 件に減った。v41 では同じ並び（0x23 の 0x0A／0x15C／0x10B、0x25、0x26 など）が 2 回出ていた。何かを待つ繰り返しの回数が減ったと見られる [U]。
 - GCC の共有レジスタへの書き込みで、ほかのビットは変わらなかった。Windows の GCC ドライバとぶつかった様子もない。
 - これで §9.12 の 7 の 1〜3 が終わった。残りは 4（OOB の GPU_SET で GX を入れ、slumber で止める）。
+
+### 9.13 GX を初めて入れる手順と止め方（本家 Linux、A635 = 7c3、非 legacy）
+
+事実の出典は本家 Linux の `a6xx_gmu.c`、`a6xx_gpu.c`、`a6xx_hfi.c/.h`、`a6xx_gmu.xml`、`a6xx.xml`、`gpucc-sc7280.c`、`kodiak.dtsi`。行番号は手元の参照コピーのもの。コードは持ち込まない。
+
+**1. GX を入れるのは GMU のファームウェア** [P]
+- `gpucc-sc7280.c` の `gx_gdsc`（GDSCR 0x100C、CLAMP_IO 0x1508）の `power_on` は `gdsc_gx_do_nothing_enable`。CPU 側は GX GDSC を操作しない。GMU の DT ノードは `power-domains = cx, gx` だが、`gx` は復旧のときにしか使わない（§9.12 の 1）。
+- GX の電源レール（RPMh の gfx.lvl）への投票も GMU が RSCC の TCS を通して行う。Linux が CPU から GX のレールに投票することはない。
+- **未確認の前提** [U]：Linux は `a6xx_gmu_rpmh_init` で GPU PDC に `PDC_GPU_SEQ_START_ADDR=0`、`PDC_GPU_ENABLE_PDC=0x80000001` を書く（§9.10）。この電話では PDC を読むだけでリセットするので書けない。PDC が有効になっていなければ、TCS の投票が RPMh に届かず、GX のレールが上がらないおそれがある。今の電話の PDC の状態はわからない。OOB の ACK が来ない、または GMU のログにエラーが出るなら、これが第一の候補。
+
+**2. GX が入ったかどうかの見分け方** [P]
+- `a6xx_gmu_gx_is_on`（95 行）：`GMU_SPTPRAC_PWR_CLK_STATUS`（0x1F8D0）の bit6（GX_HM_GDSC_POWER_OFF）と bit7（GX_HM_CLK_OFF）がどちらも 0 なら ON。今の安全策（`0x1F8D0 & 0xC0 == 0xC0` を OFF とする）と同じビット。
+- あわせて GPU_CC の GX GDSCR（0x100C）の bit31（PWR_ON）も見る。v40〜v42 では 0x00222001（OFF）。
+
+**3. OOB の GPU_SET（非 legacy）**（364〜492 行）[P]
+- 要求：`HOST2GMU_INTR_SET`（0x1F994）に bit30 を書く。
+- 応答：`GMU2HOST_INTR_INFO`（0x1F992）の bit31 を待つ（100 µs 間隔、最大 10 ms）。そのあと `GMU2HOST_INTR_CLR`（0x1F991）に bit31 を書く。時間切れでも CLR は書く。
+- 解除：`HOST2GMU_INTR_SET` に bit31 を書く。解除には応答を待たない。
+- Linux はこの間（`hw_init`）に GX 側のレジスタ（RBBM、CP など）を設定する。**最初の試験では GX 側のレジスタには触らず、入ったことを確かめるだけにする**のが安全 [I]。
+- 7c3 のアイドル状態は ACTIVE（§9.12 の 3）なので、OOB を解除しても GMU は自分から GX を落とさない [I]。落とすのは PREPARE_SLUMBER。
+
+**4. 止め方（`a6xx_gmu_shutdown`、1427 行。OOB を済ませた場合）** [P]
+1. `wait_for_idle`：`RPMH_POWER_STATE`（0x1F8EC）が 0（ACTIVE）になるまで待つ。
+2. `bus_halt`（a6xx_gpu.c 2083 行、`gx_off = false`）：
+   - `GBIF_HALT`（GPU の dword 0x3C45）= 1（クライアントの停止）→ `GBIF_HALT_ACK`（0x3C46）の bit0 を待つ。
+   - `GBIF_HALT` = 2（AXI の停止）→ `GBIF_HALT_ACK` の bit1 を待つ。
+   - `GBIF_HALT` = 0（明示的に戻す必要がある）。
+   - Linux の `spin_until` は時間の上限が長い。こちらでは上限を決めて待つ [I]。
+   - `RBBM_GBIF_HALT`（0x0016／ACK 0x0017）は GX 側のレジスタで、GPU が固まったとき（`gx_off = true`）にしか使わない。
+3. `notify_slumber`（577 行）：
+   - `POWER_COUNTER_ENABLE`（0x1F840）= 0。
+   - SPTP の無効化は legacy だけ（`a6xx_sptprac_disable` は非 legacy ではすぐ戻る、525 行）。
+   - `PREPARE_SLUMBER`（id 33）：3 dword `{header, bw = 0, freq = 0}`。今の順番なら seq 6、header は `(6 << 20) | (3 << 8) | 33` = 0x00600321。
+   - `AO_AHB_FENCE_CTRL`（0x23B10）= 0。
+   - 7c3 は `CX_FALNEXT_INTF`（0x1F8F1）= 1（GEMNoC の対策）。
+4. `AO_GPU_CX_BUSY_STATUS`（0x23B0C）の bit23 が 0 になるのを待つ（100 µs 間隔、最大 10 ms）。失敗してもエラーを出すだけで先に進む。
+5. HFI を止める（キューが空かを確かめるだけ）。割り込みのマスク（0x23B06、0x1F993）を全部立てる。
+6. `CM3_SYSRESET` = 1。
+7. `rpmh_stop`（648 行）：`RSCC_CONTROL_REQ`（0x23B07）= 1 → RSCC の `RSC_STATUS0_DRV0`（dword 0x004）の bit16 を待つ（100 µs 間隔、最大 10 ms）→ REQ = 0。RSCC だけで、PDC には触らない。今の後片付けにはまだない。
+
+**5. うまくいかないとき（`a6xx_gmu_force_off`、1139 行）** [P]
+- 順番：`PWR_COL_KEEPALIVE`（0x1F8C3）= 0 → HFI を止める → 割り込みを止める → SPTP（非 legacy では何もしない）→ `CX_FALNEXT_INTF` = 1 → `rpmh_off`（TCS0〜3 の STATUS の bit0 を待つ）→ `AHB_FENCE_STATUS_CLR`（0x23B14）= 7、`AO_AHB_FENCE_CTRL` = 0 → `CM3_SYSRESET` = 1 → `bus_halt(gx_off = true)` → GPU のソフトリセット（`RBBM_SW_RESET_CMD` 0x0043 に 1、100 µs 以上待つ）→ `rpmh_stop`。
+- `bus_halt(true)` とソフトリセットは GX 側のレジスタに触る。GX の状態がわからないときに触ると、バスが固まるおそれがある [U]。最初の試験では、GX が OFF に戻らなかったら force_off をせず、今の KeepCx（CX とすべてを残す）で止めるのが安全 [I]。電話を再起動すれば元に戻る。
+
+**6. 試験の組み立て（案）**
+- `0xE80` に新しいビット（例：bit12 = 0x1000、合計 `0x1E80`）を足す。VOTE の ACK のあとに次の順で行う。
+  1. 記録：GX GDSCR、0x1F8D0、`RPMH_POWER_STATE`、TCS0〜3、RSCC `SEQ_BUSY`、GPU_CC の PLL0 の MODE（0x000、読むだけ）。
+  2. OOB の GPU_SET を送り、ACK を待つ。待ちの回数を記録する。
+  3. 記録（同じ項目）。GX が ON になったか、TCS が動いたか、PLL0 が動いたか。
+  4. OOB を解除する。
+  5. 4 の止め方：idle 待ち → GBIF の halt → PREPARE_SLUMBER → BUSY 待ち → HFI を止める → CM3 の reset → `rpmh_stop`。
+  6. 記録。そのあと今のアイドル確認（GX OFF、RSCC idle）。条件が合わなければ KeepCx。
+- OOB の ACK が来なかった場合も、解除を書き、PREPARE_SLUMBER を試してから CM3 の reset に進む。GX が OFF のままなら、今の後片付けで終われる。
+- GMU のログ（0x1000 バイト）は記録が増えるので、足りなくなるかもしれない。2 ページ目まで読むとよい [I]。
+- GMU を扱うコードはユーザーが書く。
+
+### 9.13.1 OOB GPU_SET・slumber・rpmh_stop 試験の実装と結果
+
+bit12 `EPI_GMU_PROBE_GX_ON=0x1000` を追加した。`EpiGpuProbe=0x1E80`（bit7/9/10/11/12）のみ、HFI 5通の成功後に OOB GPU_SET と解除、PREPARE_SLUMBER を実行し、CM3 reset 後に rpmh_stop を行う。bit12に前提の4ビットが伴わない指定はハードウェアアクセス前に `GpuProbeStatus=6` で拒否する。bit12もワンショット解除とflush確認の対象。既存モードはOOB/slumber/rpmh_stopを実行しない。
+
+- OOB要求前に古いbit31のACKを消す。HOST2GMU_INTR_SETへbit30を書いたらAttempted=1とし、INFO bit31を100 µs×100まで待つ。ACKの有無にかかわらずCLR bit31と解除（HOST2GMU_INTR_SET bit31）を必ず書く。
+- OOBを送った場合は、結果にかかわらずslumber手順を試す。ACTIVE待ち→GBIF HALT=1 / ACK bit0待ち→HALT=2 / ACK bit1待ち→HALT=0→POWER_COUNTER_ENABLE=0→PREPARE_SLUMBER→AO_AHB_FENCE_CTRL=0 / CX_FALNEXT_INTF=1→CX_BUSY bit23の解除待ち→コマンド/応答キューの空確認。HALT各段は10 µs×1000、ACTIVE/BUSYは100 µs×100まで。HALTとBUSYの時間切れでも後続へ進む。HALT=0は必ず書く。
+- PREPARE_SLUMBER は既存GmuHfiExchangeで id=33、seq=6、3 DWORD `{header,0,0}`、header=0x00600321。最初のHFI 5通が失敗した場合はOOBもslumberも実行しない。slumberの失敗時も残りの停止処理とログ採取を続ける。
+- CM3 resetの成功確認後にREQ=1、RSCC STATUS0 bit16を100 µs×100まで待ち、成否にかかわらずREQ=0へ戻す。rpmh_stopの失敗は記録し、最終判断は既存のidle確認（CM3 reset、GX OFF、RSCC SEQ_BUSY/REQ/ACK=0）に任せる。この条件は変更しない。
+- POWER_COUNTER_ENABLEの元値を保存し、0以外ならGMU setupを復元する箇所で書き戻して比較する。元値0なら追加の復元書き込みはしない。復元失敗はstatus 8 / KeepCx。ログ領域は既存の0x4000バイトで足りるため確保量は変えず、全モードの `GpuGmuLog` 採取量を0x2000へ拡張した。0x1E80ではslumber後・reset前にログを取る。
+- OOB要求後のACKクリア・解除、HALT=0、REQ=0はブレッドクラム保存が失敗しても実行する。最初の保存失敗をBreadcrumbStatusに記録する。OOB/slumber中の保存失敗はstatus 13の対象に含める。reset後のrpmh_stopの成否は記録のみとし、idle確認の扱いを維持する。
+
+`GpuGmuGx`（REG_BINARY、little endian、340バイト）：先頭25 DWORDと、続く `Snap[5][12]`（60 DWORD、240バイト）。0x1E80でcleanupとkeepの両経路から保存する。OOB未到達でも要求モードの記録を残し、他モードでは空データ。
+
+先頭25 DWORDの順序は次のとおり：
+
+`{Attempted, OobStatus, OobPolls, OobInfo, HaltStatus, HaltPolls[2], HaltAck[2], SlumberStatus, BusyStatus, BusyPolls, PowerCounterOriginal, QueueEmpty[2], RpmhStopStatus, RpmhStopPolls, IdleStatus, IdlePolls, IdleLast, BusyLast, RpmhStopLast, BreadcrumbStatus, PowerCounterSaved, PowerCounterRestoreStatus}`。
+
+StatusはNTSTATUSで、未試行はSTATUS_NOT_FOUND（BreadcrumbStatusは保存失敗なしなら0）。未読値・未試行のPolls・QueueEmptyは0xFFFFFFFF。Attempted/PowerCounterSavedは0/1、QueueEmptyは取得済みなら0/1。IdleStatus/Polls/Lastはslumber前のACTIVE待ち、BusyLastとRpmhStopLastは各待ちの最後の値。Pollsは待ち回数で、OOB/ACTIVE/BUSY/rpmh_stopは100 µs単位、HALTだけ10 µs単位。PowerCounterRestoreStatusは元値0または未保存なら未試行のまま。
+
+Snapの各行は `{Stage, GxGdscr, GxHm, RpmhPower, Tcs0, Tcs1, Tcs2, Tcs3, SeqBusy, Status0, CxBusy, Pll0Mode}`。Stage 0=OOB前、1=ACK待ち終了・解除前、2=解除/slumber後・CM3 reset前、3=reset/rpmh_stop後、4=最終idle確認後（KeepCxへ進む場合も採取）。段階ごとに既存のブレッドクラムを1回使い、読み取り項目ごとの更新はしない。
+
+HFIの現在の診断は全モードで Messages が6件×148＝888バイト、Queues が9段×28＝252バイト。Messages[5]がSLUMBER、Queue stage 7がslumber/BUSY/キュー確認後、stage 8がreset後。未指定メッセージのStatusはSTATUS_NOT_FOUND、未到達キューは0xFFFFFFFF。Power/Rscc/Extraの形は維持し、0x1E80のstage 1はOOB/slumberを済ませた後になる。v41/v42の740バイト・224バイト（reset stage 7）は過去の形式。
+
+| ブレッドクラム | 処理 |
+|---|---|
+| 0x7C0 | 古いACK bit31をクリア、Snap 0 |
+| 0x7C1 / 0x7C2 | OOB bit30要求 / ACK待ち（100 µs×100） |
+| 0x7C3 / 0x7C4 | ACK bit31をクリア、Snap 1 / bit31でOOB解除 |
+| 0x7D0 | ACTIVE待ち（100 µs×100）、記録のみ |
+| 0x7D1 / 0x7D2 | HALT=1 / ACK bit0待ち（10 µs×1000） |
+| 0x7D3 / 0x7D4 | HALT=2とACK bit1待ち / HALT=0（必須） |
+| 0x7D5 | POWER_COUNTER_ENABLEの保存と0設定 |
+| 0x7E0〜0x7E3 | PREPARE_SLUMBERのキュー公開、doorbell、応答待ち、割り込みクリア |
+| 0x7F0 / 0x7F1 | FENCE_CTRL=0・FALNEXT=1 / CX_BUSY bit23待ち（100 µs×100） |
+| 0x7F2 | キュー空確認、Queue stage 7、Snap 2 |
+| 0x7F4 / 0x7F5 / 0x7F6 | reset後にREQ=1 / STATUS0 bit16待ち（100 µs×100） / REQ=0（必須）、Snap 3 |
+| 0x7F3 | 既存のidle確認後にSnap 4 |
+| 0x7F8 | 元のPOWER_COUNTER_ENABLEが0以外の場合のみ復元 |
+
+待ちループ内ではブレッドクラムを書かない。設定・待ち開始・後続処理への移行時にだけ更新する。
+
+結果コード13（EPI_GMU_E_GX）はOOB/slumberに失敗したがGX OFFに戻って通常の後片付けを完了した場合。成功は0。HALT・ACTIVE・BUSYの時間切れとrpmh_stopの失敗だけでは13にせず、個別診断で確認する。どの経路でもGXがOFFに戻らない、idle確認に失敗、または後片付けに失敗した場合は8 / KeepCx=1で全資源を保持する。force_off、RBBM/CP、RBBM_GBIF_HALT、GPU PDCには触らない。
+
+shimにはOOB ACK、GBIF HALT ACK、RSCC sleep完了の応答と、OOB/slumberでのGX ON/OFFの模擬状態を追加した。今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat、Epinephrine v43 / 20.0.2.43、`EpiGpuProbe=0x1E80`）：GX の電源が初めて入り、slumber で切れた。後片付けは RSCC の SEQ_BUSY のため KeepCx** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 8 / 1 / 16 |
+| `GpuGmuHfiStatus` / `GpuGmuHfiIdleStatus` | 0 / 0xC00000B5（時間切れ） |
+| OOB | Status 0、Polls 0、INFO 0x80000000（ACK あり） |
+| GBIF HALT | ACK 0x3 / 0x3（どちらも 0 回目で成立） |
+| PREPARE_SLUMBER（送信 0x00600321） | ACK {0x00510321, 0x00600321, 0} |
+| CX_BUSY bit23 待ち | 0 回目で成立（0x30000000） |
+| キューの空確認 | コマンド・応答とも空。コマンド r/w = 0xEC、応答 r/w = 0x18 |
+| rpmh_stop | Status 0、Polls 0、STATUS0 = 0x01010006 |
+| POWER_COUNTER_ENABLE の元値 | 0（復元なし） |
+| SMMU `FSR` | 0x400（fault なし） |
+| BreadcrumbStatus | 0 |
+
+Snap（`GxGdscr`、`GxHm`=0x1F8D0、`RpmhPower`、TCS0〜3、`SeqBusy`、`Status0`、`CxBusy`、`Pll0Mode`）：
+
+| Stage | GxGdscr | GxHm | RpmhPower | TCS0〜3 | SeqBusy | Status0 | CxBusy | Pll0Mode |
+|---|---|---|---|---|---|---|---|---|
+| 0 OOB 前 | 0x00222001 | 0xC0 | 0 | 1/1/1/1 | 0 | 0x01000000 | 0x30000000 | 0xD8000005 |
+| 1 ACK 後 | **0xF8222800** | **0** | 0 | 1/1/1/1 | 0 | 0x01000000 | 0x30000000 | 0xD8000005 |
+| 2 slumber 後 | 0x00222801 | 0xC0 | **0xF** | 1/1/1/1 | 0 | 0x01000000 | 0x30000000 | 0x08000004 |
+| 3 reset・rpmh_stop 後 | 0x00222801 | 0xC0 | 0xF | 1/1/1/1 | **1** | **0x01010006** | 0x71000000 | 0x08000004 |
+| 4 idle 確認後 | 0x00222801 | 0xC0 | 0xF | 1/1/1/1 | 1 | 0x01010006 | 0x71000000 | 0x08000004 |
+
+- **GX が ON になった**：OOB GPU_SET の ACK のあと、GX GDSCR の bit31（PWR_ON）が立ち、SW_COLLAPSE（bit0）が 0、0x1F8D0 の bit6/7 が 0。`GX_BW_PERF_VOTE` だけ（Stage 0）では GX は OFF のままで、OOB で入った。
+- **slumber で GX が OFF に戻った**：GDSCR 0x00222801、0x1F8D0 = 0xC0、`RPMH_POWER_STATE` = 0xF（SLUMBER）。GPU_CC PLL0 の MODE も 0xD8000005 から 0x08000004 に変わった。PLL0 は OOB 前から動いていた。VOTE のときにファームウェアが起こしたと見られる [U]。
+- TCS0〜3 は全段で idle（1）。投票の途中を捉えていないだけかもしれない [U]。GPU PDC に触れずに GX が入ったので、gfx レールの投票は AOP 側の PDC などで届いていると見られる [I]。
+- **KeepCx の原因**：rpmh_stop のあと、RSCC の `SEQ_BUSY` が 1、STATUS0 が 0x01010006 のまま。既存の idle 確認は SEQ_BUSY=0 を求めるため、10 ms で時間切れになった。本家 Linux の `a6xx_rpmh_stop`（a6xx_gmu.c 650 行）は STATUS0 bit16 だけを待ち、REQ=0 に戻して `PDC_SLEEP` の印を付ける。SEQ_BUSY が 0 になるのを待つのは、次に起こすときの `a6xx_rpmh_start`（620 行：REQ=bit1 → ACK bit1 → SEQ_BUSY=0 → REQ=0）。したがって、rpmh_stop のあとに SEQ_BUSY=1 なのは RSC の sleep 状態と見られる [I]。
+- CX_BUSY は Stage 3 で 0x71000000 に変わった（bit24 と bit30 が増えた）。意味はまだ調べていない [U]。
+- ファームウェアのログ（0x2000 バイト）：VOTE の受信（0x0080B788）の直後に種類 0x05、0x24、0x25、0x11、0x26 の記録がある。OOB は約 6.7 ms 後（0x0082B637〜）、PREPARE_SLUMBER は 0x008884C6 に受信し、種類 0x07 の記録のあと 0x00510321 で ACK した。
+- 後片付けは KeepCx で止まったので、SMMU の disable、クロック・GBIF・RSCC・setup の復元は実行していない（各 RestoreStatus は 0xC0000225）。CX は ON のまま、CM3 は reset のまま、RSCC は sleep 状態。
+- 次：rpmh_stop のあとの idle 確認を Linux に合わせて変える案（STATUS0 bit16 が立ち、REQ=0、GX OFF、CM3 reset なら SEQ_BUSY=1 を許す）。次の起動の前に rpmh_start の手順を入れるかどうかも決める。試験の前に電話を再起動し、RSCC と CX の状態を消しておく。
 
 ## 参照
 

@@ -43,6 +43,13 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     // Minimal firmware peer for the existing host smoke tests; no hardware access.
     if(p==gPages[1]+0x186 && v==1) gPages[1][0x180]=1;
     if(p==gPages[1]+0x191) gPages[1][0x192]&=~v;
+    if(p==gPages[1]+0x194 && v==0x40000000UL) {
+        gPages[1][0x192]|=0x80000000UL;
+        cc[0x100C/4]=(cc[0x100C/4]&~1UL)|0x80000000UL;
+        gPages[1][0xD0]=0; gPages[1][0xEC]=0;
+    }
+    if(p==gPages[6]+0x45) gPages[6][0x46]=v; // CX GBIF HALT ACK, including clear
+    if(p==gPages[2]+0x307 && v==1) gPages[5][4]|=1UL<<16; // RSCC sleep completion
     if(p==gPages[1]+0x194 && v==1 && hfiMemory) {
         ULONG* cmd=hfiMemory+6; ULONG* rsp=hfiMemory+18;
         const ULONG header=hfiMemory[0x400+cmd[10]], w=rsp[11];
@@ -50,6 +57,10 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         data[w]=(1UL<<16)|(3UL<<8)|126;
         data[(w+1)&0x3FF]=header; data[(w+2)&0x3FF]=0; data[(w+3)&0x3FF]=0xFAFAFAFA;
         cmd[10]=cmd[11]; rsp[11]=(w+4)&0x3FF; gPages[1][0x192]|=1;
+        if((header&0xFF)==33) {
+            cc[0x100C/4]=(cc[0x100C/4]&~0x80000000UL)|1;
+            gPages[1][0xD0]=0xC0; gPages[1][0xEC]=0xF;
+        }
     }
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) { diagnostics[name]=v; return 0; }

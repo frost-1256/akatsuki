@@ -8,6 +8,7 @@
 #define EPI_GMU_PROBE_HFI_START 0x200UL     // modifier: with 0x80 (0x280), add CORE_FW_START / START after PERF/BW
 #define EPI_GMU_PROBE_GX_VOTE   0x400UL     // modifier: requires 0x280 (0x680 total), add GBIF QSB / GX_BW_PERF_VOTE
 #define EPI_GMU_PROBE_CLOCK    0x800UL     // modifier: requires 0x680 (0xE80 total), GMU 200 MHz / hub 150 MHz
+#define EPI_GMU_PROBE_GX_ON    0x1000UL    // modifier: requires 0xE80 (0x1E80 total), OOB GPU_SET + slumber / rpmh_stop
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -23,6 +24,7 @@
 #define EPI_GMU_E_HFI           10          // HFI init or a requested message failed after successful FW init
 #define EPI_GMU_E_GBIF          11          // GBIF precondition/read/write/breadcrumb failed (CM3 never released)
 #define EPI_GMU_E_CLOCK         12          // clock setup failed (CM3 never released); failed restoration returns 8
+#define EPI_GMU_E_GX            13          // OOB/slumber failed, but GX returned off and teardown succeeded
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -37,12 +39,13 @@
 // GpuGmuRsccRestoreStatus (REG_DWORD): NTSTATUS of restoration, STATUS_NOT_FOUND if not attempted.
 // HFI: GpuGmuHfiStatus / GpuGmuHfiIdleStatus (REG_DWORD NTSTATUS), STATUS_NOT_FOUND if not attempted.
 // GpuGmuHfiCtrlStatus: startup HFI_CTRL_STATUS; GpuGmuHfiBwPublished: BW command was exposed to GMU.
-// GpuGmuHfiMessages (REG_BINARY): five 148-byte records (PERF, BW, CORE_FW_START, START, GX vote), 740 bytes total:
+// GpuGmuHfiMessages (REG_BINARY): six 148-byte records (PERF, BW, CORE_FW_START, START, GX vote, SLUMBER), 888 bytes total:
 // {SentHeader, NtStatus, AckDwords, Ack[19], Skipped, FwErrors, LastFwError[4], LastSkippedDwords, LastSkipped[8]}.
 // Skipped includes FW errors; LastSkipped holds up to eight leading DWORDs, with zero fill for shorter packets.
 // A response is any non-id-100 packet with >=3 DWORDs and matching ret_header seq; id 126 is not required.
-// GpuGmuHfiQueues: eight 28-byte records (224 bytes) {Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}.
-// Stages: 0 before HFI init, 1 ready, 2 after PERF, 3 after BW, 4 after CORE_FW_START, 5 after START, 6 after VOTE, 7 after reset.
+// GpuGmuHfiQueues: nine 28-byte records (252 bytes) {Stage, CmdRead, CmdWrite, RspRead, RspWrite, DebugRead, DebugWrite}.
+// Stages: 0 before HFI init, 1 ready, 2 after PERF, 3 after BW, 4 after CORE_FW_START, 5 after START, 6 after VOTE,
+// 7 after slumber/busy/queue checks, 8 after reset.
 // GpuGmuHfiPower: four 24-byte records {Stage, RpmhPower, GxGdscr, GxHm, HfiCtrlStatus, IntrInfo}.
 // Stages: 0 before HFI init, 1 after HFI trial, 2 after reset/idle wait, 3 after config restoration.
 // GpuGmuHfiRscc: four 20-byte records {Stage, Status0, SeqBusy, ControlReq, ControlAck}; same stages as Power.
@@ -64,6 +67,14 @@
 // Polls count 10-us waits (0..50); PendingPolls is the pre-restore UPDATE wait. Unread fields=0xFFFFFFFF.
 // GpuGmuClockBranches: three rows {CxGmu, HubCxInt, HubAon}, before setup / after setup / after restore (36 bytes).
 // Clock test requires original CFGs=0 (XO); an added GCC vote is retained if restoration fails.
+// GpuGmuGx (340 bytes): 25 DWORDs followed by Snap[5][12]:
+// {Attempted, OobStatus, OobPolls, OobInfo, HaltStatus, HaltPolls[2], HaltAck[2], SlumberStatus,
+// BusyStatus, BusyPolls, PowerCounterOriginal, QueueEmpty[2], RpmhStopStatus, RpmhStopPolls,
+// IdleStatus, IdlePolls, IdleLast, BusyLast, RpmhStopLast, BreadcrumbStatus, PowerCounterSaved, PowerCounterRestoreStatus}.
+// Snap rows: {Stage, GxGdscr, GxHm, RpmhPower, Tcs0, Tcs1, Tcs2, Tcs3, SeqBusy, Status0, CxBusy, Pll0Mode}.
+// Stages: 0 before OOB, 1 after OOB wait, 2 after release/slumber, 3 after reset/rpmh_stop, 4 after idle check.
+// Status fields are NTSTATUS; not-attempted statuses=STATUS_NOT_FOUND, unread values=0xFFFFFFFF.
+// BreadcrumbStatus keeps the first persistence failure. Attempted/PowerCounterSaved and QueueEmpty use 0/1.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -73,8 +84,9 @@
 // StartHfi: FALSE keeps PERF/BW-only behavior; TRUE adds CORE_FW_START then START (probe 0x280).
 // VoteGx: requires StartHfi; adds GBIF QSB before release and GX vote after START (probe 0x680).
 // FastClock: requires StartHfi/VoteGx; opt-in RCG setup/restore (probe 0xE80).
+// GxOn: requires all three modifiers; OOB then slumber before reset, rpmh_stop after reset (probe 0x1E80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
-                     BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE);
+                     BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE);
