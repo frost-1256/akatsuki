@@ -741,7 +741,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
         const ULONG gmuStatus = EpiGmuBootTest(hParams, hDiag, Cc, Fw->Data, Fw->Len,
                                                Text, EPI_GPU_TEXT_CCH, KeepCx,
                                                (Flags & EPI_GMU_PROBE_HFI_START) ? TRUE : FALSE,
-                                               (Flags & EPI_GMU_PROBE_GX_VOTE) ? TRUE : FALSE);
+                                               (Flags & EPI_GMU_PROBE_GX_VOTE) ? TRUE : FALSE,
+                                               (Flags & EPI_GMU_PROBE_CLOCK) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -828,7 +829,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 
     // GpuProbeStatus: 0 done, 1 not enabled, 2 GPU_CC not in _CRS, 3 no memory, 4 map failed,
     //                 5 GCC_GPU_CFG_AHB_CLK off (GPU_CC not read), 6 incompatible probe flags,
-    //                 7 RSCC/HFI START/GX vote one-shot persistence failed (no hardware access)
+    //                 7 RSCC/HFI modifier one-shot persistence failed (no hardware access)
     ULONG status = 0;
     ULONG n = 0;
     PULONG pairs = NULL;
@@ -850,7 +851,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit7 = G1c-3 CM3 boot/stop through SMMU (same firmware path, CX window; no PDC),
     // bit8 = independent RSCC write/read-back/restore, CM3 reset; only bits0/1 may accompany it,
     // bit9 = with bit7 (0x280), extend HFI with CORE_FW_START / START; bit9 alone is rejected,
-    // bit10 = requires bits7/9 (0x680), add GBIF QSB and GX_BW_PERF_VOTE.
+    // bit10 = requires bits7/9 (0x680), add GBIF QSB and GX_BW_PERF_VOTE,
+    // bit11 = requires bits7/9/10 (0xE80), add GMU/hub clock setup/restore.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     if (flags & EPI_RSCC_PROBE_WRITE)
@@ -865,12 +867,15 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         if (flags & ~(EPI_RSCC_PROBE_WRITE | 3UL))
         { EpiSetDword(hDiag, L"GpuRsccWStatus", 6); status = 6; goto done; }
     }
-    else if (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE))
+    else if (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE | EPI_GMU_PROBE_CLOCK))
     {
         const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
         if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
         if (!(flags & EPI_GMU_PROBE_BOOT) ||
-            ((flags & EPI_GMU_PROBE_GX_VOTE) && !(flags & EPI_GMU_PROBE_HFI_START)))
+            ((flags & EPI_GMU_PROBE_GX_VOTE) && !(flags & EPI_GMU_PROBE_HFI_START)) ||
+            ((flags & EPI_GMU_PROBE_CLOCK) &&
+             (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE)) !=
+                      (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE)))
         { status = 6; goto done; }
     }
     else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }

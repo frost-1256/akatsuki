@@ -36,6 +36,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     if(p==gPages[1] && v==1 && resetFails) return;
     *p=v;
+    if ((p==cc+0x1120/4 || p==cc+0x117C/4) && (v&1)) { *p=v&~1UL; } // RCG UPDATE self-clears
     if(p==gPages[1] && v==0 && bootCompletes) {
         gPages[1][0x1C]=0x100; gPages[1][0xEC]=0xF;
     }

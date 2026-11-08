@@ -709,6 +709,60 @@ HFI診断は全モードで Messages が5件・740バイト、Queues が8段・2
 - GMU のログ：VOTE を受けてから ACK を返すまで約 0.9 ms（19.2 MHz とする）。その間に約 50 件の記録がある。新しい ID は 0x05、0x24、0x25、0x26、0x11。0x23 の番号には 0x108、0x15C、0x15D、0x20D、0xFF00F109 などがあり、値はすべて 0xDEADBA55。0x24 の値は (0xFF000005, 0xFFFF0000) と (0xFF000001, 0xFFFFFFFF)。中身の意味は不明 [U]。ファームウェアは投票を内部で処理したが、TCS も GX も動いていないので、RPMh には何も送っていないと見られる [I]。GX が OFF の間は投票を覚えておくだけ、という Linux の使い方と合う [I]。
 - GCC の bit16（`gcc_gpu_gpll0_div_clk_src`）が立っていないので、GMU のクロックを 200 MHz にするには、先にこの投票を立てる必要がある。
 
+### 9.12.2 GMU 200 MHz / hub 150 MHz の追加試験
+
+bit11（0x800）を追加し、`EpiGpuProbe=0xE80 = 0x80 | 0x200 | 0x400 | 0x800` のときだけ、GCCのGPLL0_DIV投票とGMU/hubのRCG切り替えを実行する。bit11にbit7/9/10が伴わない指定は、ハードウェアアクセス前に `GpuProbeStatus=6` で拒否する。ワンショット解除・flushの失敗は7。`0x80` / `0x280` / `0x680` の手順・HFI診断形式は変更しない。
+
+値の出典は本家 `gpucc-sc7280.c`、`gcc-sc7280.c`、`a6xx_gmu.c` のレジスタ・周波数設定の事実のみ。コードは取り込んでいない。GMU/hubの源はどちらもsource 6（GCC GPLL0_DIV）、CFGはGMUが0x602（分周1.5）、hubが0x603（分周2）。MND modeは0。源が300 MHzなら、それぞれ200 MHz / 150 MHzとなる [I]。PLL自体、GCC bit15、HFIメッセージには変更を加えない。
+
+- 既存のRSCC・GMU設定とTCMコピーの後、SMMU Enableの直前に設定する。CM3 reset、GX GDSCとGX HMのOFF、cx_gmuブランチのCLK_OFF=0を再確認する。両RCGのCMD/CFGを保存し、試験の前提としてCFG=0（XO）かつUPDATE=0を要求する。前提不成立ならGCCにもRCGにも書かない。
+- GCC vote（物理0x00152000）の写像は、このモードだけRWとする。ブレッドクラムのflush後、書く直前に共有レジスタを読み直し、bit16が0ならそのビットだけを立てて1回書く。直後に読み戻し、bit16が立ったことと、他ビットの変化を記録して10 µs待つ。元からbit16が1なら書かず、解除対象にも含めない。
+- GMU、hubの順にCFGを書き、各CMDへ現在値にUPDATE bit0を足して書く。UPDATE直後から10 µs間隔で最大500 µs待ち、CMDのROOT_OFF=0とCFGの完全一致を確認する。UPDATEとpollの間にはレジストリflushを挟まず、待ち回数を記録する。最後に両RCGと子ブランチを再読する。成功した場合だけSMMU Enable、CM3解放、従来のHFIへ進む。
+- 後始末では、CM3 resetと既存のidle確認、SMMU Disableの成功後に、hub→GMUの順で元CFG=0へ戻す。途中で書き込みが止まったshadow CFGも復元対象に含める。設定時のUPDATEが残っている場合は先に最大500 µs待ち、終わらなければCFGを書き換えずKeepCxに進む。両RCGの復元を試みた後、XOとUPDATE完了を新しい読み取りで確認できた場合だけ、GCC bit16を解除する。
+- GCC解除でも書く直前にレジスタを読み直し、自分が立てたbit16だけをクリアする。既存の他ビットや、元から有効だったbit16は戻さない。解除直後の読み戻しと他ビットの差分も記録する。復元失敗時は追加した源の投票を残し、既存のstatus 8 / KeepCx=1でCX・マップ・メモリを保持する。CM3 resetやSMMU Disableで先に失敗した場合もクロック復元を試みず保持する。
+
+共有GCCレジスタは外部ドライバとの原子的な更新を保証できない。他ビットのXORは読み戻しで観測した変化であり、競合や更新消失がなかった証明にはならない [U]。全体の元値を書き戻す処理やリトライは入れない。
+
+追加診断（EpiDiag、REG_BINARYはlittle endian）：
+
+| 値 | 内容 |
+|---|---|
+| `GpuGmuClockStatus` / `GpuGmuClockRestoreStatus`（REG_DWORD） | 設定・復元のNTSTATUS。未試行はSTATUS_NOT_FOUND。`GpuGmuStatus=12` はクロック設定失敗（CM3未解放）。復元にも失敗した場合は最終status 8。HFI側のstatusは従来どおり |
+| `GpuGmuClockGcc`（REG_BINARY） | 9 DWORD＝36バイト。`{Before, AfterEnable, BeforeDisable, AfterDisable, EnableOtherXor, DisableOtherXor, AddedByUs, EnableWritten, DisableWritten}`。XORはbit16を除いた他ビットの差。最後の3値は0/1（AddedByUsは追加した履歴で、解除成功後も1）。未読の前半6値は0xFFFFFFFF。元からbit16が立っていればEnableWritten=0、AddedByUs=0、DisableWritten=0 |
+| `GpuGmuClockRcgs`（REG_BINARY） | GMU、hubの順に各48バイト、合計96バイト。各12 DWORD：`{CmdOffset, CfgOffset, OriginalCmd, OriginalCfg, TargetCfg, SetCmd, SetCfg, SetPolls, RestoreCmd, RestoreCfg, RestorePolls, PendingPolls}`。offsetはGPU_CCからのバイト。SetPolls/RestorePollsはUPDATE後の10 µs待ち回数（0〜50）、PendingPollsは復元前に残っていたUPDATEの待ち回数（0〜50）。未取得は0xFFFFFFFF。タイムアウト時も最後のCMD/CFGを保持する |
+| `GpuGmuClockBranches`（REG_BINARY） | 3行×3 DWORD＝36バイト。行は設定前、設定後、復元後。各行は `{cx_gmu (+0x1098), hub_cx_int (+0x1204), hub_aon (+0x1178)}` の読み戻し（CLK_OFFはbit31）。未読は0xFFFFFFFF |
+
+クロック未到達ならバイナリ診断は空。既存の `GpuGmuHfiExtra` は0xE80でも採取し、stage 0/1/2/4のGCC voteでbit16の有効化、stage 3で復元後の値を確認できる。Messagesは740バイト、Queuesは224バイトのまま。GMUのログ採取も従来どおりで、AOタイムスタンプからCORE_FW_START/VOTEの受信→応答時間をv40/v41と比較する。速くなったことは実機で確認するまで未確定 [U]。
+
+ブレッドクラム：0x6E0=前提と元RCGの保存、0x6E1=GCC投票、0x6E2/6E3/6E4=GMUのCFG/UPDATE/結果検証、0x6E5/6E6/6E7=hubの同処理、0x6E8=最終確認。復元は0x6F0/6F1/6F2がhub、0x6F3/6F4/6F5がGMU、0x6F6がXO確認とGCCの解除。UPDATE待ち中は直前のUPDATE番号を保持し、処理が戻れば後片付けの番号へ更新する。0x6FFは既存のKeepCx終了記録に予約済み。今回テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-08、v34-akat、Epinephrine v42 / 20.0.2.42、`EpiGpuProbe=0xE80`）：GMU 200 MHz／hub 150 MHz で全段階が成功** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuStatus` / `GpuGmuClockStatus` / `GpuGmuClockRestoreStatus` | 0 / 0 / 0 |
+| `GpuGmuHfiStatus` / `GpuGmuHfiIdleStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 / 0 |
+| GCC 0x52000 | 0x00E0057F → bit16 を立てて 0x00E1057F → 戻して 0x00E0057F。ほかのビットの変化（XOR）は前後とも 0 |
+| GMU の RCG | CFG 0 → 0x602（UPDATE はすぐに 0、待ち 0 回）→ 0（待ち 1 回）。CMD は 0 のまま |
+| hub の RCG | CFG 0 → 0x603（待ち 0 回）→ 0（待ち 0 回） |
+| ブランチ（cx_gmu／hub_cx_int／hub_aon） | 0x6221 / 1 / 1 のまま（すべて ON） |
+| HFI の 5 つのメッセージ | すべて ACK、error 0（v41 と同じ値） |
+| GX / RSCC / TCS0〜3 / SMMU | OFF / idle / 1 / fault なし |
+
+処理時間（GMU のログのタイムスタンプ。AO カウンタ 19.2 MHz とする）：
+
+| 区間 | v41（XO） | v42（200 MHz） | 比 |
+|---|---|---|---|
+| 最初の記録から初期化の結果（0x21, 5, 0x100）まで | 122120 tick（約 6.4 ms） | 22137 tick（約 1.15 ms） | 約 5.5 倍 |
+| PERF_TABLE の受信から ACK まで | 1200 tick | 200 tick | 6 倍 |
+| CORE_FW_START の受信から ACK まで | 13911 tick（約 0.72 ms） | 1913 tick（約 0.10 ms） | 約 7.3 倍 |
+| GX_BW_PERF_VOTE の受信から ACK まで | 17578 tick（約 0.92 ms） | 1721 tick（約 0.09 ms） | 約 10 倍 |
+
+- GMU のクロックは 200 MHz で動いていると見られる [I]。XO との比は 10.4 倍。初期化の区間は待ち時間を含むので、比が小さい。
+- VOTE の処理中のログの記録は、v41 の約 50 件から約 25 件に減った。v41 では同じ並び（0x23 の 0x0A／0x15C／0x10B、0x25、0x26 など）が 2 回出ていた。何かを待つ繰り返しの回数が減ったと見られる [U]。
+- GCC の共有レジスタへの書き込みで、ほかのビットは変わらなかった。Windows の GCC ドライバとぶつかった様子もない。
+- これで §9.12 の 7 の 1〜3 が終わった。残りは 4（OOB の GPU_SET で GX を入れ、slumber で止める）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gpu.c, a6xx_hfi.c, a6xx_catalog.c, adreno_gpu.c}`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

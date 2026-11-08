@@ -20,6 +20,7 @@
 //      Bit10 additionally applies four GBIF QSB settings after the log address, with GX still off.
 //   5. EpiSmmuEnable, then release the CM3 (SYSRESET 1, CP_RESP 0, SYSRESET 0) and poll FW_INIT_RESULT. This
 //      firmware is newer than 0x20010004, so the done value is (v & 0x1FF) == 0x100. Up to 100 ms.
+//      Bit11 first votes GCC GPLL0_DIV and switches GMU/hub RCGs to 200/150 MHz while CM3 is reset.
 //   6. After successful FW init, start HFI and send PERF_TABLE / BW_TABLE; bit9 adds CORE_FW_START / START.
 //      Bit10 adds GX_BW_PERF_VOTE after START and read-only GCC/TCS/CX-busy/GBIF observations.
 //      Record ACKs/queue indices,
@@ -28,7 +29,7 @@
 //      A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
 // Not done here (later steps): rpmh_start/stop, GPU PDC (reading it reset the phone on 2026-11-07),
-// PREPARE_SLUMBER and OOB GPU_SET; no GPU clock-source programming.
+// PREPARE_SLUMBER and OOB GPU_SET. No PLL programming; bit11 uses the existing GCC GPLL0_DIV source.
 // Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
 #ifdef EPI_GMU_HOST_TEST
@@ -302,6 +303,148 @@ static NTSTATUS GmuGbifRestore(GMU_TEST* S, HANDLE Params, GMU_GBIF_TRACE* T)
     }
     return result;
 }
+struct GMU_CLOCK_RCG {
+    ULONG CmdOffset, CfgOffset, OriginalCmd, OriginalCfg, TargetCfg;
+    ULONG SetCmd, SetCfg, SetPolls, RestoreCmd, RestoreCfg, RestorePolls, PendingPolls;
+};
+static_assert(sizeof(GMU_CLOCK_RCG)==48,"clock RCG diagnostic ABI");
+struct GMU_CLOCK_TRACE {
+    BOOLEAN Attempted, Saved, Changed[2];
+    NTSTATUS Status, RestoreStatus;
+    // Before enable, after enable, before disable, after disable, other-bit XORs (enable/disable),
+    // vote added by us, enable write issued, disable write issued.
+    ULONG Gcc[9];
+    GMU_CLOCK_RCG Rcgs[2]; // GMU, hub
+    ULONG Branches[3][3]; // before setup / after setup / after restore; cx_gmu, hub_cx_int, hub_aon
+};
+static VOID GmuClockDiag(HANDLE Diag, const GMU_CLOCK_TRACE* T)
+{
+    EpiSetDword(Diag,L"GpuGmuClockStatus",static_cast<ULONG>(T->Status));
+    EpiSetDword(Diag,L"GpuGmuClockRestoreStatus",static_cast<ULONG>(T->RestoreStatus));
+    EpiSetValue(Diag,L"GpuGmuClockGcc",REG_BINARY,T->Gcc,sizeof(T->Gcc));
+    EpiSetValue(Diag,L"GpuGmuClockRcgs",REG_BINARY,T->Rcgs,sizeof(T->Rcgs));
+    EpiSetValue(Diag,L"GpuGmuClockBranches",REG_BINARY,T->Branches,sizeof(T->Branches));
+}
+static VOID GmuClockBranches(volatile ULONG* Cc, GMU_CLOCK_TRACE* T, ULONG Stage)
+{
+    const ULONG offsets[]={0x1098,0x1204,0x1178};
+    for (ULONG i=0;i<RTL_NUMBER_OF(offsets);++i)
+    { T->Branches[Stage][i]=READ_REGISTER_ULONG(Cc+offsets[i]/4); }
+}
+static NTSTATUS GmuClockWait(volatile ULONG* Cmd, ULONG* Polls, ULONG* Last)
+{
+    for (ULONG i=0;i<=50;++i)
+    {
+        *Polls=i; *Last=READ_REGISTER_ULONG(Cmd);
+        if (!(*Last&1)) { return STATUS_SUCCESS; }
+        if (i!=50) { KeStallExecutionProcessor(10); }
+    }
+    return STATUS_IO_TIMEOUT;
+}
+static NTSTATUS GmuClockApply(HANDLE Params, volatile ULONG* Cc, GMU_CLOCK_TRACE* T,
+                              ULONG Index, BOOLEAN Restore, ULONG Step)
+{
+    GMU_CLOCK_RCG* r=&T->Rcgs[Index];
+    volatile ULONG* cmd=Cc+r->CmdOffset/4;
+    volatile ULONG* cfg=Cc+r->CfgOffset/4;
+    NTSTATUS st=GmuStep(Params,Step); if (!NT_SUCCESS(st)) { return st; }
+    if (Restore)
+    {
+        // Do not rewrite a pending RCG transaction after an UPDATE timeout.
+        st=GmuClockWait(cmd,&r->PendingPolls,&r->RestoreCmd);
+        r->RestoreCfg=READ_REGISTER_ULONG(cfg);
+        if (!NT_SUCCESS(st)) { return st; }
+    }
+    const ULONG value=Restore ? r->OriginalCfg : r->TargetCfg;
+    if (!Restore) { T->Changed[Index]=TRUE; } // includes a shadow CFG write even if the later breadcrumb fails
+    WRITE_REGISTER_ULONG(cfg,value);
+    st=GmuStep(Params,Step+1); if (!NT_SUCCESS(st)) { return st; }
+    WRITE_REGISTER_ULONG(cmd,READ_REGISTER_ULONG(cmd)|1UL);
+    // Poll immediately: a registry flush between UPDATE and polling would distort the 500-us wait/count.
+    ULONG last=0;
+    st=GmuClockWait(cmd,Restore ? &r->RestorePolls : &r->SetPolls,&last);
+    const ULONG readback=READ_REGISTER_ULONG(cfg);
+    if (Restore) { r->RestoreCmd=last; r->RestoreCfg=readback; }
+    else { r->SetCmd=last; r->SetCfg=readback; }
+    if (!NT_SUCCESS(st)) { return st; }
+    st=GmuStep(Params,Step+2); if (!NT_SUCCESS(st)) { return st; }
+    return !(last&0x80000000UL) && readback==value ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+}
+static NTSTATUS GmuClockSetup(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_CLOCK_TRACE* T)
+{
+    T->Attempted=TRUE;
+    NTSTATUS st=GmuStep(Params,0x6E0); if (!NT_SUCCESS(st)) { return st; }
+    GmuClockBranches(Cc,T,0);
+    if (READ_REGISTER_ULONG(GmuReg(S,R_CM3_SYSRESET))!=1 ||
+        (READ_REGISTER_ULONG(Cc+0x100C/4)&0x80000001UL)!=1 ||
+        (READ_REGISTER_ULONG(GmuReg(S,0x1F8D0))&0xC0)!=0xC0 ||
+        (T->Branches[0][0]&0x80000000UL)!=0) { return STATUS_INVALID_DEVICE_STATE; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(T->Rcgs);++i)
+    {
+        T->Rcgs[i].OriginalCmd=READ_REGISTER_ULONG(Cc+T->Rcgs[i].CmdOffset/4);
+        T->Rcgs[i].OriginalCfg=READ_REGISTER_ULONG(Cc+T->Rcgs[i].CfgOffset/4);
+    }
+    // This opt-in test owns an XO -> GPLL0_DIV -> XO transition only.
+    for (ULONG i=0;i<RTL_NUMBER_OF(T->Rcgs);++i)
+    { if ((T->Rcgs[i].OriginalCmd&1) || T->Rcgs[i].OriginalCfg!=0) { return STATUS_INVALID_DEVICE_STATE; } }
+    T->Saved=TRUE;
+    st=GmuStep(Params,0x6E1); if (!NT_SUCCESS(st)) { return st; }
+    volatile ULONG* vote=static_cast<volatile ULONG*>(S->Maps[7]);
+    T->Gcc[0]=READ_REGISTER_ULONG(vote); // fresh read after flushing; never replay an earlier shared-register snapshot
+    if (!(T->Gcc[0]&0x10000UL))
+    {
+        T->Gcc[6]=1; T->Gcc[7]=1;
+        WRITE_REGISTER_ULONG(vote,T->Gcc[0]|0x10000UL);
+        T->Gcc[1]=READ_REGISTER_ULONG(vote);
+        T->Gcc[4]=(T->Gcc[1]^T->Gcc[0])&~0x10000UL;
+        if (!(T->Gcc[1]&0x10000UL)) { return STATUS_IO_DEVICE_ERROR; }
+        KeStallExecutionProcessor(10); // BRANCH_HALT_DELAY, no halt-status register
+    }
+    else { T->Gcc[1]=T->Gcc[0]; T->Gcc[4]=0; }
+    st=GmuClockApply(Params,Cc,T,0,FALSE,0x6E2); if (!NT_SUCCESS(st)) { return st; }
+    st=GmuClockApply(Params,Cc,T,1,FALSE,0x6E5); if (!NT_SUCCESS(st)) { return st; }
+    st=GmuStep(Params,0x6E8); if (!NT_SUCCESS(st)) { return st; }
+    GmuClockBranches(Cc,T,1);
+    for (ULONG i=0;i<RTL_NUMBER_OF(T->Rcgs);++i)
+    {
+        GMU_CLOCK_RCG* r=&T->Rcgs[i];
+        r->SetCmd=READ_REGISTER_ULONG(Cc+r->CmdOffset/4); r->SetCfg=READ_REGISTER_ULONG(Cc+r->CfgOffset/4);
+        if ((r->SetCmd&0x80000001UL)!=0 || r->SetCfg!=r->TargetCfg) { return STATUS_IO_DEVICE_ERROR; }
+    }
+    return STATUS_SUCCESS;
+}
+static NTSTATUS GmuClockRestore(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_CLOCK_TRACE* T)
+{
+    NTSTATUS result=STATUS_SUCCESS;
+    // Reverse order. Keep the source vote if either RCG cannot be restored.
+    for (ULONG i=2;i-- > 0;)
+    {
+        if (!T->Changed[i]) { continue; }
+        const NTSTATUS st=GmuClockApply(Params,Cc,T,i,TRUE,i==1 ? 0x6F0 : 0x6F3);
+        if (!NT_SUCCESS(st) && NT_SUCCESS(result)) { result=st; }
+    }
+    GmuClockBranches(Cc,T,2);
+    if (!NT_SUCCESS(result)) { return result; }
+    NTSTATUS st=GmuStep(Params,0x6F6); if (!NT_SUCCESS(st)) { return st; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(T->Rcgs);++i)
+    {
+        // Fresh verification of XO and UPDATE completion before touching the shared source vote.
+        if (READ_REGISTER_ULONG(Cc+T->Rcgs[i].CfgOffset/4)!=0 ||
+            (READ_REGISTER_ULONG(Cc+T->Rcgs[i].CmdOffset/4)&1)!=0) { return STATUS_IO_DEVICE_ERROR; }
+    }
+    volatile ULONG* vote=static_cast<volatile ULONG*>(S->Maps[7]);
+    T->Gcc[2]=READ_REGISTER_ULONG(vote);
+    T->Gcc[3]=T->Gcc[2]; T->Gcc[5]=0;
+    if (T->Gcc[6] && (T->Gcc[2]&0x10000UL))
+    {
+        T->Gcc[8]=1;
+        WRITE_REGISTER_ULONG(vote,T->Gcc[2]&~0x10000UL);
+        T->Gcc[3]=READ_REGISTER_ULONG(vote);
+        T->Gcc[5]=(T->Gcc[3]^T->Gcc[2])&~0x10000UL;
+        if (T->Gcc[3]&0x10000UL) { return STATUS_IO_DEVICE_ERROR; }
+    }
+    return STATUS_SUCCESS;
+}
 static VOID GmuText(PWCHAR Text, SIZE_T Cch, PCWSTR Name, ULONG Value)
 {
     WCHAR line[72];
@@ -565,13 +708,14 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 }
 
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
-                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx)
+                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx, BOOLEAN FastClock)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
     *KeepCx=FALSE;
     if (g_KeptGmu != NULL) { *KeepCx=TRUE; return EPI_GMU_E_TEARDOWN; }
     if (VoteGx && !StartHfi) { return EPI_GMU_E_PRECOND; }
+    if (FastClock && (!VoteGx || !StartHfi)) { return EPI_GMU_E_PRECOND; }
     if (Cc == NULL || Text == NULL || TextCch==0) { return EPI_GMU_E_PRECOND; }
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -598,11 +742,30 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetDword(Diag,L"GpuGmuGbifRestoreStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
     EpiSetDword(Diag,L"GpuGmuGbifBadIndex",0xFFFFFFFF);
     EpiSetDword(Diag,L"GpuGmuGbifRestoreBadIndex",0xFFFFFFFF);
+    EpiSetDword(Diag,L"GpuGmuClockStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetDword(Diag,L"GpuGmuClockRestoreStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+    EpiSetValue(Diag,L"GpuGmuClockGcc",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuClockRcgs",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuClockBranches",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     ULONG result=EPI_GMU_OK, configured=0, rsccConfigured=0;
     NTSTATUS st=STATUS_SUCCESS;
     BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE;
+    GMU_CLOCK_TRACE clocks={}; clocks.Status=STATUS_NOT_FOUND; clocks.RestoreStatus=STATUS_NOT_FOUND;
+    for (ULONG i=0;i<6;++i) { clocks.Gcc[i]=0xFFFFFFFF; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(clocks.Rcgs);++i)
+    {
+        GMU_CLOCK_RCG* r=&clocks.Rcgs[i];
+        r->CmdOffset=i==0 ? 0x1120 : 0x117C; r->CfgOffset=r->CmdOffset+4;
+        r->TargetCfg=i==0 ? 0x602 : 0x603;
+        r->OriginalCmd=0xFFFFFFFF; r->OriginalCfg=0xFFFFFFFF;
+        r->SetCmd=0xFFFFFFFF; r->SetCfg=0xFFFFFFFF; r->SetPolls=0xFFFFFFFF;
+        r->RestoreCmd=0xFFFFFFFF; r->RestoreCfg=0xFFFFFFFF;
+        r->RestorePolls=0xFFFFFFFF; r->PendingPolls=0xFFFFFFFF;
+    }
+    for (ULONG i=0;i<RTL_NUMBER_OF(clocks.Branches);++i)
+    { for (ULONG j=0;j<RTL_NUMBER_OF(clocks.Branches[i]);++j) { clocks.Branches[i][j]=0xFFFFFFFF; } }
     GMU_HFI_TRACE hfi={}; hfi.Status=STATUS_NOT_FOUND; hfi.CtrlStatus=0xFFFFFFFF;
     hfi.ExtraEnabled=VoteGx; hfi.ExtraStatus=STATUS_NOT_FOUND;
     GMU_GBIF_TRACE gbif={}; gbif.Status=STATUS_NOT_FOUND; gbif.RestoreStatus=STATUS_NOT_FOUND;
@@ -663,11 +826,11 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (!GmuPlan(s,Fw,FwLen)) { result=EPI_GMU_E_FW; goto cleanup; }
     // Confirm the CX window before accessing any GMU register.
     {
-        const ULONG clocks[]={0x1078,0x109C,0x1098,0x1204,0x5000};
+        const ULONG branchOffsets[]={0x1078,0x109C,0x1098,0x1204,0x5000};
         if (!(READ_REGISTER_ULONG(Cc+0x106C/4)&0x80000000UL) ||
             (READ_REGISTER_ULONG(Cc+0x100C/4)&0x80000001UL)!=1) { result=EPI_GMU_E_PRECOND; goto cleanup; }
-        for (ULONG i=0;i<RTL_NUMBER_OF(clocks);++i)
-        { if (READ_REGISTER_ULONG(Cc+clocks[i]/4)&0x80000000UL) { result=EPI_GMU_E_PRECOND; goto cleanup; } }
+        for (ULONG i=0;i<RTL_NUMBER_OF(branchOffsets);++i)
+        { if (READ_REGISTER_ULONG(Cc+branchOffsets[i]/4)&0x80000000UL) { result=EPI_GMU_E_PRECOND; goto cleanup; } }
     }
     for (ULONG i=0;i<RTL_NUMBER_OF(bases);++i)
     {
@@ -684,7 +847,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         PHYSICAL_ADDRESS pa; pa.QuadPart=EPI_GMU_GBIF_PHYS;
         s->Maps[6]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
         pa.QuadPart=EPI_GMU_GCC_VOTE_PHYS;
-        s->Maps[7]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READONLY|PAGE_NOCACHE);
+        s->Maps[7]=MmMapIoSpaceEx(pa,PAGE_SIZE,(FastClock ? PAGE_READWRITE : PAGE_READONLY)|PAGE_NOCACHE);
         if (s->Maps[6]==NULL || s->Maps[7]==NULL) { result=EPI_GMU_E_NOMEM; goto cleanup; }
     }
     for (ULONG i=0;i<s->Count;++i)
@@ -758,6 +921,11 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         st=STATUS_IO_DEVICE_ERROR; result=EPI_GMU_E_TCM; goto cleanup;
     }
     GmuText(Text,TextCch,L"gmu_fw_ver",READ_REGISTER_ULONG(static_cast<volatile ULONG*>(s->Maps[4])+EPI_GMU_VER_DTCM_OFF/4));
+    if (FastClock)
+    {
+        st=GmuClockSetup(s,Params,Cc,&clocks); clocks.Status=st; GmuClockDiag(Diag,&clocks);
+        if (!NT_SUCCESS(st)) { result=EPI_GMU_E_CLOCK; goto cleanup; }
+    }
     smmuAttempted=TRUE;
     st=EpiSmmuEnable(s->Smmu,Cc,static_cast<volatile ULONG*>(s->Maps[1]));
     if (!NT_SUCCESS(st))
@@ -809,6 +977,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     }
 cleanup:
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
+    if (clocks.Attempted) { GmuClockDiag(Diag,&clocks); }
     if (gbif.Attempted) { GmuGbifDiag(Diag,&gbif); }
     if (hfi.Attempted) { GmuHfiDiag(Diag,&hfi); }
     if (rsccSaved) { EpiSetValue(Diag,L"GpuGmuRsccSetup",REG_BINARY,rscc,sizeof(rscc)); }
@@ -842,6 +1011,11 @@ cleanup:
         st=EpiSmmuDisable(s->Smmu);
         EpiSetDword(Diag,L"GpuGmuDisableStatus",static_cast<ULONG>(st));
         if (!NT_SUCCESS(st)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+    }
+    if (clocks.Saved && (clocks.Changed[0] || clocks.Changed[1] || clocks.Gcc[6]))
+    {
+        clocks.RestoreStatus=GmuClockRestore(s,Params,Cc,&clocks); GmuClockDiag(Diag,&clocks);
+        if (!NT_SUCCESS(clocks.RestoreStatus)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
     }
     // Processor reset and SMMU detached; restore address/config registers before freeing buffers.
     for (ULONG i=configured; i-- > 2;)
@@ -896,6 +1070,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (clocks.Attempted) { GmuClockDiag(Diag,&clocks); }
     if (gbif.Attempted) { GmuGbifDiag(Diag,&gbif); }
     if (hfi.Attempted) { GmuHfiDiag(Diag,&hfi); }
     g_KeptGmu=s; *KeepCx=TRUE;

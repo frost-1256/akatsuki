@@ -7,6 +7,7 @@
 #define EPI_GMU_PROBE_BOOT      0x80UL      // G1c-3: boot the CM3 behind the adreno SMMU, then put it back in reset
 #define EPI_GMU_PROBE_HFI_START 0x200UL     // modifier: with 0x80 (0x280), add CORE_FW_START / START after PERF/BW
 #define EPI_GMU_PROBE_GX_VOTE   0x400UL     // modifier: requires 0x280 (0x680 total), add GBIF QSB / GX_BW_PERF_VOTE
+#define EPI_GMU_PROBE_CLOCK    0x800UL     // modifier: requires 0x680 (0xE80 total), GMU 200 MHz / hub 150 MHz
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -21,6 +22,7 @@
 #define EPI_GMU_E_RSCC          9           // RSCC initialization write/readback or breadcrumb failed (CM3 never released)
 #define EPI_GMU_E_HFI           10          // HFI init or a requested message failed after successful FW init
 #define EPI_GMU_E_GBIF          11          // GBIF precondition/read/write/breadcrumb failed (CM3 never released)
+#define EPI_GMU_E_CLOCK         12          // clock setup failed (CM3 never released); failed restoration returns 8
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -54,6 +56,14 @@
 // GpuGmuGbifSetup: four 20-byte records {GPU dword Reg, Original, Value, Readback, Restored}, 80 bytes total.
 // GpuGmuGbifStatus / GpuGmuGbifRestoreStatus: NTSTATUS; STATUS_NOT_FOUND when not attempted.
 // GpuGmuGbifBadIndex / GpuGmuGbifRestoreBadIndex: first failing index, or 0xFFFFFFFF.
+// GpuGmuClockStatus / GpuGmuClockRestoreStatus: NTSTATUS; STATUS_NOT_FOUND if not attempted.
+// GpuGmuClockGcc (36 bytes): {Before, AfterEnable, BeforeDisable, AfterDisable,
+// EnableOtherXor, DisableOtherXor, AddedByUs, EnableWritten, DisableWritten}; only bit16 is modified.
+// GpuGmuClockRcgs: two 48-byte records (GMU/hub), each {CmdOffset, CfgOffset, OriginalCmd, OriginalCfg,
+// TargetCfg, SetCmd, SetCfg, SetPolls, RestoreCmd, RestoreCfg, RestorePolls, PendingPolls}.
+// Polls count 10-us waits (0..50); PendingPolls is the pre-restore UPDATE wait. Unread fields=0xFFFFFFFF.
+// GpuGmuClockBranches: three rows {CxGmu, HubCxInt, HubAon}, before setup / after setup / after restore (36 bytes).
+// Clock test requires original CFGs=0 (XO); an added GCC vote is retained if restoration fails.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -62,7 +72,9 @@
 // Text/TextCch: diagnostic "name=value; " entries are appended.
 // StartHfi: FALSE keeps PERF/BW-only behavior; TRUE adds CORE_FW_START then START (probe 0x280).
 // VoteGx: requires StartHfi; adds GBIF QSB before release and GX vote after START (probe 0x680).
+// FastClock: requires StartHfi/VoteGx; opt-in RCG setup/restore (probe 0xE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
-                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE, BOOLEAN VoteGx = FALSE);
+                     PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
+                     BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE);
