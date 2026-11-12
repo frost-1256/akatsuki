@@ -25,6 +25,8 @@ static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
 static ULONG failGmuStep=0xFFFFFFFF;
+static bool failCxHaltClear=false, failRbbmHaltClear=false;
+static ULONG gxPageProtection=0;
 static const ULONG gxRegExpected[]={1,0x213,0x201,0xAE,0x16,0x17};
 inline void GmuSeedGxRegs() {
     gPages[8][0x210]=gxRegExpected[0]; gPages[8][0x213]=gxRegExpected[1];
@@ -33,7 +35,8 @@ inline void GmuSeedGxRegs() {
 }
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
-inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG) {
+inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
+    if(a.QuadPart==0x03D00000) gxPageProtection=protection;
     const ULONGLONG bases[]={0x03D7D000,0x03D7E000,0x03D8E000,0x03D6D000,0x03D71000,0x03DE0000,
                             0x03D0F000,0x00152000,0x03D00000};
     for(ULONG i=0;i<RTL_NUMBER_OF(bases);++i) if(static_cast<ULONGLONG>(a.QuadPart)==bases[i]) return gPages[i];
@@ -42,6 +45,7 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG) {
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     if(p==gPages[1] && v==1 && resetFails) return;
+    if(v==0 && ((p==gPages[6]+0x45 && failCxHaltClear) || (p==gPages[8]+0x16 && failRbbmHaltClear))) return;
     *p=v;
     if ((p==cc+0x1120/4 || p==cc+0x117C/4) && (v&1)) { *p=v&~1UL; } // RCG UPDATE self-clears
     if(p==gPages[1] && v==0 && bootCompletes) {
@@ -56,6 +60,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         gPages[1][0xD0]=0; gPages[1][0xEC]=0;
     }
     if(p==gPages[6]+0x45) gPages[6][0x46]=v; // CX GBIF HALT ACK, including clear
+    if(p==gPages[8]+0x16) gPages[8][0x17]=v;
     if(p==gPages[2]+0x307 && v==1) {
         gPages[5][4]|=1UL<<16; gPages[5][0x101]=1; // sleeping RSCC remains busy after REQ clears
     }

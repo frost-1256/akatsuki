@@ -53,6 +53,7 @@ static void Reset() {
     cc[0x106C/4]=0x80000000; cc[0x100C/4]=1; gPages[1][0]=1; gPages[1][0x340/4]=0xC0;
     bootCompletes=true; resetFails=false; smmuEnableFails=false; smmuDisableFails=false;
     failAfter=-1; diagnostics.clear(); gmuWrites=0; hfiMemory=nullptr; failGmuStep=0xFFFFFFFF;
+    failCxHaltClear=false; failRbbmHaltClear=false; gxPageProtection=0;
     GmuSeedGxRegs();
 }
 static ULONG Run(const std::vector<UCHAR>& f,BOOLEAN* keep) {
@@ -71,13 +72,14 @@ int main(int argc,char** argv) {
     // Read-only GX probe: independent fixture order, complete count, and stopping before an unpersisted read.
     Reset();
     {
-        GMU_TEST probe={}; probe.Maps[1]=gPages[1];
+        GMU_TEST probe={}; probe.Maps[1]=gPages[1]; probe.Maps[6]=gPages[6];
         GMU_GX_TRACE oob={}; oob.OobStatus=STATUS_SUCCESS;
         cc[0x100C/4]=0x80000000; gPages[1][0xD0]=0;
         GMU_GX_REG_TRACE regs={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
                               {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF}};
         GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs);
         assert(regs.Attempted==1 && regs.Reason==GX_REG_READ && regs.Count==6 && gmuWrites==0);
+        assert(gxPageProtection==(PAGE_READONLY|PAGE_NOCACHE));
         for(ULONG i=0;i<6;++i) assert(regs.Value[i]==gxRegExpected[i]);
         regs={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
               {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF}};
@@ -86,6 +88,36 @@ int main(int argc,char** argv) {
         assert(regs.Attempted==1 && regs.Reason==GX_REG_BREADCRUMB_FAILED && regs.Count==2 && gmuWrites==0);
         assert(regs.Value[0]==gxRegExpected[0] && regs.Value[1]==gxRegExpected[1]);
         for(ULONG i=2;i<6;++i) assert(regs.Value[i]==0xFFFFFFFF);
+        // New opt-in path: both original halt pairs are recorded, and only the two HALT registers are cleared.
+        failGmuStep=0xFFFFFFFF;
+        regs={};
+        GMU_GX_HALT_TRACE halt={}; halt.Status=STATUS_NOT_FOUND;
+        gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; gPages[8][0x17]=1;
+        GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs,&halt);
+        assert(halt.Status==0 && halt.Reason==0 && halt.Count==2 && gmuWrites==2);
+        assert(halt.Before[0]==3 && halt.Before[1]==3 && halt.Before[2]==1 && halt.Before[3]==1);
+        for(ULONG i=0;i<4;++i) assert(halt.After[i]==0);
+        assert(gxPageProtection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert(GmuGxCxHaltIdle(&probe,reinterpret_cast<HANDLE>(1),&halt)==0);
+        // v50: ACK can stay at 3 while HALT is clear; record it without blocking teardown.
+        gPages[6][0x46]=3;
+        assert(GmuGxCxHaltIdle(&probe,reinterpret_cast<HANDLE>(1),&halt)==0);
+        assert(halt.FinalCx[0]==0 && halt.FinalCx[1]==3 && halt.CxPolls==0);
+        // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
+        regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
+        gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;
+        GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs,&halt);
+        assert(halt.Status==STATUS_IO_DEVICE_ERROR && halt.Reason==7 && halt.Count==1 && gmuWrites==1);
+        assert(gPages[8][0x16]==1);
+        assert(GmuGxCxHaltIdle(&probe,reinterpret_cast<HANDLE>(1),&halt)==STATUS_IO_TIMEOUT);
+        // A stuck RBBM clear is recorded too, but a cleared CX halt remains independently observable.
+        regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
+        failCxHaltClear=false; failRbbmHaltClear=true;
+        gPages[6][0x45]=3; gPages[6][0x46]=3;
+        GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs,&halt);
+        assert(halt.Status==STATUS_IO_DEVICE_ERROR && halt.Reason==7 && halt.Count==2 && gmuWrites==2);
+        assert(halt.After[0]==0 && halt.After[2]==1);
+        assert(GmuGxCxHaltIdle(&probe,reinterpret_cast<HANDLE>(1),&halt)==0);
     }
     Reset(); GMU_TEST plan={}; assert(GmuPlan(&plan,f.data(),static_cast<ULONG>(f.size())));
     assert(plan.Count==8 && GmuFind(&plan,0x300000,0x7060));

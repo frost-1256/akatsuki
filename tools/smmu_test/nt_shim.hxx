@@ -41,7 +41,7 @@ static int failAfter = -1;
 static ULONG mmio[0x17000/4], cc[0x9000/4], gmu[0x1000/4];
 static ULONG dropOffset = 0xFFFFFFFF;
 static bool dropAlways = false, syncTimeout = false;
-static ULONG writes = 0, stalls = 0;
+static ULONG mmioWrites = 0, stalls = 0;
 inline bool FailAllocation() { if (failAfter < 0) return false; return failAfter-- == 0; }
 inline void* ExAllocatePool2(int, SIZE_T n, ULONG) {
     if (FailAllocation()) return nullptr;
@@ -63,7 +63,7 @@ inline ULONG READ_REGISTER_ULONG(volatile ULONG* p) {
     return *p;
 }
 inline void WRITE_REGISTER_ULONG(volatile ULONG* p, ULONG v) {
-    ++writes;
+    ++mmioWrites;
     if (dropOffset != 0xFFFFFFFF && p==mmio+dropOffset/4) {
         if (!dropAlways) dropOffset=0xFFFFFFFF;
         return;

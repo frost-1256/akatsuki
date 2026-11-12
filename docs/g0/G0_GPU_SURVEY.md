@@ -1106,7 +1106,7 @@ CPUのMMIO読み取りにはNTSTATUSの戻り値がない。バスが応答し�
 
 机上試験用のshimのGPU先頭ページには、上表の位置に `{1, 0x213, 0x201, 0xAE, 0x16, 0x17}` を設定するfixtureを追加した。ホストテストには、Valueの順序・Count=6・Reason=0・MMIO書き込みなしの確認と、0x7CAの記録保存失敗を注入してCount=2・Reason=6・残り未読で止まる確認を追加した。テストは未実行。版番号の変更・ビルド・署名・配置・実機実行も行っていない。
 
-**机上の試験（2026-11-12）**：`smmu_test` と `gmu_test` はどちらも通った。ただし `gmu_test` は、今回より前からある C4459 の警告（`epi_gmu.cxx` の局所変数 `writes` が `nt_shim.hxx` のグローバル変数と同じ名前）で `build.cmd` のままでは止まる。`/wd4459` を付けて一時的にビルドして確かめた。
+**机上の試験（2026-11-12）**：`smmu_test` と `gmu_test` はどちらも通った。ただし `gmu_test` は、今回より前からある C4459 の警告（`epi_gmu.cxx` の局所変数 `writes` が `nt_shim.hxx` のグローバル変数と同じ名前）で `build.cmd` のままでは止まる。`/wd4459` を付けて一時的にビルドして確かめた。そのあと shim 側のグローバル変数を `mmioWrites` に変えて直し、`build.cmd` のままで両方の試験が通ることを確かめた（ドライバのコードは変えていない）。
 
 **最初の実行（v48 の実行のあと、再起動しないで、v49 / 20.0.2.49）**：入口で `EPI_GMU_E_PRECOND`（`GpuGmuStatus` 1、NtStatus 0xC0000184）となり、何も触らずに止まった。`GpuGmuRsccEntry` = {0x00010006, 1, 0, 1} で、v48 の rpmh_stop で眠った RSCC が残っていた [P]。KeepCx=0 で終わっていても、GX を ON にする実行（0x1E80／0x3E80）の前には毎回再起動がいる。
 
@@ -1131,6 +1131,97 @@ CPUのMMIO読み取りにはNTSTATUSの戻り値がない。バスが応答し�
 - `GBIF_HALT` = 0、`HALT_ACK` = 0：RBBM 側の GBIF は止められていない。`hw_init` が最初に書く `RBBM_GBIF_HALT=0` は、今の値と同じになる [I]。
 - 6 回の読み取りのあとも、OOB の解除、slumber、rpmh_stop、後片付けはすべて通った。
 - 次：Linux の `hw_init` の最初の書き込み（`GBIF_HALT=0`、`RBBM_GBIF_HALT=0` と、そのあとの読み返し）を調べる。
+
+### 9.15 GX 側への最初の書き込みの計画（本家 Linux の事実、2026-11-12）
+
+**Linux の `hw_init` の冒頭**（`a6xx_gpu.c` 1179〜1210）：
+1. `a6xx_gmu_set_oob(GMU_OOB_GPU_SET)`（GX を ON に保たせる）。
+2. A635 は `a6xx_has_gbif()` が真（偽になるのは A630 だけ）なので、次の 4 つを順に行う。読み返しは値を確かめるためではなく、書き込みを届かせるためのもの。
+   - `GBIF_HALT` ← 0、`GBIF_HALT` を読む
+   - `RBBM_GBIF_HALT` ← 0、`RBBM_GBIF_HALT` を読む
+3. そのあとに `RBBM_SECVID_TSB_CNTL`（0xF803）← 0、TSB の TRUSTED_BASE/SIZE ← 0、各ブロックの `*_ADDR_MODE_CNTL` ← 1、`a6xx_set_hwcg(true)` …と続く。
+
+コメントは「GX domain が collapse されなかった場合に備えて GBIF の halt を外す」。つまり、どちらも 0 になっているのが普通の状態で、2 の書き込みは前回に止めたままの halt を外すためのもの。
+
+**レジスタの場所**（`a6xx.xml`）：
+
+| 名前 | dword | 物理アドレス | 置き場所 |
+|---|---|---|---|
+| `GBIF_HALT` | 0x3C45 | 0x03D0F114 | GBIF のページ。bit10 の QSB 設定ですでに読み書き可能で割り当てている（`Maps[6]` = 0x03D0F000、dword 0x3C00 から）。GX が OFF でも書けた |
+| `GBIF_HALT_ACK` | 0x3C46 | 0x03D0F118 | 同上 |
+| `RBBM_GBIF_HALT` | 0x016 | 0x03D00058 | GPU の先頭ページ（GX 側）。v49 の 0 はここ |
+| `RBBM_GBIF_HALT_ACK` | 0x017 | 0x03D0005C | 同上。v49 で 0 |
+
+ビットは `GBIF_CLIENT_HALT_MASK` = bit0、`GBIF_ARB_HALT_MASK` = bit1。
+
+**Linux が halt を立てる場所**（`a6xx_bus_clear_pending_transactions`、2085〜2120）：
+- 普通の停止（`a6xx_gmu_shutdown` 1455、slumber を通知する前）では `gx_off` = `hung`（普通は偽）。`GBIF_HALT` ← bit0 を書いて ACK の bit0 を待ち、← bit1 を書いて ACK の bit1 を待ち、最後に `GBIF_HALT` ← 0 で外す。`RBBM_GBIF_HALT` には触らない。
+- 固まったときと `force_off`（1178）だけ `RBBM_GBIF_HALT` ← 1 を書いて ACK を待ち、0 には戻さない。ここで残った halt を、次の `hw_init` が外す。
+- 現行の `GmuGxSlumber()` には、既に0x7D1〜0x7D4でGBIF_HALT=1→ACK bit0待ち→HALT=2→ACK bit1待ち→HALT=0が実装されている。v50でもこの停止手順は維持する。RBBM_GBIF_HALTを立てるforce_offの経路は追加しない。
+
+**提案（v50）**：GX 側に初めて書く。v49 までの読み取りより危険が大きいので、新しいビット（例：bit14、合わせて `0x7E80`、bit13 が前提）に分ける。
+- OOB の ACK のあと、v49 の 6 個の読み取りが終わってから、解除の前に行う。
+- 先に元の値（`GBIF_HALT`、`GBIF_HALT_ACK`、`RBBM_GBIF_HALT`、`RBBM_GBIF_HALT_ACK`）を読んで記録する。
+- Linux と同じ順に、`GBIF_HALT` ← 0 → 読み返し、`RBBM_GBIF_HALT` ← 0 → 読み返し。どちらも書く前に breadcrumb を残し、v48 と同じ GX の確かめをやり直す。
+- 元に戻す処理はいらない。0 は普通の状態で、Linux も戻さない。元の値が 0 でなかったときは、その値を診断に残す（halt を外したことになる）。
+- 先頭ページは今は読み取り専用で割り当てているので、この段階だけ読み書き可能で割り当てる必要がある。
+- 読み返しが 0 でないときは、それ以上書かずに OOB の解除と slumber に進み、診断に残す。その場合に後片付けをどうするかは決めておく必要がある。`RBBM_GBIF_HALT` は GX 側なので、GX が切れれば消えると見られる [I]。`GBIF_HALT` は CX 側（GX が OFF でも書けた）なので、CX を切るまで残る可能性がある [U]。
+- 机上の試験：shim の GBIF ページと先頭ページで、書いた 0 が読み返せること、元の値が 0 でないときの記録、途中で breadcrumb が失敗したら書かないこと。
+
+その次の候補は 2 つある。
+- slumber の前にバスの halt（`GBIF_HALT` の bit0 → bit1 → 0）を入れて、Linux の普通の停止に合わせる。
+- `hw_init` の 3（SECVID と ADDR_MODE）に進む。
+
+### 9.15.1 OOB中のGBIF/RBBM halt解除の実装（実機未実行）
+
+bit14 `EPI_GMU_PROBE_GX_HALT=0x4000` を追加した。前提はbit13とその全前提（0x3E80）で、`EpiGpuProbe=0x7E80` のときだけ実行する。ビット不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。既存の0x3E80は読み取り専用のまま維持し、0x7E80だけGPU先頭ページをRWでmapする。ページ数や既存の診断ABIは増やさない。
+
+- OOB ACK後、6レジスタの読み取りがCount=6 / Reason=0で終わった場合にだけ進む。先に、CX GBIF_HALT/ACKとRBBM_GBIF_HALT/ACKの4元値を同じOOB中に読む。
+- 書く順番はCX GBIF_HALTへ0→同じレジスタを直後に読み返す、次にRBBM_GBIF_HALTへ0→同じレジスタを直後に読み返す。書き込みと読み返しの間にブレッドクラムや状態確認は挟まない。各ACKも記録するが、この時点のACK非0だけでは失敗にしない。
+- 元値保存と両書き込みの前に、ブレッドクラム保存・flushとGX確認（OOB ACK成功、GDSCR bit31=1、GX HM bit6/7=0）を行う。途中で確認・保存に失敗したら後続を書かない。HALT本体の読み返しが非0なら後続の追加書き込みを止め、試験失敗として記録する。0を書いた元値を復元する処理は入れない。
+- 書き込みや読み返しに異常があっても、既存のOOB解除とslumberを試みる。GX OFFと既存のidle確認に通った後、CX側のGBIF_HALTが0、ACK bit0/1がともに0になることを100 µs間隔・最大10 msで確認する。これは読み取りだけで、追加のリトライ書き込みはしない。解消していればSMMU Disableと通常の復元へ進み、追加試験の失敗は最終status 13に残す。CX側のHALT/ACKが残る、または確認用の記録保存に失敗した場合はstatus 8 / KeepCxとして、クロック・SMMU・資源を保持する。
+- RBBM側はOOB解除後に読み直さない。GX OFFの既存安全条件が成立した場合だけ後始末を許し、読み返し異常そのものはstatus 13と生値で残す。GX電源断でHALTが消えることを測定済みとして扱う処理は入れない。GX OFFに戻らない場合は、従来どおりstatus 8 / KeepCx。
+
+追加診断 `GpuGmuGxHalt`（REG_BINARY、little endian、72バイト＝18 DWORD）：
+
+`{Attempted, Reason, Gdscr, GxHm, Count, Status, CxIdleStatus, Before[4], After[4], FinalCx[2], CxPolls}`。
+
+Before/Afterの順序は `{CX HALT, CX ACK, RBBM HALT, RBBM ACK}`。Beforeは4元値、Afterは各HALT書き込み直後のHALT/ACK。Countは完了した書き込み・読み返し組数（0〜2、不一致の組も含む）、Attemptedは最初の書き込み直前に1。Gdscr/GxHmは最後の確認値。未読値と未試行のCxPollsは0xFFFFFFFF。Statusは追加試験、CxIdleStatusは後片付け中のCX HALT/ACK確認のNTSTATUSで、未試行はSTATUS_NOT_FOUND。FinalCxはその最終HALT/ACK、CxPollsは100 µs待ちの回数（0〜100）。cleanup/keepの両経路で保存し、他モードでは空データ。
+
+Reasonは0=2組完了、1=未到達、2=OOB ACK失敗、3=GDSCR OFF、4=GX HMが完全ONでない、5=map失敗、6=ブレッドクラム失敗、7=HALT読み返し非0、8=前提の6読み取り未完了。前提の読み取り段階で止まった場合はそのReasonを引き継ぎ、StatusをSTATUS_INVALID_DEVICE_STATEとする。成功済みでも後片付けでKeepCxになることがあるため、CxIdleStatusと既存のGpuGmuStatus/KeepCxを併読する。
+
+| ブレッドクラム | 内容 |
+|---|---|
+| 0x7C8〜0x7CD | 既存の6レジスタ読み取り |
+| 0x7CE | 4元値保存前のflush・GX確認 |
+| 0x7D6 | CX GBIF_HALT=0の前のflush・GX確認と即時読み返し |
+| 0x7D7 | RBBM_GBIF_HALT=0の前のflush・GX確認と即時読み返し |
+| 0x7D8 | reset/rpmh_stop・既存idle確認後のCX HALT/ACK待ち |
+
+実行順は0x7CD→0x7CE→0x7D6→0x7D7→既存の0x7C4（OOB解除）で、後片付けの0x7D8は既存のidle確認後。0x7D0〜0x7D5のslumber処理と番号は変えていない。追加のGX書き込みはRBBM_GBIF_HALT=0だけで、SECVID・ADDR_MODE・hwcg、force_off、PDCには進まない。
+
+shimにはRW/RO写像の確認、両haltのclear応答、片側のclearが効かない状態の注入を追加した。ホスト試験には2組成功、CX側不一致でRBBMへ書かず停止・最終CX確認も失敗、RBBM側だけ不一致でもCX側は解消しているケースを追加した。試験・版番号変更・ビルド・署名・配置・実機実行は行っていない。
+
+**最初の実行（2026-11-12、再起動の直後、v50 / 20.0.2.50、`EpiGpuProbe=0x7E80`）**：halt の解除そのものは成功した（Reason 0、Count 2、Status 0）。ただし最後の確かめで止まり、`GpuGmuStatus` 8、`KeepCx` 1 になった [P]。
+- Before = After = {CX HALT 0, **CX ACK 3**, RBBM HALT 0, RBBM ACK 0}。どの HALT も元から 0 で、書き込みで何も変わっていない。
+- `GBIF_HALT_ACK` は、何も書く前から 3 だった。halt が立っていなくても bit0/1 が立っているのが普通の状態である [P]。Linux は halt を立てたあと ACK のビットが立つのを待つだけで、0 に戻るのは待たないので、Linux の手順とも矛盾しない [I]。
+- 最後の確かめが「ACK の bit0/1 = 0」を求めていたため、100 回（10 ms）見ても FinalCx = {0, 3} のままで `STATUS_IO_TIMEOUT`（0xC00000B5）になった。halt が残っていたわけではない。
+- 修正（v51）：最後の確かめは `GBIF_HALT == 0` だけを見る。ACK は記録するだけにする。HALT が残ったときに KeepCx にする動きは残す。机上の試験に、HALT=0 で ACK=3 のまま成功するケースを足した。
+
+**結果（2026-11-12、再起動の直後、v51 / 20.0.2.51、`EpiGpuProbe=0x7E80`）：GX 側への初めての書き込みが成功し、後片付けまで通った** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuGxReg` | {1, 0, 0xF8222800, 0, Count 6}、値は v49 と同じ {1, 0, 0, 0, 0, 0} |
+| `GpuGmuGxHalt` | Attempted 1、Reason 0、GDSCR 0xF8222800、GX HM 0、Count 2、Status 0、CxIdleStatus 0 |
+| Before / After | {0, 3, 0, 0} / {0, 3, 0, 0} |
+| FinalCx / CxPolls | {0, 3} / 0（最初の 1 回で確認できた） |
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 |
+| HFI / idle の判定 / GBIF / クロック / SMMU の Disable / RSCC と各復元 | すべて 0 |
+
+- `GBIF_HALT=0`（CX 側）と `RBBM_GBIF_HALT=0`（GX 側）を書いて、電話も固まらず、読み返しも 0 だった。GX 側のレジスタに書けることを初めて確かめた。
+- どちらの HALT も元から 0 だったので、ハードウェアの状態は変わっていない。`hw_init` の最初の手順を、Linux と同じ順に実行できたということになる。
+- 次の候補（§9.15 の最後）：slumber の前にバスの halt（`GBIF_HALT` の bit0 → bit1 → 0）を入れて Linux の普通の停止に合わせる。または `hw_init` の 3（`RBBM_SECVID_TSB_CNTL`、TSB の TRUSTED_BASE/SIZE、`*_ADDR_MODE_CNTL`）に進む。
 
 ## 参照
 

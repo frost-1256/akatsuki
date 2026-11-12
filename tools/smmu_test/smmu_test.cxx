@@ -64,10 +64,10 @@ int main() {
     }
     ULONG fsr=0,syn=0; ULONGLONG far=0;
     // Occupied owner and unexpected global configuration refuse without MMIO writes.
-    ULONG before=writes; mmio[0]|=1;
-    assert(EpiSmmuEnable(c,cc,gmu)==STATUS_NOT_SUPPORTED); assert(writes==before); mmio[0]&=~1UL;
+    ULONG before=mmioWrites; mmio[0]|=1;
+    assert(EpiSmmuEnable(c,cc,gmu)==STATUS_NOT_SUPPORTED); assert(mmioWrites==before); mmio[0]&=~1UL;
     mmio[0x804/4]=0x80000006;
-    assert(EpiSmmuEnable(c,cc,gmu)==STATUS_DEVICE_BUSY); assert(writes==before); mmio[0x804/4]=0;
+    assert(EpiSmmuEnable(c,cc,gmu)==STATUS_DEVICE_BUSY); assert(mmioWrites==before); mmio[0x804/4]=0;
     assert(EpiSmmuEnable(c,cc,gmu)==0);
     assert(mmio[0]==0x002C0406 && mmio[0x800/4]==0x84000005);
     assert(mmio[0x10030/4]==0x802020 && mmio[0x10010/4]==0x38011);
@@ -78,10 +78,10 @@ int main() {
     EPI_SMMU* second=NewMapped(); assert(EpiSmmuEnable(second,cc,gmu)==STATUS_DEVICE_BUSY);
     assert(EpiSmmuDestroy(second)==0);
     gmu[0]=0; mmio[0x10058/4]=2; mmio[0x10060/4]=0x60004000; mmio[0x10064/4]=1; mmio[0x10068/4]=0x1234;
-    before=writes;
+    before=mmioWrites;
     assert(EpiSmmuQueryFault(c,&fsr,&far,&syn)==0);
-    assert(fsr==2 && far==0x160004000ULL && syn==0x1234 && writes==before);
-    assert(EpiSmmuDisable(c)==STATUS_INVALID_DEVICE_STATE && writes==before); gmu[0]=1;
+    assert(fsr==2 && far==0x160004000ULL && syn==0x1234 && mmioWrites==before);
+    assert(EpiSmmuDisable(c)==STATUS_INVALID_DEVICE_STATE && mmioWrites==before); gmu[0]=1;
     syncTimeout=true;
     assert(EpiSmmuDisable(c)==STATUS_IO_TIMEOUT && stalls>=1000);
     assert(EpiSmmuDestroy(c)==STATUS_DEVICE_BUSY); syncTimeout=false;
