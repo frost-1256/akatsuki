@@ -1535,6 +1535,147 @@ SP再開のbreadcrumb/GX確認で後から失敗しても、既に失敗して�
   - #43 は、書き込み専用か、デバッグ用（ISDB）で読み出せないレジスタの可能性がある [U]。
 - これで `a6xx_set_hwcg(true)` に相当する処理を終えた。
 
+### 9.18 次の段階：hwcg の後の単純な設定（stage D の計画）
+
+出典は Linux master の `a6xx_gpu.c` の `hw_init`（hwcg の直後から `adreno_hw_init` の前まで）、`a6xx_catalog.c` の A635 の項目、`registers/adreno/a6xx.xml`、`a6xx_gmu.xml`、`a6xx_perfcntrs.xml`。事実の確認だけに使った。
+
+#### 9.18.1 A635 での分岐
+
+A635（chip id 0x06030500）の family は `ADRENO_6XX_GEN4` [L]。このため、`hw_init` の分岐は次のとおりになる [L]。
+
+| 判定 | A635 |
+|---|---|
+| `adreno_is_a650_family`（GEN3 か GEN4） | 真 |
+| `adreno_is_a660_family`（GEN4） | 真 |
+| `adreno_is_a640_family`、`a610_family`、`a7xx` | 偽 |
+| `adreno_is_a660`（revn 660 だけ） | 偽 |
+| `hw_apriv`（quirk `ADRENO_QUIRK_HAS_HW_APRIV`） | 真 |
+| `prim_fifo_threshold` | 0x00200200 |
+| `gmem` | 512 KB（ただし a650 系は GMEM 範囲の設定を飛ばす） |
+| `uche_trap_base` | 0x1FFFFFFFFF000 |
+
+#### 9.18.2 書き込みの一覧（Linux の順）
+
+アドレスはすべて dword 単位で、GPU の窓（0x03D00000）からの位置。64 ビットのレジスタは lo、hi の順に 2 dword を書く。
+
+| # | レジスタ | dword | 値 | 備考 |
+|---|---|---|---|---|
+| 1 | `RBBM_GBIF_CLIENT_QOS_CNTL` | 0x011 | 0x3 | a650 系。#21 で 0 に書き直す |
+| 2 | `RBBM_PERFCTR_GPU_BUSY_MASKED` | 0x50B | 0xFFFFFFFF | |
+| 3 | `UCHE_WRITE_RANGE_MAX` lo／hi | 0xE05／0xE06 | 0xFFFFFFC0／0x0001FFFF | trap_base + 0xFC0 |
+| 4 | `UCHE_TRAP_BASE` lo／hi | 0xE09／0xE0A | 0xFFFFF000／0x0001FFFF | |
+| 5 | `UCHE_WRITE_THRU_BASE` lo／hi | 0xE07／0xE08 | 0xFFFFF000／0x0001FFFF | |
+| — | `UCHE_GMEM_RANGE_MIN／MAX` | — | 書かない | a650 系は飛ばす [L] |
+| 6 | `UCHE_FILTER_CNTL` | 0xE18 | 0x804 | |
+| 7 | `UCHE_CACHE_WAYS` | 0xE17 | 0x4 | |
+| 8 | `CP_ROQ_THRESHOLDS_2` | 0x8C2 | 0x02000140 | a650 系 |
+| 9 | `CP_ROQ_THRESHOLDS_1` | 0x8C1 | 0x8040362C | a650 系 |
+| 10 | `CP_LPAC_PROG_FIFO_SIZE` | 0xB34 | 0x20 | a660 系。xml では A7XX の名前だが、Linux は a660 系にも書く |
+| 11 | `CP_MEM_POOL_SIZE` | 0x8C3 | 128（0x80） | |
+| 12 | `PC_DBG_ECO_CNTL` | 0x9E00 | 0x00200200 | prim_fifo_threshold |
+| 13 | `CP_AHB_CNTL` | 0x98D | 0x1 | AHB の既定の応答を ERROR にする。**§9.18.4 の注意を参照** |
+| 14 | `RBBM_PERFCTR_CNTL` | 0x500 | 0x1 | 性能カウンタを ON |
+| 15 | `CP_PERFCTR_CP_SEL(0)` | 0x8D0 | 0 | `PERF_CP_ALWAYS_COUNT`=0 |
+| — | `a6xx_set_ubwc_config` | — | 今回は書かない | 値が UBWC の設定データに依存する。別の段階にする |
+| 16 | `RBBM_INTERFACE_HANG_INT_CNTL` | 0x01F | 0x401FFFFF | `(1<<30)|0x1FFFFF`（A635 は既定の分岐） |
+| 17 | `UCHE_CLIENT_PF` | 0xE19 | 0x81 | `BIT(7)|1` |
+| 18 | `TPL1_BICUBIC_WEIGHTS_TABLE(0..4)` | 0xB608〜0xB60C | 0、0x3FE05FF4、0x3FA0EBEE、0x3F5193ED、0x3F0243F0 | a650 系 |
+| 19 | `GPU_GMU_AO_GPU_CX_BUSY_MASK` | 0x23B0E | 0xFF000000 | GMU 側（CX、AO） |
+| 20 | `GMU_CX_GMU_POWER_COUNTER_SELECT_0` | 0x1F841 | 下位 8 ビットを 0x20（`BIT(5)`）に rmw | GMU 側（CX） |
+| 20b | `GMU_CX_GMU_POWER_COUNTER_ENABLE` | 0x1F840 | 1 | GMU 側（CX）。slumber の前に既存の処理が 0 に戻す |
+| — | `a6xx_set_cp_protect` | — | 今回は書かない | 表が大きい（a660_protect）。別の段階にする |
+| 21 | `CP_CHICKEN_DBG` | 0x841 | 0x1 | a660 系（a690 以外） |
+| 21b | `RBBM_GBIF_CLIENT_QOS_CNTL` | 0x011 | 0x0 | a660 系。#1 の 3 を上書き |
+| — | `UCHE_CMDQ_CONFIG` | — | 書かない | a660／a663 だけ。A635 は対象外 [L] |
+| 22 | `CP_APRIV_CNTL` | 0x844 | 0x6E | `BIT(6)|BIT(5)|BIT(3)|BIT(2)|BIT(1)`（hw_apriv、a6xx） |
+| — | `RBBM_INT_0_MASK` | 0x038 | 今回は書かない | 割り込みの処理がまだないので 0 のまま |
+
+この後の `adreno_hw_init`、SQE の命令の基点、リングバッファ、`CP_SQE_CNTL=1`、`cp_init`、zap は、メモリ（IOVA）と SQE ファームウェアが要るので、stage D の範囲外。
+
+#### 9.18.3 マップするページ
+
+| ページ（物理） | dword の範囲 | 中のレジスタ | 状態 |
+|---|---|---|---|
+| 0x03D00000 | 0x000〜0x3FF | 0x011、0x01F | stage C で使用中 |
+| 0x03D01000 | 0x400〜0x7FF | 0x500、0x50B | stage C で使用中 |
+| 0x03D02000 | 0x800〜0xBFF | 0x841、0x844、0x8C1〜0x8C3、0x8D0、0x98D、0xB34 | stage B（0x842）で使用 |
+| 0x03D03000 | 0xC00〜0xFFF | 0xE05〜0xE0A、0xE17〜0xE19 | stage B（0xE00）で使用 |
+| 0x03D27000 | 0x9C00〜0x9FFF | 0x9E00 | stage B（0x9E01）で使用 |
+| 0x03D2D000 | 0xB400〜0xB7FF | 0xB608〜0xB60C | stage B（0xB601）で使用 |
+| 0x03D7E000 | 0x1F800〜0x1FBFF | 0x1F840、0x1F841 | GMU。既存の処理で使用中 |
+| 0x03D8E000 | 0x23800〜0x23BFF | 0x23B0E | GMU のページ B。既存 |
+
+新しいページは要らない [I]。
+
+#### 9.18.4 注意点
+
+- **`CP_AHB_CNTL=1`（#13）：** Linux のコメントは「AHB の既定のスレーブ応答を ERROR にする」[L]。CPU から存在しないレジスタを読んだときにバスエラー（SError）になるかどうかは分からない [U]。今の診断は存在するレジスタしか読まないが、安全のため次のどちらかにすることを提案する。
+  - 案 A：最初の実行では #13 だけ飛ばし、別のビットで後から足す。
+  - 案 B：書くが、書いた後の GX 側の読み出しを一覧の値の読み戻しだけに限る。
+- **読み戻し：** v54/v55 で、書いた値が読み戻せないレジスタがあると分かった。stage D の読み戻しは全部を診断用の記録だけにし、止めるのは breadcrumb、GX の確認、map の失敗だけにすることを提案する。0x011 は 2 回書くので、記録は 2 回分とる。
+- **GMU 側（#19〜#20b）：** CX 側なので、GX を切っても消えない [I]。元の値を記録し、teardown で戻す。ENABLE（0x1F840）は既存の slumber の処理が 0 にするので、二重に戻さなくてよい。
+- **GX 側の元の値：** hwcg と同じく、GX を切ると消えるので戻さない [I]。Linux も戻さない。
+- **順番の条件：** stage C（bit17）が成功してから行う。bit18 は bit17 を前提にする。
+
+#### 9.18.5 提案する実装の形
+
+- プローブのビット：bit18（0x40000）。`EpiGpuProbe=0x7FE80`。bit17 の前提が足りなければ、既存のとおり status 6 で拒む。
+- breadcrumb：元の値の読み出しは 0x900+i、書き込みは 0x940+i、GMU 側の復元は 0x9A0+i（範囲は実装の都合で決めてよい）。
+- 記録（`GpuGmuGxCfg` など）：
+  - Attempted、Reason、Status、Count、Gdscr、GxHm。
+  - 書いた各項目の Before と After。64 ビットのものは lo と hi を別の項目にする。
+  - GMU 側の元の値 3 個、復元後の値、復元の Status。
+- 期待：Before はすべて 0（v55 の時点で GX は起動直後の状態）。After は書いた値になるが、一部は実装されていないビットや書き込み専用のため違う値になりうる [U]。
+
+#### 9.18.6 stage D の実装（実機未実行）
+
+bit18 `EPI_GMU_PROBE_GX_CFG=0x40000` を追加。bit17とその全前提を必要とし、`0x7FE80` でstage C成功後、同じOOBの解除前に実行する。前提不足はワンショット解除・flush後、ハードウェアに触る前にstatus 6で拒否する。CP_AHB_CNTLは案Aを採用し、元値の読み取りも書き込みも含めない。追加の試験ビットは今回は作らない。
+
+§9.18.2の順序を保ち、64ビット値をlo・hiに分けた30項目を実装した。先頭、+0x1000、+0x2000、+0x3000、+0x27000、+0x2D000の既知の6ページを一時的にRW・非キャッシュでmapし、GMUの2ページは既存mapを使う。全元値を保存してから書き始める。各元値読み取り前と各書き込み前にbreadcrumb保存・flushとGX確認を行う。書いた直後の読み戻しは全項目とも診断専用で、不一致だけでは止めない。map、breadcrumb、GX確認の失敗でそれ以降の書き込みを止め、取得済みmapをすべて解除してOOB解除・slumberへ進む。stage Cが失敗した場合はstage Dを呼ばずReason 8を記録する。
+
+SELECT_0は保存した元値の下位8ビットだけを0x20に置き換える。QOSは3と0の2項目として記録し、それぞれのBeforeは書き始める前の同じ元値、Afterはそれぞれの書き込み直後の値になる。GX側の元値は復元しない。
+
+CX側のBUSY_MASK、SELECT_0、ENABLEは、実際に書いたものだけをreset/idle確認とSMMU Disable成功後、CGC・クロック復元の前に元へ戻す。各復元は読み戻しを厳密に比較し、失敗しても残るCX項目を試みる。いずれかの復元・breadcrumbに失敗すればstatus 8 / KeepCx。ENABLEの元値はstage D開始前の値を既存のPowerCounterOriginalにも引き継ぎ、slumberで一時値1を保存し直さない。slumberは従来どおりENABLEに0を書く。復元時にすでに元値なら値の確認だけにし、既存の後段のENABLE復元は重ねて行わない。初期値が非0なら、その初期値へ戻す。GX/idle確認やSMMU Disableで先にKeepCxとなった場合は、従来どおりCX設定も保持する。stage D自体の失敗でも安全な後片付けが成功すればstatus 13。
+
+診断 `GpuGmuGxCfg` はREG_BINARY、536バイト（134 DWORD）：`{Attempted, Reason, Status, Count, Gdscr, GxHm, Writes[30], CxBefore[3], CxRestored[3], CxRestoreStatus, CxWritten}`。Writesの各項目は `{Reg, Value, Before, After}` の16バイト。RegはGPU窓からのdword、Valueは実際の要求値（SELECT_0もRMW後の値）、順序は§9.18.2からCP_AHB_CNTLを除いて展開した順。Countは読み戻しまで完了した項目数（最大30）、Attemptedは最初の書き込み直前に1。Reasonの0〜6は従来と同じ、8は前段未完了。Status/CxRestoreStatusはNTSTATUSで未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。CxBefore/CxRestoredの順序とCxWrittenのbit0〜2はBUSY_MASK、SELECT_0、ENABLE。CxWrittenは各書き込み直前に立てる。cleanup/keepの両経路とCX復元直後に保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x900〜0x91D | 30項目の元値保存（0x900はmap前にも使用） |
+| 0x940〜0x95D | 同じ順序の書き込みと即時読み戻し |
+| 0x9A0〜0x9A2 | CX 3項目の復元・確認 |
+
+shim/ホスト試験に、30項目の順序、lo/hi、QOSの2記録、SELECTの上位ビット保持、不一致を無視した続行、各書き込み前のbreadcrumb失敗、元値記録中・mapの失敗、CXの復元と復元失敗、slumber後のENABLE二重書き込み回避を追加した。30組の定数と順序は仕様表との機械的照合で一致した。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。UBWC、cp_protect、割り込みマスク、SQE、リングバッファ、CP起動は含めない。
+
+#### 9.18.7 結果（v56）
+
+**結果（2026-11-13、v34-akat、Epinephrine v56 / 20.0.2.56、`EpiGpuProbe=0x7FE80`、00:31 の再起動後）：成功** [P]。
+
+- 全体：
+  - `GpuGmuStatus=0`、NtStatus 0、KeepCx 0、`GpuCxStatus=0`。
+  - hwcg（stage C）は v55 と同じく Reason 0、Count 53、`RBBM_CLOCK_CNTL=0x8AA8AA82`。
+- `GpuGmuGxCfg`（536 B）：
+  - Attempted 1、Reason 0、Status 0、Count 30、Gdscr 0xF8222800、GxHm 0。
+  - CX 側 3 項目の元値は 0／0／0、復元後も 0／0／0、`CxRestoreStatus=0`、CxWritten 7。
+- 30 項目のうち 28 項目は、書いた値が読み戻せた。違ったのは 2 項目：
+
+  | # | レジスタ（dword） | 書いた値 | 読み戻し | 解釈 |
+  |---|---|---|---|---|
+  | 1 | `RBBM_PERFCTR_GPU_BUSY_MASKED`（0x50B） | 0xFFFFFFFF | 0x002F7FFF | 実装されているビットだけが残る [I] |
+  | 10 | `CP_ROQ_THRESHOLDS_2`（0x8C2） | 0x02000140 | 0 | 読むと 0。書き込み専用か、この GPU にない [U] |
+
+- 元の値が 0 でなかった項目（リセット直後の既定値と見られる [I]）：
+
+  | # | レジスタ（dword） | 元の値 |
+  |---|---|---|
+  | 2、3 | `UCHE_WRITE_RANGE_MAX` lo／hi（0xE05／0xE06） | 0xFFFFFFC0／0x0001FFFF（Linux の値と同じ） |
+  | 9 | `UCHE_CACHE_WAYS`（0xE17） | 0x00040000 |
+  | 14 | `PC_DBG_ECO_CNTL`（0x9E00） | 0x00180000 |
+  | 17 | `RBBM_INTERFACE_HANG_INT_CNTL`（0x01F） | 0x0FFFFFFF |
+
+- #28（QOS を 0 に戻す 2 回目）の Before は 0。元の値は、どの書き込みよりも先に 30 項目まとめて読むので、#0 で書いた 3 は映っていない。
+- これで、hwcg の後から `adreno_hw_init` の前までの単純な設定を、`CP_AHB_CNTL`、UBWC、cp_protect、割り込みマスクを除いて終えた。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

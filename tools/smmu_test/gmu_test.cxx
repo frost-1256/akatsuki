@@ -48,6 +48,7 @@ static std::vector<UCHAR> Image() {
     ULONG version=0x30010008; Block(f,0x10007FE0,4,0,0,&version); return f;
 }
 static void Reset() {
+    cfgWrites.clear(); failCfgDword=0xFFFFFFFF;
     std::memset(hwcgIsdbPage,0,sizeof(hwcgIsdbPage)); std::memset(hwcgSpPage,0,sizeof(hwcgSpPage));
     hwcgWrites.clear(); failHwcgDword=0xFFFFFFFF; failHwcgSpSet=false;
     std::memset(secvidPage,0,sizeof(secvidPage)); secvidWrites.clear(); failSecvidOffset=0xFFFFFFFF;
@@ -251,6 +252,61 @@ int main(int argc,char** argv) {
         assert(GmuGxHwcgRestore(&probe,reinterpret_cast<HANDLE>(1),&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.CgcRestored[0]==GmuHwcgCgc[0] && hw.CgcRestored[1]==0x11 && hw.CgcRestored[2]==0x12);
         failHwcgDword=0xFFFFFFFF;
+        // Stage D: complete originals, lo/high ordering, QOS twice, SELECT RMW, no readback comparisons.
+        const auto seedCfg=[&]() {
+            failGmuStep=0xFFFFFFFF; failCfgDword=0xFFFFFFFF; failAddrMap=0xFFFFFFFF;
+            cfgWrites.clear();
+            for(ULONG i=0;i<30;++i) *GmuCfgReg(cfgDwords[i])=0x100+i;
+            *GmuCfgReg(0x1F841)=0xABCDEFAA; *GmuCfgReg(0x1F840)=0;
+        };
+        seedCfg(); GMU_GX_CFG_TRACE cfg=GmuGxCfgTrace();
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
+        assert(cfg.Reason==0 && cfg.Count==30 && cfg.Attempted==1 && cfg.CxWritten==7 && cfgWrites.size()==30);
+        assert(cfg.Writes[0].Before==0x11C && cfg.Writes[28].Before==0x11C);
+        assert(cfg.Writes[0].After==3 && cfg.Writes[28].After==0);
+        assert(cfg.Writes[25].Value==0xABCDEF20 && cfg.Writes[25].After==0xABCDEF20);
+        for(ULONG i=0;i<30;++i) {
+            assert(cfg.Writes[i].Reg==cfgDwords[i] && cfgWrites[i].first==cfgDwords[i]);
+            assert(cfgWrites[i].second==cfg.Writes[i].Value && cfg.Writes[i].After==cfg.Writes[i].Value);
+        }
+        // Slumber clears ENABLE; teardown must not duplicate that write or restore stage D's temporary 1.
+        *GmuCfgReg(0x1F840)=0; cfgWrites.clear();
+        assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==0);
+        assert(cfgWrites.size()==2 && cfg.CxRestored[2]==0);
+        for(ULONG i=0;i<3;++i) assert(cfg.CxRestored[i]==cfg.CxBefore[i]);
+        seedCfg(); cfg=GmuGxCfgTrace(); *GmuCfgReg(0x1F840)=5;
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
+        *GmuCfgReg(0x1F840)=0;
+        assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==0);
+        assert(cfg.CxBefore[2]==5 && cfg.CxRestored[2]==5 && *GmuCfgReg(0x1F840)==5);
+        for(ULONG fail=0;fail<30;++fail) {
+            seedCfg(); cfg=GmuGxCfgTrace(); failCfgDword=cfgDwords[fail];
+            assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
+            assert(cfg.Reason==0 && cfg.Count==30 && cfgWrites.size()==30);
+        }
+        // Every write breadcrumb failure stops later writes, leaving unread After fields untouched.
+        for(ULONG fail=0;fail<30;++fail) {
+            seedCfg(); cfg=GmuGxCfgTrace(); failGmuStep=0x940+fail;
+            assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_IO_DEVICE_ERROR);
+            assert(cfg.Reason==6 && cfg.Count==fail && cfgWrites.size()==fail);
+            for(ULONG i=fail;i<30;++i) assert(cfg.Writes[i].After==0xFFFFFFFF);
+            assert(cfg.CxWritten==static_cast<ULONG>((fail>24 ? 1 : 0)|(fail>25 ? 2 : 0)|(fail>26 ? 4 : 0)));
+        }
+        seedCfg(); cfg=GmuGxCfgTrace(); failGmuStep=0x919;
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_IO_DEVICE_ERROR);
+        assert(cfg.Count==0 && cfg.CxWritten==0 && cfgWrites.empty());
+        seedCfg(); cfg=GmuGxCfgTrace(); failAddrMap=0;
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_INSUFFICIENT_RESOURCES);
+        assert(cfg.Reason==5 && cfgWrites.empty());
+        seedCfg(); cfg=GmuGxCfgTrace(); gPages[1][0xD0]=0xC0;
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_INVALID_DEVICE_STATE);
+        assert(cfg.Reason==GX_REG_HM_OFF && cfg.Count==0 && cfgWrites.empty()); gPages[1][0xD0]=0;
+        seedCfg(); cfg=GmuGxCfgTrace();
+        assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
+        failCfgDword=0x23B0E;
+        assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==STATUS_IO_DEVICE_ERROR);
+        assert(cfg.CxRestored[0]!=cfg.CxBefore[0] && cfg.CxRestored[1]==cfg.CxBefore[1] && cfg.CxRestored[2]==0);
+        failCfgDword=0xFFFFFFFF;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;

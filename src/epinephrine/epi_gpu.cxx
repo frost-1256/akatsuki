@@ -748,7 +748,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
                                                (Flags & EPI_GMU_PROBE_GX_HALT) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_SECVID) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_ADDR_MODE) ? TRUE : FALSE,
-                                               (Flags & EPI_GMU_PROBE_HWCG) ? TRUE : FALSE);
+                                               (Flags & EPI_GMU_PROBE_HWCG) ? TRUE : FALSE,
+                                               (Flags & EPI_GMU_PROBE_GX_CFG) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -865,6 +866,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit15 = requires bit14 and its prerequisites (0xFE80), SECVID stage A.
     // bit16 = requires bit15 and its prerequisites (0x1FE80), ADDR_MODE stage B.
     // bit17 = requires bit16 and its prerequisites (0x3FE80), hwcg stage C.
+    // bit18 = requires bit17 and its prerequisites (0x7FE80), stage D without CP_AHB_CNTL.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     if (flags & EPI_RSCC_PROBE_WRITE)
@@ -881,7 +883,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     }
     else if (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE | EPI_GMU_PROBE_CLOCK |
                       EPI_GMU_PROBE_GX_ON | EPI_GMU_PROBE_GX_REG | EPI_GMU_PROBE_GX_HALT |
-                      EPI_GMU_PROBE_SECVID | EPI_GMU_PROBE_ADDR_MODE | EPI_GMU_PROBE_HWCG))
+                      EPI_GMU_PROBE_SECVID | EPI_GMU_PROBE_ADDR_MODE | EPI_GMU_PROBE_HWCG | EPI_GMU_PROBE_GX_CFG))
     {
         const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
         if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
@@ -897,7 +899,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             ((flags & EPI_GMU_PROBE_GX_HALT) && !(flags & EPI_GMU_PROBE_GX_REG)) ||
             ((flags & EPI_GMU_PROBE_SECVID) && !(flags & EPI_GMU_PROBE_GX_HALT)) ||
             ((flags & EPI_GMU_PROBE_ADDR_MODE) && !(flags & EPI_GMU_PROBE_SECVID)) ||
-            ((flags & EPI_GMU_PROBE_HWCG) && !(flags & EPI_GMU_PROBE_ADDR_MODE)))
+            ((flags & EPI_GMU_PROBE_HWCG) && !(flags & EPI_GMU_PROBE_ADDR_MODE)) ||
+            ((flags & EPI_GMU_PROBE_GX_CFG) && !(flags & EPI_GMU_PROBE_HWCG)))
         { status = 6; goto done; }
     }
     else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }
