@@ -15,6 +15,7 @@
 #define EPI_GMU_PROBE_ADDR_MODE 0x10000UL // modifier: requires 0xFE80 (0x1FE80 total), ADDR_MODE stage B
 #define EPI_GMU_PROBE_HWCG      0x20000UL // modifier: requires 0x1FE80 (0x3FE80 total), hwcg stage C
 #define EPI_GMU_PROBE_GX_CFG    0x40000UL // modifier: requires 0x3FE80 (0x7FE80 total), stage D without CP_AHB_CNTL
+#define EPI_GMU_PROBE_STAGE_E   0x80000UL // modifier: requires 0x7FE80 (0xFFE80 total), UBWC and CP protection
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -129,6 +130,13 @@
 // Reason 0..6 match GxReg, 8=stage C incomplete. Unread=0xFFFFFFFF, unattempted status=STATUS_NOT_FOUND.
 // Breadcrumbs: originals 0x900..0x91D, writes 0x940..0x95D, CX restoration 0x9A0..0x9A2.
 // CX restoration compares strictly, attempts all written targets, and failure requires KeepCx.
+// GpuGmuGxStageE: 776 bytes {Attempted, Reason, Status, Count, Gdscr, GxHm, Writes[47]}.
+// Each entry is {Reg, Value, Before, After}, in survey 9.19 order: UBWC[5], CP_PROTECT_CNTL, protect[41].
+// Protect entries 0..39 use 0x850..0x877; entry 40 uses 0x87F. 0x878..0x87E are never accessed.
+// Readbacks are diagnostic only; no restoration. Count is completed write/readback pairs (0..47).
+// Reason 0..6 match GxReg; 8=stage D incomplete. Unread=0xFFFFFFFF; unattempted Status=STATUS_NOT_FOUND.
+// Breadcrumbs: original reads 0xA00..0xA2E, writes 0xA40..0xA6E; each flush precedes a GX guard.
+// Stage F (bit20) remains unimplemented and is rejected before hardware access.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -145,10 +153,11 @@
 // AddrMode: requires Secvid and its prerequisites; stage B follows successful stage A (probe 0x1FE80).
 // Hwcg: requires AddrMode and its prerequisites; stage C follows successful stage B (probe 0x3FE80).
 // GxCfg: requires Hwcg and its prerequisites; stage D follows stage C under OOB (probe 0x7FE80).
+// StageE: requires GxCfg and its prerequisites; follows successful stage D under OOB (probe 0xFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
-                     BOOLEAN GxCfg = FALSE);
+                     BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE);

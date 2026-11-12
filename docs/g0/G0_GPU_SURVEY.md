@@ -1676,6 +1676,153 @@ shim/ホスト試験に、30項目の順序、lo/hi、QOSの2記録、SELECTの�
 - #28（QOS を 0 に戻す 2 回目）の Before は 0。元の値は、どの書き込みよりも先に 30 項目まとめて読むので、#0 で書いた 3 は映っていない。
 - これで、hwcg の後から `adreno_hw_init` の前までの単純な設定を、`CP_AHB_CNTL`、UBWC、cp_protect、割り込みマスクを除いて終えた。
 
+### 9.19 次の段階：UBWC、cp_protect、CP_AHB_CNTL（stage E／F の計画）
+
+出典は Linux master の `a6xx_gpu.c`（`a6xx_set_ubwc_config`、`a6xx_set_cp_protect`、`hw_init`）、`a6xx_gpu.h`（`A6XX_PROTECT_*`）、`a6xx_catalog.c`（`a660_protect`）、`drivers/soc/qcom/ubwc_config.c`、`include/linux/soc/qcom/ubwc.h`、`registers/adreno/a6xx.xml`。事実の確認だけに使った。
+
+#### 9.19.1 UBWC の設定値
+
+- `ubwc_config.c` で `qcom,sm7325` は `ubwc_3_1_hbb14`。`ubwc_enc_version` は UBWC_3_1（0x30010000）、`highest_bank_bit` は 14、flags は 0 [L]。sc7280 と qcm6490 も同じデータ [L]。
+- `a6xx_set_ubwc_config` の中間値（A635 で計算した）[L]：
+
+  | 名前 | 計算 | 値 |
+  |---|---|---|
+  | hbb | 14 − 13 | 1 |
+  | hbb_hi／hbb_lo | hbb >> 2／hbb & 3 | 0／1 |
+  | rgb565_predicator | 版 ≥ 4.0 | 0 |
+  | level2_swizzling_dis | 3.1 なので LVL2 は有効 | 0 |
+  | ubwc_mode | 版 == 1.0 | 0 |
+  | amsbc | 版 ≥ 3.0 | 1 |
+  | min_acc_len_64b | 版 == 1.0 | 0 |
+  | uavflagprd_inv | a650 系 | 2 |
+  | macrotile_mode | 版 ≥ 3.1 | 1 |
+
+- 書き込み（Linux の順。A7XX だけの部分は飛ばす）：
+
+  | # | レジスタ | dword | 式 | 値 |
+  |---|---|---|---|---|
+  | U1 | `RB_NC_MODE_CNTL` | 0x8E08 | amsbc<<4 \| hbb_lo<<1 | 0x12 |
+  | U2 | `TPL1_NC_MODE_CNTL` | 0xB604 | hbb_lo<<1 | 0x2 |
+  | U3 | `SP_NC_MODE_CNTL` | 0xAE02 | uavflagprd_inv<<4 \| hbb_lo<<1 | 0x22 |
+  | U4 | `UCHE_MODE_CNTL` | 0xE01 | min_acc_len_64b<<23 \| hbb_lo<<21 | 0x00200000 |
+  | U5 | `RBBM_NC_MODE_CNTL` | 0x534 | macrotile_mode | 0x1 |
+
+- Linux では、`CP_PERFCTR_CP_SEL(0)` の直後（stage D の #16 と #17 の間）に呼ばれる [L]。
+
+#### 9.19.2 cp_protect の値
+
+- `CP_PROTECT_CNTL`（dword 0x84F）= ACCESS_PROT_EN（bit0）| ACCESS_FAULT_ON_VIOL_EN（bit1）| LAST_SPAN_INF_RANGE（bit3）= **0xB** [L]。
+- 各項目の形 [L]：
+  - `A6XX_PROTECT_NORDWR(reg, len)` = `(1<<31) | ((len & 0x3FFF) << 18) | (reg & 0x3FFFF)`。読み書きの両方を禁止する。
+  - `A6XX_PROTECT_RDONLY(reg, len)` は bit31 を立てない。読むことは許す。
+- `a660_protect` は 41 項目で、count_max は 48 [L]。書き方は次のとおり [L]：
+  - 項目 0〜39 を `CP_PROTECT(0..39)`（dword 0x850〜0x877）に書く。値が 0 の項目は飛ばすが、a660 の表には 0 の項目はない。
+  - 最後の項目 40 は `CP_PROTECT(47)`（dword 0x87F）に書く。CNTL の bit3 と組み合わせて「その番地から末尾まで」の意味になる。
+  - `CP_PROTECT(40..46)`（0x878〜0x87E）は書かない。
+  - xml の配列の長さは 32 だが、Linux は 48 個目まで使う。
+- 書く値（Linux のマクロから機械的に計算した）：
+
+  | 項目 | dword | 値 | 項目 | dword | 値 |
+  |---|---|---|---|---|---|
+  | 0 | 0x850 | 0x13FC0000 | 21 | 0x865 | 0x876C9624 |
+  | 1 | 0x851 | 0x00140501 | 22 | 0x866 | 0x80449E60 |
+  | 2 | 0x852 | 0x0BD0050B | 23 | 0x867 | 0x861C9E78 |
+  | 3 | 0x853 | 0x8000050E | 24 | 0x868 | 0x873CA630 |
+  | 4 | 0x854 | 0x80000510 | 25 | 0x869 | 0x8000AE02 |
+  | 5 | 0x855 | 0x80000534 | 26 | 0x86A | 0x84BCAE50 |
+  | 6 | 0x856 | 0x82080800 | 27 | 0x86B | 0x8000B604 |
+  | 7 | 0x857 | 0x802008A0 | 28 | 0x86C | 0x8018B608 |
+  | 8 | 0x858 | 0x809008AB | 29 | 0x86D | 0x8004BE02 |
+  | 9 | 0x859 | 0x02B808DE | 30 | 0x86E | 0x857CBE20 |
+  | 10 | 0x85A | 0x81340900 | 31 | 0x86F | 0x97FCD000 |
+  | 11 | 0x85B | 0x89C8098D | 32 | 0x870 | 0xAFFCF000 |
+  | 12 | 0x85C | 0x80040E00 | 33 | 0x871 | 0x7FFCFC00 |
+  | 13 | 0x85D | 0x80300E03 | 34 | 0x872 | 0xFFFD8400 |
+  | 14 | 0x85E | 0x830C3C00 | 35 | 0x873 | 0xFFFDA400 |
+  | 15 | 0x85F | 0x7FFC3CC4 | 36 | 0x874 | 0x910DF400 |
+  | 16 | 0x860 | 0x873C8630 | 37 | 0x875 | 0x01EDF844 |
+  | 17 | 0x861 | 0x80008E00 | 38 | 0x876 | 0x8001F860 |
+  | 18 | 0x862 | 0x80008E08 | 39 | 0x877 | 0x806DF887 |
+  | 19 | 0x863 | 0x807C8E50 | 40 → (47) | 0x87F | 0x8001F8C0 |
+  | 20 | 0x864 | 0x89FC8E80 | | | |
+
+- 元の a660 の表の (reg, len) の組：項目 0 = RDONLY(0x00000, 0x4FF)、項目 11 = NORDWR(0x0098D, 0x272)、項目 31 = NORDWR(0x0D000, 0x5FF)、項目 40 = NORDWR(0x1F8C0, 0) など。全項目は Linux の `a660_protect_regs` のとおり。
+- Linux では、GMU の電力カウンタの直後（stage D の #20b と #21 の間）に呼ばれる [L]。
+- この保護は CP（SQE）が出すレジスタアクセスにだけ効く。CPU から AHB 経由で触る分には効かない [I]。CP はまだ動かしていないので、今書いても動作は変わらない [I]。
+
+#### 9.19.3 CP_AHB_CNTL
+
+- dword 0x98D に 0x1 を書く。Linux のコメントは「AHB の既定のスレーブ応答を ERROR にする」[L]。
+- 意味が CPU 側のアクセスにも及ぶかどうかは分からない [U]。今の診断が読むのは、存在が確かめられたレジスタだけ。
+- 別のビットにして、ほかの段階が全部通った後に、単独で 1 回だけ試すことを提案する。
+
+#### 9.19.4 マップするページ
+
+| ページ（物理） | dword の範囲 | 使う番地 | 状態 |
+|---|---|---|---|
+| 0x03D01000 | 0x400〜0x7FF | 0x534 | 使用中 |
+| 0x03D02000 | 0x800〜0xBFF | 0x84F、0x850〜0x877、0x87F、0x98D | 使用中 |
+| 0x03D03000 | 0xC00〜0xFFF | 0xE01 | 使用中 |
+| 0x03D23000 | 0x8C00〜0x8FFF | 0x8E08 | stage B（0x8E05）で使用 |
+| 0x03D2B000 | 0xAC00〜0xAFFF | 0xAE02 | stage B（0xAE01）で使用 |
+| 0x03D2D000 | 0xB400〜0xB7FF | 0xB604 | 使用中 |
+
+新しいページは要らない [I]。
+
+#### 9.19.5 提案する実装の形
+
+- **stage E（bit19 = 0x80000、`EpiGpuProbe=0xFFE80`）：** UBWC 5 個、`CP_PROTECT_CNTL`、protect 41 個の計 47 書き込み。
+  - Linux の位置どおりに stage D の途中へ差し込むと、stage D の記録の形が変わる。stage D の直後にまとめて行うことを提案する。どちらも CP が動く前の静的な設定なので、順番による差はないと見ている [I]。
+  - 読み戻しは記録だけにする。止めるのは breadcrumb、GX の確認、map の失敗だけ。
+  - GX 側だけなので、元の値は戻さない（GX を切ると消える）[I]。
+- **stage F（bit20、`EpiGpuProbe=0x1FFE80`）：** `CP_AHB_CNTL=1` だけを書く。
+  - 書いた後に、stage D で書いたレジスタのいくつか（たとえば 0x011、0x500、0xE17）を読み、値が変わらず読めて SError が出ないことを確かめる。
+- **書かないもの：** `RBBM_INT_0_MASK`（割り込みの処理がまだない）。
+- stage F が通れば、`adreno_hw_init` の前の設定はすべて終わる。その次はメモリが要る段階に入る（SQE ファームウェアの読み込み、`CP_SQE_INSTR_BASE`、リングバッファ、`CP_SQE_CNTL=1`、`cp_init`）。
+
+#### 9.19.6 stage E の実装（実機未実行）
+
+bit19 `EPI_GMU_PROBE_STAGE_E=0x80000` を追加。bit18とその全前提が必要で、`EpiGpuProbe=0xFFE80` のとき、stage D成功後、同じOOBの解除前に実行する。前提不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。stage F（bit20）は未実装として同じくstatus 6で拒否し、CP_AHB_CNTLを読んだり書いたりしない。既存の`0x7FE80`までの設定手順と後片付けは維持する。
+
+書く順序はUBWC 5個、CP_PROTECT_CNTL、保護表41個の計47個。保護表の項目0〜39は0x850〜0x877、最後の項目40は0x87Fへ書く。0x878〜0x87Eは元値読み取りにも書き込みにも含めない。定数と順序は§9.19.1/9.19.2の表との機械的照合で47組すべて一致した。
+
+既知の6ページ（GPU窓の+0x1000、+0x2000、+0x3000、+0x23000、+0x2B000、+0x2D000）だけを一時的にRW・非キャッシュでmapする。全47個の元値を保存してから書き始める。各元値読み取り・各書き込みの前にはbreadcrumb保存・flushとGX確認を行い、各書き込み直後に同じレジスタを読み返す。読み戻しは診断だけで、不一致によって止めない。map、breadcrumb、GX確認の失敗時には後続のstage E書き込みを止め、取得済みmapをすべて解除して既存のOOB解除・slumber・resetへ進む。元値の復元はしない。stage D未完了ならstage Eには触らずReason 8を記録する。stage Eだけの失敗でも安全な後片付けが成功すればstatus 13、従来の安全確認や後片付けに失敗すればstatus 8 / KeepCx。stage DのCX復元、CGC復元、GX OFF確認の扱いは変えない。
+
+追加診断 `GpuGmuGxStageE` はREG_BINARY、776バイト（194 DWORD）：`{Attempted, Reason, Status, Count, Gdscr, GxHm, Writes[47]}`。Writesの各項目は16バイトの `{Reg, Value, Before, After}`。RegはGPU窓からのdword、Valueは要求値で、順序はUBWC[5]、CP_PROTECT_CNTL、protect[41]。Attemptedは最初の書き込み直前に1、Countは読み戻し完了までの項目数（最大47）。Reasonは0=完了、1=未到達、2=OOB ACK失敗、3=GDSCR OFF、4=GX HM不成立、5=map失敗、6=breadcrumb失敗、8=前段未完了。StatusはNTSTATUS、未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。cleanup/keepの両経路で保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0xA00〜0xA2E | 元値保存前のflush・GX確認（0xA00はmap前にも使用） |
+| 0xA40〜0xA6E | 同じ順序での書き込みと即時読み戻し |
+
+shim/ホスト試験に、47個の順序・値と全元値の保存、最後の保護項目の47番配置、40〜46番に触れないこと、各項目の読み戻し不一致でも最後まで進むこと、各書き込み前のbreadcrumb失敗、元値記録中・map・GX確認の失敗で書き込まないことを追加した。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。割り込みマスク、stage F、SQE、リングバッファ、CP起動は含めない。
+
+#### 9.19.7 結果（v57）
+
+**結果（2026-11-13、v34-akat、Epinephrine v57 / 20.0.2.57、`EpiGpuProbe=0xFFE80`、00:49 の再起動後）：成功** [P]。
+
+- 全体：
+  - `GpuGmuStatus=0`、NtStatus 0、KeepCx 0、`GpuCxStatus=0`。
+  - 前提の段階も v56 と同じ結果だった：
+    - hwcg：Reason 0、Count 53、`RBBM_CLOCK_CNTL=0x8AA8AA82`。
+    - stage D：Reason 0、Count 30、CX の復元 0。
+- `GpuGmuGxStageE`（776 B）：
+  - Attempted 1、Reason 0、Status 0、Count 47、Gdscr 0xF8222800、GxHm 0。
+  - **47 項目すべてで、書いた値がそのまま読み戻せた。**
+  - `CP_PROTECT_CNTL`（0x84F）、`CP_PROTECT(0..39)`、`CP_PROTECT(47)` は、元の値が 0 だった。
+- UBWC の 5 個のうち 4 個は、元の値が 0 ではなかった（リセット直後の既定値と見られる [I]）：
+
+  | レジスタ（dword） | 元の値 | 書いた値 |
+  |---|---|---|
+  | `RB_NC_MODE_CNTL`（0x8E08） | 0x2 | 0x12（amsbc を追加） |
+  | `TPL1_NC_MODE_CNTL`（0xB604） | 0x2 | 0x2（同じ） |
+  | `SP_NC_MODE_CNTL`（0xAE02） | 0x2 | 0x22（uavflagprd_inv を追加） |
+  | `UCHE_MODE_CNTL`（0xE01） | 0x00200000 | 0x00200000（同じ） |
+  | `RBBM_NC_MODE_CNTL`（0x534） | 0x1 | 0x1（同じ） |
+
+  - 既定値の hbb_lo はすでに 1（highest bank bit 14）で、macrotile も有効になっていた。sm7325 向けの既定値と見られる [I]。
+- これで、`adreno_hw_init` の前の設定で残っているのは `CP_AHB_CNTL`（stage F）と、割り込みのマスクだけになった。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

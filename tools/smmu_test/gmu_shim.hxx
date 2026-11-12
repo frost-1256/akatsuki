@@ -46,6 +46,12 @@ static const ULONG addrDwords[]={0x0842,0x0C01,0x8601,0x8E05,0x9E01,0xBE05,
 static std::vector<ULONG> addrWrites;
 static std::vector<std::pair<ULONG,ULONG>> cfgWrites;
 static ULONG failCfgDword=0xFFFFFFFF;
+static std::vector<std::pair<ULONG,ULONG>> stageEWrites;
+static ULONG failStageEDword=0xFFFFFFFF;
+inline ULONG GmuStageEReg(ULONG i) {
+    const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
+    return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
+}
 static const ULONG cfgDwords[]={0x011,0x50B,0xE05,0xE06,0xE09,0xE0A,0xE07,0xE08,0xE18,0xE17,
     0x8C2,0x8C1,0xB34,0x8C3,0x9E00,0x500,0x8D0,0x01F,0xE19,0xB608,0xB609,0xB60A,0xB60B,0xB60C,
     0x23B0E,0x1F841,0x1F840,0x841,0x011,0x844};
@@ -97,6 +103,15 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x98D)); // stage D must never enable CP_AHB_CNTL
+    for(ULONG reg=0x878;reg<=0x87E;++reg) assert(p!=GmuCfgReg(reg));
+    for(ULONG i=0;i<47;++i) {
+        const ULONG reg=GmuStageEReg(i);
+        if(p==GmuCfgReg(reg)) {
+            stageEWrites.push_back({reg,v});
+            if(reg==failStageEDword) return;
+            break;
+        }
+    }
     for(ULONG i=0;i<RTL_NUMBER_OF(cfgDwords);++i) if(p==GmuCfgReg(cfgDwords[i])) {
         cfgWrites.push_back({cfgDwords[i],v});
         if(cfgDwords[i]==failCfgDword) return;
