@@ -52,7 +52,8 @@ static void Reset() {
     std::memset(gPages,0,sizeof(gPages)); std::memset(cc,0,sizeof(cc));
     cc[0x106C/4]=0x80000000; cc[0x100C/4]=1; gPages[1][0]=1; gPages[1][0x340/4]=0xC0;
     bootCompletes=true; resetFails=false; smmuEnableFails=false; smmuDisableFails=false;
-    failAfter=-1; diagnostics.clear(); gmuWrites=0; hfiMemory=nullptr;
+    failAfter=-1; diagnostics.clear(); gmuWrites=0; hfiMemory=nullptr; failGmuStep=0xFFFFFFFF;
+    GmuSeedGxRegs();
 }
 static ULONG Run(const std::vector<UCHAR>& f,BOOLEAN* keep) {
     WCHAR text[3072]={};
@@ -67,6 +68,25 @@ static void ClearQuarantine() {
 }
 int main(int argc,char** argv) {
     std::vector<UCHAR> f=Image(); BOOLEAN keep=false;
+    // Read-only GX probe: independent fixture order, complete count, and stopping before an unpersisted read.
+    Reset();
+    {
+        GMU_TEST probe={}; probe.Maps[1]=gPages[1];
+        GMU_GX_TRACE oob={}; oob.OobStatus=STATUS_SUCCESS;
+        cc[0x100C/4]=0x80000000; gPages[1][0xD0]=0;
+        GMU_GX_REG_TRACE regs={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
+                              {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF}};
+        GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs);
+        assert(regs.Attempted==1 && regs.Reason==GX_REG_READ && regs.Count==6 && gmuWrites==0);
+        for(ULONG i=0;i<6;++i) assert(regs.Value[i]==gxRegExpected[i]);
+        regs={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
+              {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF}};
+        failGmuStep=0x7CA;
+        GmuGxReadReg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&regs);
+        assert(regs.Attempted==1 && regs.Reason==GX_REG_BREADCRUMB_FAILED && regs.Count==2 && gmuWrites==0);
+        assert(regs.Value[0]==gxRegExpected[0] && regs.Value[1]==gxRegExpected[1]);
+        for(ULONG i=2;i<6;++i) assert(regs.Value[i]==0xFFFFFFFF);
+    }
     Reset(); GMU_TEST plan={}; assert(GmuPlan(&plan,f.data(),static_cast<ULONG>(f.size())));
     assert(plan.Count==8 && GmuFind(&plan,0x300000,0x7060));
     assert(Run(f,&keep)==0 && !keep && allocations.empty() && gPages[1][0]==1);

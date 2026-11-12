@@ -24,7 +24,7 @@
 //   6. After successful FW init, start HFI and send PERF_TABLE / BW_TABLE; bit9 adds CORE_FW_START / START.
 //      Bit10 adds GX_BW_PERF_VOTE after START and read-only GCC/TCS/CX-busy/GBIF observations.
 //      Bit12 then performs OOB GPU_SET/release and PREPARE_SLUMBER before diagnostics/reset.
-//      Bit13 reads RBBM_STATUS once after OOB ACK and GX-on checks, strictly before release.
+//      Bit13 reads six GX registers once each after OOB ACK and GX-on checks, strictly before release.
 //      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset, bit12 rpmh_stop, check RSCC/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls, optional GBIF and RSCC, then Unmap / Destroy / free.
@@ -739,8 +739,8 @@ enum GMU_GX_REG_REASON {
     GX_REG_READ=0, GX_REG_NOT_REACHED=1, GX_REG_NO_ACK=2, GX_REG_GDSC_OFF=3,
     GX_REG_HM_OFF=4, GX_REG_MAP_FAILED=5, GX_REG_BREADCRUMB_FAILED=6
 };
-struct GMU_GX_REG_TRACE { ULONG Attempted, Reason, Gdscr, GxHm, RbbmStatus; };
-static_assert(sizeof(GMU_GX_REG_TRACE)==20,"GX register diagnostic ABI");
+struct GMU_GX_REG_TRACE { ULONG Attempted, Reason, Gdscr, GxHm, Count, Value[6]; };
+static_assert(sizeof(GMU_GX_REG_TRACE)==44,"GX register diagnostic ABI");
 static BOOLEAN GmuGxRegReady(volatile ULONG* Cc, GMU_TEST* S, const GMU_GX_TRACE* T, GMU_GX_REG_TRACE* R)
 {
     R->Gdscr=READ_REGISTER_ULONG(Cc+0x100C/4);
@@ -758,11 +758,15 @@ static VOID GmuGxReadReg(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
     PVOID map=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READONLY|PAGE_NOCACHE);
     if (map==NULL) { R->Reason=GX_REG_MAP_FAILED; return; }
     // A failed diagnostic read preparation must not prevent the mandatory OOB release/slumber path.
-    if (!NT_SUCCESS(GmuStep(Params,0x7C8))) { R->Reason=GX_REG_BREADCRUMB_FAILED; }
-    else if (GmuGxRegReady(Cc,S,T,R)) // recheck after map/flush, immediately before the only GX read
+    const ULONG dwords[]={0x210,0x213,0x201,0x0AE,0x016,0x017};
+    static_assert(RTL_NUMBER_OF(dwords)==RTL_NUMBER_OF(R->Value),"GX register diagnostic count");
+    for (ULONG i=0;i<RTL_NUMBER_OF(dwords);++i)
     {
+        if (!NT_SUCCESS(GmuStep(Params,0x7C8+i))) { R->Reason=GX_REG_BREADCRUMB_FAILED; break; }
+        if (!GmuGxRegReady(Cc,S,T,R)) { break; } // recheck after every flush, still under the same OOB lease
         R->Attempted=1; R->Reason=GX_REG_READ;
-        R->RbbmStatus=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(map)+0x210);
+        R->Value[i]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(map)+dwords[i]);
+        R->Count=i+1;
     }
     MmUnmapIoSpace(map,PAGE_SIZE);
 }
@@ -949,7 +953,8 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     ULONG result=EPI_GMU_OK, configured=0, rsccConfigured=0;
     NTSTATUS st=STATUS_SUCCESS;
     BOOLEAN smmuAttempted=FALSE, released=FALSE, rsccSaved=FALSE, rpmhStopIssued=FALSE;
-    GMU_GX_REG_TRACE gxReg={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+    GMU_GX_REG_TRACE gxReg={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
+                           {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF}};
     GMU_GX_TRACE gx={};
     gx.OobStatus=STATUS_NOT_FOUND; gx.HaltStatus=STATUS_NOT_FOUND; gx.SlumberStatus=STATUS_NOT_FOUND;
     gx.BusyStatus=STATUS_NOT_FOUND; gx.RpmhStopStatus=STATUS_NOT_FOUND; gx.IdleStatus=STATUS_NOT_FOUND;

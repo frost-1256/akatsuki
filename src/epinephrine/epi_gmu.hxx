@@ -9,7 +9,7 @@
 #define EPI_GMU_PROBE_GX_VOTE   0x400UL     // modifier: requires 0x280 (0x680 total), add GBIF QSB / GX_BW_PERF_VOTE
 #define EPI_GMU_PROBE_CLOCK    0x800UL     // modifier: requires 0x680 (0xE80 total), GMU 200 MHz / hub 150 MHz
 #define EPI_GMU_PROBE_GX_ON    0x1000UL    // modifier: requires 0xE80 (0x1E80 total), OOB GPU_SET + slumber / rpmh_stop
-#define EPI_GMU_PROBE_GX_REG   0x2000UL    // modifier: requires 0x1E80 (0x3E80 total), read RBBM_STATUS once under OOB
+#define EPI_GMU_PROBE_GX_REG   0x2000UL    // modifier: requires 0x1E80 (0x3E80 total), read six GX registers under OOB
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -86,9 +86,11 @@
 // GpuSmmuDisableWrites: up to eleven 28-byte records {Step, Offset, Value, Readback, CmpMask, Status, Written}.
 // All ConfigOffsets restore attempts are recorded. No-write records have Written=0 and Readback=0xFFFFFFFF.
 // Mismatches after stream/CB disable and TLB sync do not stop this sweep; any failure still retains CX/ctx.
-// GpuGmuGxReg: 20 bytes {Attempted, Reason, Gdscr, GxHm, RbbmStatus}; unread values=0xFFFFFFFF.
-// Reason: 0 read, 1 not reached, 2 OOB ACK failed, 3 GDSCR off, 4 GX HM off, 5 map failed, 6 breadcrumb failed.
-// Skips are diagnostic only. Only RBBM_STATUS (GPU dword 0x210) is read, before OOB release.
+// GpuGmuGxReg: 44 bytes {Attempted, Reason, Gdscr, GxHm, Count, Value[6]}; unread values=0xFFFFFFFF.
+// Reason: 0 completed, 1 not reached, 2 OOB ACK failed, 3 GDSCR off, 4 GX HM off, 5 map failed, 6 breadcrumb failed.
+// Value order: STATUS (0x210), STATUS3 (0x213), INT_0_STATUS (0x201), CLOCK_CNTL (0xAE), GBIF_HALT/ACK (0x16/17).
+// Count is completed reads (0..6); Attempted becomes 1 before the first read. Stop on a failed guard/flush.
+// All six are read once, never written, in one RO page mapping before OOB release; breadcrumbs 0x7C8..0x7CD.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -99,7 +101,7 @@
 // VoteGx: requires StartHfi; adds GBIF QSB before release and GX vote after START (probe 0x680).
 // FastClock: requires StartHfi/VoteGx; opt-in RCG setup/restore (probe 0xE80).
 // GxOn: requires all three modifiers; OOB then slumber before reset, rpmh_stop after reset (probe 0x1E80).
-// GxReg: requires GxOn and its prerequisites; optional one-shot read under OOB (probe 0x3E80).
+// GxReg: requires GxOn and its prerequisites; optional six-register read under OOB (probe 0x3E80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,

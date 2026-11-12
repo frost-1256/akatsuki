@@ -1042,6 +1042,8 @@ rpmh_stopを省く試験、OOBだけでslumberを省く試験、GX/RBBM/CPやPDC
 
 ### 9.14.1 RBBM_STATUSの単発読み取りの実装（実機未実行）
 
+この節はv48の単発読み取りと20バイト診断の説明。現行の6レジスタ・44バイト形式は§9.14.2を参照。
+
 bit13 `EPI_GMU_PROBE_GX_REG=0x2000` を追加し、`EpiGpuProbe=0x3E80` のときだけ RBBM_STATUS を1回読む。bit13にはbit7/9/10/11/12（0x1E80）をすべて要求し、不足する指定はワンショット解除・flush後、ハードウェアアクセス前に `GpuProbeStatus=6` で拒否する。既存モードのOOB・slumber・後始末は維持する。
 
 読み取りは `GmuGxOob()` のACKクリア・Snap 1（0x7C3）とOOB解除（0x7C4）の間だけで行う。OOB ACK成功、GX GDSCR bit31=1、GX HM（0x1F8D0）のbit6/7=0を確認し、GPU先頭ページ（物理0x03D00000、0x1000バイト）をPAGE_READONLY / non-cacheableで一時mapする。ブレッドクラム0x7C8の保存とflushを確認した後、同じ3条件を再確認してから dword 0x210（物理0x03D00840）を一度だけ読む。OOBのACK判定は保存済みの待ち結果を使う（INFO bit31は既にクリア済み）。ページは解除前にunmapする。
@@ -1078,6 +1080,57 @@ Attemptedは実際のREAD_REGISTER_ULONG直前に1とし、読み取りを飛ば
 - `RBBM_STATUS` = 0x1：立っているのは bit0（CP_AHB_BUSY_CX_MASTER）だけ。CP も描画のブロックも BUSY ではない。Linux の idle の判定（bit0 を除いて 0）に合う。値は、CPU が CX 側から AHB でこのレジスタを読んでいること自体を示していると見られる [I]。
 - そのあとの OOB の解除、slumber、rpmh_stop、後片付けは v47 と同じく、すべて通った。
 - 次：同じ ON の間に、読むだけのレジスタを 1 つずつ足す（`RBBM_STATUS3`、`RBBM_INT_0_STATUS`、`RBBM_CLOCK_CNTL` など）。そのあと、Linux の `hw_init` の最初の書き込み（`GBIF_HALT=0`、`RBBM_GBIF_HALT=0`）を調べる。
+
+### 9.14.2 同じOOB中の6レジスタ読み取りへの拡張（実機未実行）
+
+案Aを採用し、bit13の `EpiGpuProbe=0x3E80` の読み取りを6レジスタに広げた。前提の0x1E80、新しい試験ビットを追加しない点、OOB ACK後・解除前だけで読む点、1ページを読み取り専用でmap/unmapする点はv48と同じ。GX側への書き込みは追加しない。
+
+| Valueの添字 | レジスタ | GPU dword | ページ内バイト | ブレッドクラム |
+|---|---|---|---|---|
+| 0 | RBBM_STATUS | 0x210 | 0x840 | 0x7C8 |
+| 1 | RBBM_STATUS3 | 0x213 | 0x84C | 0x7C9 |
+| 2 | RBBM_INT_0_STATUS | 0x201 | 0x804 | 0x7CA |
+| 3 | RBBM_CLOCK_CNTL | 0x0AE | 0x2B8 | 0x7CB |
+| 4 | RBBM_GBIF_HALT | 0x016 | 0x058 | 0x7CC |
+| 5 | RBBM_GBIF_HALT_ACK | 0x017 | 0x05C | 0x7CD |
+
+map前にv48の条件（OOB ACK成功、GDSCR bit31=1、GX HM bit6/7=0）を確認する。その後、表の順に各レジスタのブレッドクラムを保存・flushし、条件を再確認して1回だけ読む。読み取りが戻るたびにCountを増やす。確認または保存・flushに失敗した時点で後続を読まず、ページをunmapして必須のOOB解除・slumberへ進む。GBIF側の別ページのHALTをこの読み取り一覧には加えず、INT_CLEAR_CMDにも書かない。
+
+`GpuGmuGxReg`（REG_BINARY、little endian）は11 DWORD＝44バイト：
+
+`{Attempted, Reason, Gdscr, GxHm, Count, Value[6]}`。
+
+Attemptedは最初のREAD直前に1となる。Countは完了した読み取りの数（0〜6）、Valueは上表の順で、未読は0xFFFFFFFF。Reasonはv48と同じ0〜6で、0は全6項目の読み取り完了、途中の失敗はその理由（条件不成立・map失敗・保存失敗）を保持する。途中まで読めた場合はAttempted=1と非0のReasonが共存し、Count件のValueが有効。Gdscr/GxHmは最後に条件確認した値。値が0xFFFFFFFFだったこと自体はエラー条件にせず、生値を保存する。
+
+CPUのMMIO読み取りにはNTSTATUSの戻り値がない。バスが応答しなければ処理自体が戻らず、unmapやOOB解除もできない可能性がある。その場合は0x7C8〜0x7CDのどのブレッドクラムで止まったかを使って対象を特定する。Countの診断は処理が戻ってcleanup/keepに到達した場合に保存される。
+
+机上試験用のshimのGPU先頭ページには、上表の位置に `{1, 0x213, 0x201, 0xAE, 0x16, 0x17}` を設定するfixtureを追加した。ホストテストには、Valueの順序・Count=6・Reason=0・MMIO書き込みなしの確認と、0x7CAの記録保存失敗を注入してCount=2・Reason=6・残り未読で止まる確認を追加した。テストは未実行。版番号の変更・ビルド・署名・配置・実機実行も行っていない。
+
+**机上の試験（2026-11-12）**：`smmu_test` と `gmu_test` はどちらも通った。ただし `gmu_test` は、今回より前からある C4459 の警告（`epi_gmu.cxx` の局所変数 `writes` が `nt_shim.hxx` のグローバル変数と同じ名前）で `build.cmd` のままでは止まる。`/wd4459` を付けて一時的にビルドして確かめた。
+
+**最初の実行（v48 の実行のあと、再起動しないで、v49 / 20.0.2.49）**：入口で `EPI_GMU_E_PRECOND`（`GpuGmuStatus` 1、NtStatus 0xC0000184）となり、何も触らずに止まった。`GpuGmuRsccEntry` = {0x00010006, 1, 0, 1} で、v48 の rpmh_stop で眠った RSCC が残っていた [P]。KeepCx=0 で終わっていても、GX を ON にする実行（0x1E80／0x3E80）の前には毎回再起動がいる。
+
+**結果（2026-11-12、v34-akat を起動した直後、Epinephrine v49 / 20.0.2.49、`EpiGpuProbe=0x3E80`）：6 個とも読めた** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuGxReg` | {Attempted 1, Reason 0, GDSCR 0xF8222800, 0x1F8D0 = 0, Count 6} |
+| `RBBM_STATUS`（0x210） | 0x00000001 |
+| `RBBM_STATUS3`（0x213） | 0x00000000 |
+| `RBBM_INT_0_STATUS`（0x201） | 0x00000000 |
+| `RBBM_CLOCK_CNTL`（0x0AE） | 0x00000000 |
+| `RBBM_GBIF_HALT`（0x016） | 0x00000000 |
+| `RBBM_GBIF_HALT_ACK`（0x017） | 0x00000000 |
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 |
+| `GpuGmuRsccEntry` | {0, 0, 0, 0}（再起動で眠りが解けている） |
+| HFI / idle の判定 / GBIF / クロック / SMMU の Disable / 各復元 | すべて 0 |
+
+- `RBBM_STATUS` は v48 と同じ 0x1。`STATUS3` も 0 で、どのブロックも BUSY ではない。
+- `INT_0_STATUS` = 0：GX を入れた直後で、残っている割り込みはない。
+- `CLOCK_CNTL` = 0：hwcg（ハードウェアのクロックゲーティング）がまだ設定されていない、リセット直後の値と見られる。Linux では `hw_init` の中で hwcg の表を書いてから、この値を設定する [I]。
+- `GBIF_HALT` = 0、`HALT_ACK` = 0：RBBM 側の GBIF は止められていない。`hw_init` が最初に書く `RBBM_GBIF_HALT=0` は、今の値と同じになる [I]。
+- 6 回の読み取りのあとも、OOB の解除、slumber、rpmh_stop、後片付けはすべて通った。
+- 次：Linux の `hw_init` の最初の書き込み（`GBIF_HALT=0`、`RBBM_GBIF_HALT=0` と、そのあとの読み返し）を調べる。
 
 ## 参照
 

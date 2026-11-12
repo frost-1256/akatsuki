@@ -24,6 +24,13 @@ static ULONG gPages[9][4096];
 static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
+static ULONG failGmuStep=0xFFFFFFFF;
+static const ULONG gxRegExpected[]={1,0x213,0x201,0xAE,0x16,0x17};
+inline void GmuSeedGxRegs() {
+    gPages[8][0x210]=gxRegExpected[0]; gPages[8][0x213]=gxRegExpected[1];
+    gPages[8][0x201]=gxRegExpected[2]; gPages[8][0x0AE]=gxRegExpected[3];
+    gPages[8][0x016]=gxRegExpected[4]; gPages[8][0x017]=gxRegExpected[5];
+}
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG) {
@@ -65,7 +72,10 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         }
     }
 }
-inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) { diagnostics[name]=v; return 0; }
+inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
+    if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
+    diagnostics[name]=v; return 0;
+}
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t*,ULONG,const void*,ULONG) { return 0; }
 inline void* GmuAlloc(SIZE_T n,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,int) {
     if(FailAllocation()) return nullptr;

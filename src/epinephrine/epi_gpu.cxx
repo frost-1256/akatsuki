@@ -856,7 +856,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit10 = requires bits7/9 (0x680), add GBIF QSB and GX_BW_PERF_VOTE,
     // bit11 = requires bits7/9/10 (0xE80), add GMU/hub clock setup/restore,
     // bit12 = requires bits7/9/10/11 (0x1E80), add OOB GPU_SET and slumber/rpmh_stop,
-    // bit13 = requires bit12 and its prerequisites (0x3E80), read RBBM_STATUS once before OOB release.
+    // bit13 = requires bit12 and its prerequisites (0x3E80), read six GX registers once before OOB release.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     if (flags & EPI_RSCC_PROBE_WRITE)
