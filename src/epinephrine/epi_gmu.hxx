@@ -13,6 +13,7 @@
 #define EPI_GMU_PROBE_GX_HALT  0x4000UL    // modifier: requires 0x3E80 (0x7E80 total), clear CX/RBBM GBIF halt under OOB
 #define EPI_GMU_PROBE_SECVID   0x8000UL    // modifier: requires 0x7E80 (0xFE80 total), SECVID stage A only
 #define EPI_GMU_PROBE_ADDR_MODE 0x10000UL // modifier: requires 0xFE80 (0x1FE80 total), ADDR_MODE stage B
+#define EPI_GMU_PROBE_HWCG      0x20000UL // modifier: requires 0x1FE80 (0x3FE80 total), hwcg stage C
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -107,6 +108,15 @@
 // Status is NTSTATUS (unattempted=STATUS_NOT_FOUND). Unread values=0xFFFFFFFF.
 // Breadcrumbs 0x800..0x803 precede original reads, 0x810..0x813 precede writes; each flush is followed by a GX guard.
 // Stage B uses 0x820..0x82B for original reads and 0x830..0x83B for writes; mismatch stops further writes.
+// GpuGmuGxHwcg: 480 bytes {Attempted, Reason, Gdscr, GxHm, Count, Status, Skipped,
+// CgcBefore[3], CgcAfter[3], ClockCntlBefore, ClockCntlAfter, SptpracBefore, SptpracAfterClear,
+// SptpracAfterSet, Before[49], After[49], CgcRestored[3], CgcRestoreStatus}.
+// CGC order: MODE, DELAY, HYST. Table order: a660_hwcg as listed in survey section 9.17.
+// Count counts CGC/table/CLOCK_CNTL writes with readback (0..53); SPTPRAC is separate.
+// Reason 0 success; 1..8 match GxInit; 9 SP clock re-enable failed. Unread=0xFFFFFFFF.
+// Status/RestoreStatus are NTSTATUS, unattempted=STATUS_NOT_FOUND. Skipped=1 if CLOCK_CNTL was already enabled.
+// Breadcrumbs: originals 0x840..0x875, CGC 0x880..0x882, SP clear 0x883, table 0x890..0x8C0,
+// mandatory SP set 0x8C1, CLOCK_CNTL 0x8C2, CGC restoration 0x8D0..0x8D2.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -121,9 +131,10 @@
 // ClearHalt: requires GxReg and its prerequisites; clear GBIF/RBBM halt after the six reads (probe 0x7E80).
 // Secvid: requires ClearHalt and its prerequisites; stage A after halt clears, before OOB release (probe 0xFE80).
 // AddrMode: requires Secvid and its prerequisites; stage B follows successful stage A (probe 0x1FE80).
+// Hwcg: requires AddrMode and its prerequisites; stage C follows successful stage B (probe 0x3FE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
-                     BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE);
+                     BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE);

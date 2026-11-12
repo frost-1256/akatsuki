@@ -1343,6 +1343,164 @@ shimに段Bのページと書き込みの記録、map失敗・書き込み無視
 - 元に戻していないが、後片付け（slumber、rpmh_stop、CX OFF）はすべて通った。次の実行の最初に読む元の値が 0 に戻っていれば、GX を切ると設定が消えることも確かめられる（毎回再起動するので、その確認は再起動のあとになる）。
 - これで `hw_init` の冒頭（OOB → GBIF の halt の解除 → SECVID → ADDR_MODE）を、Linux と同じ順に実行できた。次は `a6xx_set_hwcg(gpu, true)`（クロックゲーティングの表）になる。
 
+### 9.17 hwcg（ハードウェアのクロックゲーティング）の計画（本家 Linux の事実、2026-11-12）
+
+`hw_init` では ADDR_MODE の直後に `a6xx_set_hwcg(gpu, true)` を呼ぶ（`a6xx_gpu.c` 1240）。中身は `a6xx_gpu.c` 641〜721。
+
+**A635 で使う値**（`a6xx_catalog.c` 1124〜1137、chip_ids 0x06030500）：
+- `.hwcg = a660_hwcg`（コメントにも「a635 と a660 用」とある）、`.gmu_cgc_mode = 0x00020202`
+- A630・A610・A612・A702・A615 の系列・A7xx のどれでもないので、`clock_cntl_on = 0x8AA8AA82`、`cgc_delay = 0x10111`、`cgc_hyst = 0x5555`
+- A610 の系列でも A7xx でもないので、SP のクロックを止めてから表を書く手順が入る
+
+**Linux の順番**（`state = true` のとき）：
+1. GMU 側の 3 つ（`gmu_write`）：
+   - `GPU_GMU_AO_GMU_CGC_MODE_CNTL`（dword 0x23B09）← 0x00020202
+   - `GPU_GMU_AO_GMU_CGC_DELAY_CNTL`（0x23B0A）← 0x00010111
+   - `GPU_GMU_AO_GMU_CGC_HYST_CNTL`（0x23B0B）← 0x00005555
+2. `RBBM_CLOCK_CNTL`（0x0AE）を読む。もう 0x8AA8AA82 なら、ここで終わる（v49 で読んだ値は 0 なので、先へ進む）。
+3. `GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL`（dword 0x1A880）の bit0 を 0 にする（`gmu_rmw(…, 1, 0)`、SP のクロックを止める）。
+4. 下の表の 49 個を、表の順に書く。
+5. 同じレジスタの bit0 を 1 に戻す（`gmu_rmw(…, 0, 1)`、SP のクロックを戻す）。
+6. `RBBM_CLOCK_CNTL` ← 0x8AA8AA82。
+
+**レジスタの場所**：
+- dword 0x23B09〜0x23B0B は GMU のページ B（0x03D8E000、dword 0x23800〜0x23BFF）にある。このページはもう割り当ててある。
+- dword 0x1A880 は物理アドレス 0x03D6A200（ページ 0x03D6A000）。**今は割り当てていない新しいページ**。隣の 0x1A881 は `GMU_GX_SPTPRAC_POWER_CONTROL`。
+- 表の 48 個と `RBBM_CLOCK_CNTL` は GPU の先頭ページ（0x03D00000）。v48 から割り当てているページと同じ。
+- `RBBM_ISDB_CNT`（0x533）だけはページ 0x03D01000（ページ内 0x4CC）。
+
+**表 `a660_hwcg`**（順番どおり。dword ← 値）：
+
+| # | 名前 | dword | 値 |
+|---|---|---|---|
+| 0 | CLOCK_CNTL_SP0 | 0x0B0 | 0x02222222 |
+| 1 | CLOCK_CNTL2_SP0 | 0x0B4 | 0x02222220 |
+| 2 | CLOCK_DELAY_SP0 | 0x0B8 | 0x00000080 |
+| 3 | CLOCK_HYST_SP0 | 0x0BC | 0x0000F3CF |
+| 4 | CLOCK_CNTL_TP0 | 0x0C0 | 0x22222222 |
+| 5 | CLOCK_CNTL2_TP0 | 0x0C4 | 0x22222222 |
+| 6 | CLOCK_CNTL3_TP0 | 0x0C8 | 0x22222222 |
+| 7 | CLOCK_CNTL4_TP0 | 0x0CC | 0x00022222 |
+| 8 | CLOCK_DELAY_TP0 | 0x0D0 | 0x11111111 |
+| 9 | CLOCK_DELAY2_TP0 | 0x0D4 | 0x11111111 |
+| 10 | CLOCK_DELAY3_TP0 | 0x0D8 | 0x11111111 |
+| 11 | CLOCK_DELAY4_TP0 | 0x0DC | 0x00011111 |
+| 12 | CLOCK_HYST_TP0 | 0x0E0 | 0x77777777 |
+| 13 | CLOCK_HYST2_TP0 | 0x0E4 | 0x77777777 |
+| 14 | CLOCK_HYST3_TP0 | 0x0E8 | 0x77777777 |
+| 15 | CLOCK_HYST4_TP0 | 0x0EC | 0x00077777 |
+| 16 | CLOCK_CNTL_RB0 | 0x0F0 | 0x22222222 |
+| 17 | CLOCK_CNTL2_RB0 | 0x0F4 | 0x01002222 |
+| 18 | CLOCK_CNTL_CCU0 | 0x0F8 | 0x00002220 |
+| 19 | CLOCK_HYST_RB_CCU0 | 0x100 | 0x00040F00 |
+| 20 | CLOCK_CNTL_RAC | 0x104 | 0x25222022 |
+| 21 | CLOCK_CNTL2_RAC | 0x105 | 0x00005555 |
+| 22 | CLOCK_DELAY_RAC | 0x106 | 0x00000011 |
+| 23 | CLOCK_HYST_RAC | 0x107 | 0x00445044 |
+| 24 | CLOCK_CNTL_TSE_RAS_RBBM | 0x108 | 0x04222222 |
+| 25 | CLOCK_MODE_VFD | 0x111 | 0x00002222 |
+| 26 | CLOCK_MODE_GPC | 0x114 | 0x00222222 |
+| 27 | CLOCK_DELAY_HLSQ_2 | 0x117 | 0x00000002 |
+| 28 | CLOCK_MODE_HLSQ | 0x11B | 0x00002222 |
+| 29 | CLOCK_DELAY_TSE_RAS_RBBM | 0x109 | 0x00004000 |
+| 30 | CLOCK_DELAY_VFD | 0x112 | 0x00002222 |
+| 31 | CLOCK_DELAY_GPC | 0x115 | 0x00000200 |
+| 32 | CLOCK_DELAY_HLSQ | 0x11C | 0x00000000 |
+| 33 | CLOCK_HYST_TSE_RAS_RBBM | 0x10A | 0x00000000 |
+| 34 | CLOCK_HYST_VFD | 0x113 | 0x00000000 |
+| 35 | CLOCK_HYST_GPC | 0x116 | 0x04104004 |
+| 36 | CLOCK_HYST_HLSQ | 0x11D | 0x00000000 |
+| 37 | CLOCK_CNTL_TEX_FCHE | 0x120 | 0x00000222 |
+| 38 | CLOCK_DELAY_TEX_FCHE | 0x121 | 0x00000111 |
+| 39 | CLOCK_HYST_TEX_FCHE | 0x122 | 0x00000000 |
+| 40 | CLOCK_CNTL_UCHE | 0x10B | 0x22222222 |
+| 41 | CLOCK_HYST_UCHE | 0x110 | 0x00000004 |
+| 42 | CLOCK_DELAY_UCHE | 0x10F | 0x00000002 |
+| 43 | ISDB_CNT | 0x533 | 0x00000182 |
+| 44 | RAC_THRESHOLD_CNT | 0x044 | 0x00000000 |
+| 45 | SP_HYST_CNT | 0x042 | 0x00000000 |
+| 46 | CLOCK_CNTL_GMU_GX | 0x118 | 0x00000222 |
+| 47 | CLOCK_DELAY_GMU_GX | 0x119 | 0x00000111 |
+| 48 | CLOCK_HYST_GMU_GX | 0x11A | 0x00000555 |
+
+名前の頭の `RBBM_` は省いた。dword は `a6xx.xml` で A6XX の変種に当たるもの。
+
+**提案（段 C、例：bit17、合わせて `0x3FE80`、bit16 が前提）**：段 B のあと、OOB を解除する前に行う。
+- 書く前に、次の元の値を全部読んで記録する：GMU の CGC の 3 つ、`RBBM_CLOCK_CNTL`、`SPTPRAC_CLOCK_CONTROL`、表の 49 個。
+- `RBBM_CLOCK_CNTL` がもう 0x8AA8AA82 なら、Linux と同じく何も書かない（記録だけ）。
+- 書く順番は Linux と同じ 1 → 3 → 4 → 5 → 6。どの書き込みの前にも breadcrumb と GX の確かめをし、書いたらすぐ読み返す。
+- **3 で SP のクロックを止めたあとに途中で止まった場合も、必ず 5（bit0 を 1 に戻す）を行ってから** OOB の解除と slumber に進む。止める理由は、breadcrumb の失敗、GX の確かめの失敗、読み返しの違いのどれでも同じ。
+- 読み返しが違ったら、表のそれ以降と 6 は書かない。表の中には予約ビットがあって、書いた値どおりに読めないものがあるかもしれない [U]。最初の実行では、違ったところで止めて、その値を見る。
+- **元に戻す処理**：
+  - GPU 側（表と `RBBM_CLOCK_CNTL`）と `SPTPRAC_CLOCK_CONTROL` は GX 側なので、GX を切ると消える [I]。Linux も戻していない。
+  - GMU の CGC の 3 つは `GPU_GMU_AO`（常時 ON の領域）にあり、GX を切っても残る可能性が高い [I]。後片付けで元の値に戻すのがよい（bit10 の GBIF QSB と同じ扱い）。戻せなかったら `KeepCx` にする。
+- **ページ**：0x03D6A000 を新しく読み書き可能で割り当てる。GPU のページは、先頭（0x03D00000）と 0x03D01000 の 2 枚。
+
+**診断**（案）：`GpuGmuGxHwcg` = `{Attempted, Reason, Gdscr, GxHm, Count, Status, Skipped, CgcBefore[3], CgcAfter[3], ClockCntlBefore, ClockCntlAfter, SptpracBefore, SptpracAfterClear, SptpracAfterSet, Before[49], After[49], CgcRestored[3], CgcRestoreStatus}`。
+- Count は書いて読み返した数（CGC の 3 個 + 表の 49 個 + `RBBM_CLOCK_CNTL` の最大 53。SPTPRAC の 2 回は別に記録する）。
+- Reason は v48 の 0〜6 に、7 = 読み返しが違う、8 = 前の段が終わっていない、9 = SP のクロックを戻せなかった、を足す。
+- 9 のときは、GX が切れるまで SP のクロックが止まったままになるだけなので、後片付けは続ける [I]。
+
+**机上の試験**：
+- shim に、GMU のページ 0x03D6A000、GPU の 0x03D01000 の受け口と、SPTPRAC の bit0 の書き込みの記録を足す。
+- 試すこと：
+  - 53 個の書き込みの順番と値
+  - `RBBM_CLOCK_CNTL` = 0x8AA8AA82 のとき何も書かないこと
+  - 表の途中で止まっても SPTPRAC の bit0 が 1 に戻ること
+  - CGC の 3 つが後片付けで元の値に戻ること
+
+### 9.17.1 段C（hwcg）の実装（実機未実行）
+
+bit17 `EPI_GMU_PROBE_HWCG=0x20000` を追加した。bit16とその全前提が必要で、`0x3FE80` で段B成功後、同じOOBの解除前に実行する。前提不足はワンショット解除・flush後にstatus 6で拒否する。既存の`0x1FE80`までの設定手順は変更していない。
+
+§9.17の提案に合わせ、まずCGC 3個、CLOCK_CNTL、SPTPRAC、表49個の全元値を保存する。CLOCK_CNTLが既に0x8AA8AA82ならSkipped=1としてCGCを含む書き込みを省略する。それ以外はCGC 3個→SPTPRAC bit0クリア→表49個→SPTPRAC bit0セット→CLOCK_CNTLの順とし、各書き込み直後に読み返し、全ビット一致を求める。元値保存中と通常書き込み前には、breadcrumb保存・flushとGX確認を行う。mapはGPU先頭、GPU+0x1000、GPU+0x6A000の3ページだけで、全経路で解除する。
+
+SPTPRACのクリアを試みたあとは、どのエラーでも必須のbit0セット処理を通ってからOOB解除・slumberへ進む。復帰用breadcrumb/確認が失敗した場合も、この復帰書き込みは省略しない。SPTPRACはその時点の値を読み、bit0だけ変更して書く。復帰読み戻しが一致しなければReason 9、それ以外の途中エラーでは元のReasonを保持する。異常があった場合は残りの表と最後のCLOCK_CNTLを書かない。GX側の元値復元はしない。
+
+CGCは実際に書いた個数（Countの先頭最大3個）を、既存のreset/idle確認とSMMU Disableが成功したあと、クロック復元の前に元へ戻す。各項目のbreadcrumbが失敗しても復元書き込み自体は行い、3個すべての復元を試みる。読み戻しまたは記録保存に失敗した場合はstatus 8 / KeepCxとする。既存の安全確認やSMMU Disableで先にKeepCxとなった場合は、CGCもその時点の状態を保持する。hwcg設定だけの失敗で安全な後片付けが成功すればstatus 13。
+
+`GpuGmuGxHwcg` はREG_BINARY・480バイト（120 DWORD）で、§9.17の提案どおり `{Attempted, Reason, Gdscr, GxHm, Count, Status, Skipped, CgcBefore[3], CgcAfter[3], ClockCntlBefore, ClockCntlAfter, SptpracBefore, SptpracAfterClear, SptpracAfterSet, Before[49], After[49], CgcRestored[3], CgcRestoreStatus}`。CGCの順序はMODE、DELAY、HYST。CountはCGC・表・CLOCK_CNTLの読み戻し完了数（不一致も含む最大53）で、SPTPRACの2回は含めない。Attemptedは最初のCGC書き込み直前に1、Skippedは既設定時だけ1。Status/CgcRestoreStatusはNTSTATUS、未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。Reasonは0〜8が従来と同じ、9はSPクロック復帰失敗。cleanup/keepの両経路とCGC復元直後に保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x840〜0x875 | 全54個の元値保存前のflush・GX確認（0x840はmap前にも使用） |
+| 0x880〜0x882 | CGC 3個の設定 |
+| 0x883 | SPTPRAC bit0クリア |
+| 0x890〜0x8C0 | 表49個の設定 |
+| 0x8C1 | 必須のSPTPRAC bit0セット |
+| 0x8C2 | CLOCK_CNTL設定 |
+| 0x8D0〜0x8D2 | CGC元値復元 |
+
+shimに2ページの受け口、SPTPRACとhwcgの書き込み記録、書き込み無視の注入を追加。ホスト試験に全55書き込み（SPTPRACを含む）の順序と値、既設定時の省略、各表項目のbreadcrumb失敗後のSP復帰、読み戻し不一致、復帰breadcrumb失敗、SP復帰失敗、元値保存中の停止、CGC復元と復元失敗を追加した。表49組のレジスタと値は§9.17との機械的照合で一致を確認した。試験・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.17.2 結果（v54）
+
+**結果（2026-11-12、v34-akat、Epinephrine v54 / 20.0.2.54、`EpiGpuProbe=0x3FE80`、23:25 の再起動後）：途中で停止したが、安全に後片付けまで通った** [P]。
+
+- 全体：
+  - `GpuGmuStatus=13`（E_GX）、NtStatus 0xC0000185。
+  - KeepCx 0。teardown、slumber、CX の後片付けはすべて 0。
+  - CGC の復元は 0／0／0 に戻り、`CgcRestoreStatus=0`。
+  - 機器が止まることはなく、WinRM も生きていた。
+- `GpuGmuGxHwcg`（480 B）：
+  - Attempted 1、Reason 9、Gdscr 0xF8222800、GxHm 0、Count 23、Skipped 0。
+  - CGC：元値は 0／0／0、書き込み後は 0x00020202／0x00010111／0x00005555（一致）。
+  - `RBBM_CLOCK_CNTL` の元値は 0。最後の書き込みには進んでいない（After は 0xFFFFFFFF）。
+  - **SPTPRAC_CLOCK_CONTROL（0x03D6A200）は、元値、bit0 クリア後、bit0 セット後のどれも 0**。
+  - 表の元値 49 個はすべて 0。
+  - 表 #0〜#18 は書いた値と一致した。
+  - **表 #19 `CLOCK_HYST_RB_CCU0`（dword 0x100）は 0x00040F00 を書いて 0x00000F00 が返った**。bit18 だけが落ちた。#20 以降は書いていない。
+- Count 23 の内訳は、CGC 3 個と表 #0〜#19 の 20 個。
+- 停止の順番：
+  1. 表 #19 の不一致で Reason 7 になる。
+  2. 必須の SP 復帰に進む。
+  3. SPTPRAC は bit0 をセットしても 0 のままなので、Reason が 9 に上書きされた。
+  - 最初の原因は #19 で、Reason 9 は 2 番目の異常 [P]。
+- 解釈：
+  - SPTPRAC：アドレスは Linux の GMU の基点（0x03D6A000）+ 0x80×4 なので正しい。Linux は a660 系でも `gmu_rmw` で書くが、読み戻しはしない。元値も 0 なので、この GPU ではこのレジスタは読むと 0 で、書いても値が残らない（RAZ/WI）可能性が高い [I]。
+  - #19：Linux も読み戻しはしない。a660_hwcg は A660 用の表を流用しているので、A635 では bit18 のフィールドが実装されていない予約ビットの可能性がある [U]。
+  - 「書いた値と全ビットが一致する」という判定は、hwcg の表には厳しすぎる [I]。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

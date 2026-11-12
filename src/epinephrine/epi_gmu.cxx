@@ -27,13 +27,13 @@
 //      Bit13 reads six GX registers once each after OOB ACK and GX-on checks, strictly before release.
 //      Bit14 then clears CX GBIF_HALT and RBBM_GBIF_HALT with immediate posted-write readbacks.
 //      Bit15 then clears four SECVID TSB controls under the same OOB lease (stage A only).
-//      Bit16 follows successful stage A with twelve ADDR_MODE controls set to 1.
+//      Bit16 follows successful stage A with twelve ADDR_MODE controls set to 1; bit17 then enables hwcg.
 //      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset, bit12 rpmh_stop, check RSCC/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls, optional GBIF and RSCC, then Unmap / Destroy / free.
 //      A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
-// Not done here: rpmh_start, force_off, CP execution, hwcg, GPU PDC (reading it reset the phone on 2026-11-07).
+// Not done here: rpmh_start, force_off, CP execution, GPU PDC (reading it reset the phone on 2026-11-07).
 // No PLL programming; bit11 uses the existing GCC GPLL0_DIV source.
 // Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
@@ -918,9 +918,156 @@ static NTSTATUS GmuGxAddrMode(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
     { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
     return st;
 }
+struct GMU_GX_HWCG_TRACE {
+    ULONG Attempted, Reason, Gdscr, GxHm, Count;
+    NTSTATUS Status;
+    ULONG Skipped, CgcBefore[3], CgcAfter[3], ClockCntlBefore, ClockCntlAfter;
+    ULONG SptpracBefore, SptpracAfterClear, SptpracAfterSet, Before[49], After[49], CgcRestored[3];
+    NTSTATUS CgcRestoreStatus;
+};
+static_assert(sizeof(GMU_GX_HWCG_TRACE)==480,"GX hwcg diagnostic ABI");
+static const ULONG GmuHwcgTable[][2]={
+    {0x0B0,0x02222222},{0x0B4,0x02222220},{0x0B8,0x00000080},{0x0BC,0x0000F3CF},
+    {0x0C0,0x22222222},{0x0C4,0x22222222},{0x0C8,0x22222222},{0x0CC,0x00022222},
+    {0x0D0,0x11111111},{0x0D4,0x11111111},{0x0D8,0x11111111},{0x0DC,0x00011111},
+    {0x0E0,0x77777777},{0x0E4,0x77777777},{0x0E8,0x77777777},{0x0EC,0x00077777},
+    {0x0F0,0x22222222},{0x0F4,0x01002222},{0x0F8,0x00002220},{0x100,0x00040F00},
+    {0x104,0x25222022},{0x105,0x00005555},{0x106,0x00000011},{0x107,0x00445044},
+    {0x108,0x04222222},{0x111,0x00002222},{0x114,0x00222222},{0x117,0x00000002},
+    {0x11B,0x00002222},{0x109,0x00004000},{0x112,0x00002222},{0x115,0x00000200},
+    {0x11C,0x00000000},{0x10A,0x00000000},{0x113,0x00000000},{0x116,0x04104004},
+    {0x11D,0x00000000},{0x120,0x00000222},{0x121,0x00000111},{0x122,0x00000000},
+    {0x10B,0x22222222},{0x110,0x00000004},{0x10F,0x00000002},{0x533,0x00000182},
+    {0x044,0x00000000},{0x042,0x00000000},{0x118,0x00000222},{0x119,0x00000111},
+    {0x11A,0x00000555}
+};
+static_assert(RTL_NUMBER_OF(GmuHwcgTable)==49,"hwcg table count");
+static const ULONG GmuHwcgCgc[]={0x20202,0x10111,0x5555};
+static GMU_GX_HWCG_TRACE GmuGxHwcgTrace()
+{
+    GMU_GX_HWCG_TRACE t;
+    RtlFillMemory(&t,sizeof(t),0xFF);
+    t.Attempted=0; t.Reason=GX_REG_NOT_REACHED; t.Count=0; t.Skipped=0;
+    t.Status=STATUS_NOT_FOUND; t.CgcRestoreStatus=STATUS_NOT_FOUND;
+    return t;
+}
+static NTSTATUS GmuGxHwcgGuard(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,
+                                const GMU_GX_TRACE* T,GMU_GX_HWCG_TRACE* H,ULONG Step)
+{
+    const NTSTATUS st=GmuStep(Params,Step);
+    if (!NT_SUCCESS(st)) { H->Reason=GX_REG_BREADCRUMB_FAILED; return st; }
+    GMU_GX_REG_TRACE guard={};
+    const BOOLEAN ready=GmuGxRegReady(Cc,S,T,&guard);
+    H->Gdscr=guard.Gdscr; H->GxHm=guard.GxHm;
+    if (!ready) { H->Reason=guard.Reason; return STATUS_INVALID_DEVICE_STATE; }
+    return STATUS_SUCCESS;
+}
+static NTSTATUS GmuGxHwcg(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,
+                           const GMU_GX_TRACE* T,GMU_GX_HWCG_TRACE* H)
+{
+    PVOID maps[3]={};
+    const ULONGLONG physical[]={EPI_GMU_GPU_BASE,EPI_GMU_GPU_BASE+0x1000,EPI_GMU_GPU_BASE+0x6A000};
+    NTSTATUS st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x840);
+    if (!NT_SUCCESS(st)) { return st; }
+    for (ULONG i=0;i<3;++i)
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart=physical[i];
+        maps[i]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+        if (maps[i]==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; H->Reason=GX_REG_MAP_FAILED; break; }
+    }
+    volatile ULONG* regs[54]={};
+    ULONG* before[54]={};
+    BOOLEAN spTouched=FALSE;
+    if (NT_SUCCESS(st))
+    {
+        for (ULONG i=0;i<3;++i) { regs[i]=GmuReg(S,0x23B09+i); before[i]=&H->CgcBefore[i]; }
+        regs[3]=static_cast<volatile ULONG*>(maps[0])+0xAE; before[3]=&H->ClockCntlBefore;
+        regs[4]=static_cast<volatile ULONG*>(maps[2])+0x200/4; before[4]=&H->SptpracBefore;
+        for (ULONG i=0;i<49;++i)
+        {
+            const ULONG off=GmuHwcgTable[i][0];
+            regs[5+i]=static_cast<volatile ULONG*>(maps[off>=0x400 ? 1 : 0])+(off&0x3FF);
+            before[5+i]=&H->Before[i];
+        }
+        for (ULONG i=0;i<54;++i)
+        {
+            st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x840+i);
+            if (!NT_SUCCESS(st)) { break; }
+            *before[i]=READ_REGISTER_ULONG(regs[i]);
+        }
+    }
+    if (NT_SUCCESS(st) && H->ClockCntlBefore==0x8AA8AA82)
+    { H->Skipped=1; H->Reason=0; goto done; }
+    for (ULONG i=0;i<3 && NT_SUCCESS(st);++i)
+    {
+        st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x880+i); if (!NT_SUCCESS(st)) { break; }
+        H->Attempted=1;
+        WRITE_REGISTER_ULONG(regs[i],GmuHwcgCgc[i]);
+        H->CgcAfter[i]=READ_REGISTER_ULONG(regs[i]); ++H->Count;
+        if (H->CgcAfter[i]!=GmuHwcgCgc[i]) { H->Reason=7; st=STATUS_IO_DEVICE_ERROR; }
+    }
+    if (NT_SUCCESS(st))
+    {
+        st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x883);
+        if (NT_SUCCESS(st))
+        {
+            const ULONG value=READ_REGISTER_ULONG(regs[4])&~1UL;
+            spTouched=TRUE; // publication attempt requires unconditional re-enable below
+            WRITE_REGISTER_ULONG(regs[4],value);
+            H->SptpracAfterClear=READ_REGISTER_ULONG(regs[4]);
+            if (H->SptpracAfterClear!=value) { H->Reason=7; st=STATUS_IO_DEVICE_ERROR; }
+        }
+    }
+    for (ULONG i=0;i<49 && NT_SUCCESS(st);++i)
+    {
+        st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x890+i); if (!NT_SUCCESS(st)) { break; }
+        WRITE_REGISTER_ULONG(regs[5+i],GmuHwcgTable[i][1]);
+        H->After[i]=READ_REGISTER_ULONG(regs[5+i]); ++H->Count;
+        if (H->After[i]!=GmuHwcgTable[i][1]) { H->Reason=7; st=STATUS_IO_DEVICE_ERROR; }
+    }
+    if (spTouched)
+    {
+        // Recovery is mandatory even if the breadcrumb/guard fails; do not let that skip SP re-enable.
+        const ULONG priorReason=H->Reason;
+        const NTSTATUS recovery=GmuGxHwcgGuard(S,Params,Cc,T,H,0x8C1);
+        const ULONG value=READ_REGISTER_ULONG(regs[4])|1UL;
+        WRITE_REGISTER_ULONG(regs[4],value);
+        H->SptpracAfterSet=READ_REGISTER_ULONG(regs[4]);
+        if (H->SptpracAfterSet!=value) { H->Reason=9; st=STATUS_IO_DEVICE_ERROR; }
+        else if (NT_SUCCESS(st) && !NT_SUCCESS(recovery)) { st=recovery; }
+        else if (!NT_SUCCESS(st)) { H->Reason=priorReason; }
+    }
+    if (NT_SUCCESS(st))
+    {
+        st=GmuGxHwcgGuard(S,Params,Cc,T,H,0x8C2);
+        if (NT_SUCCESS(st))
+        {
+            WRITE_REGISTER_ULONG(regs[3],0x8AA8AA82);
+            H->ClockCntlAfter=READ_REGISTER_ULONG(regs[3]); ++H->Count;
+            if (H->ClockCntlAfter!=0x8AA8AA82) { H->Reason=7; st=STATUS_IO_DEVICE_ERROR; }
+        }
+    }
+    if (NT_SUCCESS(st)) { H->Reason=0; }
+done:
+    for (ULONG i=0;i<3;++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
+    return st;
+}
+static NTSTATUS GmuGxHwcgRestore(GMU_TEST* S,HANDLE Params,GMU_GX_HWCG_TRACE* H)
+{
+    NTSTATUS result=STATUS_SUCCESS;
+    for (ULONG i=0;i<3 && i<H->Count;++i)
+    {
+        const NTSTATUS step=GmuStep(Params,0x8D0+i);
+        WRITE_REGISTER_ULONG(GmuReg(S,0x23B09+i),H->CgcBefore[i]);
+        H->CgcRestored[i]=READ_REGISTER_ULONG(GmuReg(S,0x23B09+i));
+        const NTSTATUS st=H->CgcRestored[i]==H->CgcBefore[i] ? step : STATUS_IO_DEVICE_ERROR;
+        if (!NT_SUCCESS(st) && NT_SUCCESS(result)) { result=st; }
+    }
+    return result;
+}
 static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_TRACE* T,
                          GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL,
-                         GMU_GX_INIT_TRACE* Init = NULL, BOOLEAN AddrMode = FALSE)
+                         GMU_GX_INIT_TRACE* Init = NULL, BOOLEAN AddrMode = FALSE, GMU_GX_HWCG_TRACE* Hwcg = NULL)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -956,6 +1103,12 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
             { Init->Status=GmuGxAddrMode(S,Params,Cc,T,Init); }
         }
         else { Init->Reason=8; Init->Status=STATUS_INVALID_DEVICE_STATE; }
+    }
+    if (Hwcg!=NULL)
+    {
+        if (Init!=NULL && NT_SUCCESS(Init->Status) && Init->Count==16)
+        { Hwcg->Status=GmuGxHwcg(S,Params,Cc,T,Hwcg); }
+        else { Hwcg->Reason=8; Hwcg->Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
     WRITE_REGISTER_ULONG(GmuReg(S,R_HOST2GMU_INTR_SET),0x80000000UL);
@@ -1065,7 +1218,7 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx, BOOLEAN FastClock,
-                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode)
+                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode, BOOLEAN Hwcg)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
@@ -1078,6 +1231,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (ClearHalt && !GxReg) { return EPI_GMU_E_PRECOND; }
     if (Secvid && !ClearHalt) { return EPI_GMU_E_PRECOND; }
     if (AddrMode && !Secvid) { return EPI_GMU_E_PRECOND; }
+    if (Hwcg && !AddrMode) { return EPI_GMU_E_PRECOND; }
     if (Cc == NULL || Text == NULL || TextCch==0) { return EPI_GMU_E_PRECOND; }
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -1116,6 +1270,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxHalt",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     for (ULONG i=0;i<RTL_NUMBER_OF(s->SmmuCbar);++i)
@@ -1134,6 +1289,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     for (ULONG i=0;i<4;++i) { gxHalt.Before[i]=0xFFFFFFFF; gxHalt.After[i]=0xFFFFFFFF; }
     gxHalt.FinalCx[0]=0xFFFFFFFF; gxHalt.FinalCx[1]=0xFFFFFFFF;
     GMU_GX_INIT_TRACE gxInit=GmuGxInitTrace();
+    GMU_GX_HWCG_TRACE gxHwcg=GmuGxHwcgTrace();
     GMU_GX_TRACE gx={};
     gx.OobStatus=STATUS_NOT_FOUND; gx.HaltStatus=STATUS_NOT_FOUND; gx.SlumberStatus=STATUS_NOT_FOUND;
     gx.BusyStatus=STATUS_NOT_FOUND; gx.RpmhStopStatus=STATUS_NOT_FOUND; gx.IdleStatus=STATUS_NOT_FOUND;
@@ -1364,7 +1520,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         else if (GxOn)
         {
             const NTSTATUS oob=GmuGxOob(s,Params,Cc,&gx,GxReg ? &gxReg : NULL,
-                                        ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL,AddrMode);
+                                        ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL,AddrMode,Hwcg ? &gxHwcg : NULL);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (gx.Attempted)
             {
@@ -1372,12 +1528,14 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                 if (!NT_SUCCESS(slumber)) { hfi.Status=slumber; }
             }
             if (!NT_SUCCESS(oob) || (gx.Attempted && !NT_SUCCESS(slumber)) || !NT_SUCCESS(gx.BreadcrumbStatus) ||
-                (ClearHalt && !NT_SUCCESS(gxHalt.Status)) || (Secvid && !NT_SUCCESS(gxInit.Status)))
+                (ClearHalt && !NT_SUCCESS(gxHalt.Status)) || (Secvid && !NT_SUCCESS(gxInit.Status)) ||
+                (Hwcg && !NT_SUCCESS(gxHwcg.Status)))
             {
                 result=EPI_GMU_E_GX;
                 st=!NT_SUCCESS(oob) ? oob : (!NT_SUCCESS(slumber) ? slumber :
                    (!NT_SUCCESS(gx.BreadcrumbStatus) ? gx.BreadcrumbStatus :
-                    (ClearHalt && !NT_SUCCESS(gxHalt.Status) ? gxHalt.Status : gxInit.Status)));
+                    (ClearHalt && !NT_SUCCESS(gxHalt.Status) ? gxHalt.Status :
+                     (Secvid && !NT_SUCCESS(gxInit.Status) ? gxInit.Status : gxHwcg.Status))));
             }
         }
         GmuHfiPower(s,Params,Cc,&hfi,1);
@@ -1398,6 +1556,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         EpiSetValue(Diag,L"GpuGmuLog",REG_BINARY,log->Va,EPI_GMU_LOG_DUMP);
     }
 cleanup:
+    if (Hwcg) { EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,&gxHwcg,sizeof(gxHwcg)); }
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
     if (Secvid) { EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,&gxInit,sizeof(gxInit)); }
     if (GxReg) { EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,&gxReg,sizeof(gxReg)); }
@@ -1466,6 +1625,12 @@ cleanup:
             result=EPI_GMU_E_TEARDOWN; goto keep;
         }
     }
+    if (Hwcg && gxHwcg.Count!=0)
+    {
+        gxHwcg.CgcRestoreStatus=GmuGxHwcgRestore(s,Params,&gxHwcg);
+        EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,&gxHwcg,sizeof(gxHwcg));
+        if (!NT_SUCCESS(gxHwcg.CgcRestoreStatus)) { result=EPI_GMU_E_TEARDOWN; goto keep; }
+    }
     if (clocks.Saved && (clocks.Changed[0] || clocks.Changed[1] || clocks.Gcc[6]))
     {
         clocks.RestoreStatus=GmuClockRestore(s,Params,Cc,&clocks); GmuClockDiag(Diag,&clocks);
@@ -1533,6 +1698,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (Hwcg) { EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,&gxHwcg,sizeof(gxHwcg)); }
     if (Secvid) { EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,&gxInit,sizeof(gxInit)); }
     if (ClearHalt) { EpiSetValue(Diag,L"GpuGmuGxHalt",REG_BINARY,&gxHalt,sizeof(gxHalt)); }
     if (GxReg) { EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,&gxReg,sizeof(gxReg)); }

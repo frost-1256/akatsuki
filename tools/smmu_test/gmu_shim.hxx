@@ -16,12 +16,26 @@ using PCWSTR=const wchar_t*;
 #define NT_ASSERT(x) assert(x)
 #define REG_BINARY 3
 inline void RtlCopyMemory(void* a,const void* b,SIZE_T n) { std::memcpy(a,b,n); }
+inline void RtlFillMemory(void* a,SIZE_T n,UCHAR value) { std::memset(a,value,n); }
 template<class... T> inline void RtlStringCchPrintfW(wchar_t* p,SIZE_T n,const wchar_t* f,T... args) {
     _snwprintf_s(p,n,_TRUNCATE,f,args...);
 }
 inline void RtlStringCchCatW(wchar_t* p,SIZE_T n,const wchar_t* a) { wcsncat_s(p,n,a,_TRUNCATE); }
 static ULONG gPages[9][4096];
 static ULONG secvidPage[PAGE_SIZE/sizeof(ULONG)];
+static ULONG hwcgIsdbPage[PAGE_SIZE/sizeof(ULONG)], hwcgSpPage[PAGE_SIZE/sizeof(ULONG)];
+static std::vector<std::pair<ULONG,ULONG>> hwcgWrites;
+static ULONG failHwcgDword=0xFFFFFFFF;
+static bool failHwcgSpSet=false;
+inline ULONG HwcgDword(volatile ULONG* p) {
+    if(p==hwcgSpPage+0x80) return 0x1A880;
+    for(ULONG i=0;i<3;++i) if(p==gPages[2]+0x309+i) return 0x23B09+i;
+    for(ULONG i=0;i<PAGE_SIZE/sizeof(ULONG);++i) {
+        if(p==gPages[8]+i) return i;
+        if(p==hwcgIsdbPage+i) return 0x400+i;
+    }
+    return 0xFFFFFFFF;
+}
 static std::vector<ULONG> secvidWrites;
 static ULONG failSecvidOffset=0xFFFFFFFF;
 static ULONG addrPages[10][PAGE_SIZE/sizeof(ULONG)];
@@ -53,6 +67,8 @@ inline void GmuSeedGxRegs() {
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
+    if(a.QuadPart==0x03D01000) return hwcgIsdbPage;
+    if(a.QuadPart==0x03D6A000) return hwcgSpPage;
     for(ULONG i=0;i<RTL_NUMBER_OF(addrPageOffsets);++i) if(a.QuadPart==0x03D00000+addrPageOffsets[i]) {
         assert(protection==(PAGE_READWRITE|PAGE_NOCACHE));
         return failAddrMap==i ? nullptr : addrPages[i];
@@ -66,6 +82,11 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
+    const ULONG hw=HwcgDword(p);
+    if(hw!=0xFFFFFFFF) {
+        hwcgWrites.push_back({hw,v});
+        if(hw==failHwcgDword || (hw==0x1A880 && (v&1) && failHwcgSpSet)) return;
+    }
     for(ULONG i=0;i<RTL_NUMBER_OF(addrDwords);++i) if(p==GmuAddrReg(i)) {
         assert(v==1); addrWrites.push_back(addrDwords[i]);
         if(i!=failAddrWrite) *p=v;

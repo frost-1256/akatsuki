@@ -48,6 +48,8 @@ static std::vector<UCHAR> Image() {
     ULONG version=0x30010008; Block(f,0x10007FE0,4,0,0,&version); return f;
 }
 static void Reset() {
+    std::memset(hwcgIsdbPage,0,sizeof(hwcgIsdbPage)); std::memset(hwcgSpPage,0,sizeof(hwcgSpPage));
+    hwcgWrites.clear(); failHwcgDword=0xFFFFFFFF; failHwcgSpSet=false;
     std::memset(secvidPage,0,sizeof(secvidPage)); secvidWrites.clear(); failSecvidOffset=0xFFFFFFFF;
     std::memset(addrPages,0,sizeof(addrPages)); addrWrites.clear();
     failAddrWrite=0xFFFFFFFF; failAddrMap=0xFFFFFFFF;
@@ -75,7 +77,7 @@ int main(int argc,char** argv) {
     // Read-only GX probe: independent fixture order, complete count, and stopping before an unpersisted read.
     Reset();
     {
-        GMU_TEST probe={}; probe.Maps[1]=gPages[1]; probe.Maps[6]=gPages[6];
+        GMU_TEST probe={}; probe.Maps[1]=gPages[1]; probe.Maps[2]=gPages[2]; probe.Maps[6]=gPages[6];
         GMU_GX_TRACE oob={}; oob.OobStatus=STATUS_SUCCESS;
         cc[0x100C/4]=0x80000000; gPages[1][0xD0]=0;
         GMU_GX_REG_TRACE regs={0,GX_REG_NOT_REACHED,0xFFFFFFFF,0xFFFFFFFF,0,
@@ -176,6 +178,59 @@ int main(int argc,char** argv) {
             for(ULONG i=fail+1;i<12;++i) assert(init.After[4+i]==0xFFFFFFFF && *GmuAddrReg(i)==0x100+i);
         }
         failAddrWrite=0xFFFFFFFF;
+        // HWCG: seed distinct originals and verify ordered writes, skip, recovery and AO restoration.
+        const auto seedHwcg=[&]() {
+            failGmuStep=0xFFFFFFFF; failHwcgDword=0xFFFFFFFF; failHwcgSpSet=false;
+            hwcgWrites.clear(); gPages[8][0xAE]=0; hwcgSpPage[0x80]=0xA5;
+            for(ULONG i=0;i<3;++i) gPages[2][0x309+i]=0x10+i;
+            for(ULONG i=0;i<49;++i) {
+                const ULONG off=GmuHwcgTable[i][0];
+                (off>=0x400 ? hwcgIsdbPage : gPages[8])[off&0x3FF]=0xA000+i;
+            }
+        };
+        seedHwcg(); GMU_GX_HWCG_TRACE hw=GmuGxHwcgTrace();
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+        assert(hw.Attempted==1 && hw.Reason==0 && hw.Count==53 && hw.Skipped==0);
+        assert(hwcgWrites.size()==55 && hw.SptpracBefore==0xA5 && hw.SptpracAfterClear==0xA4 && hw.SptpracAfterSet==0xA5);
+        for(ULONG i=0;i<3;++i) assert(hwcgWrites[i].first==0x23B09+i && hwcgWrites[i].second==GmuHwcgCgc[i]);
+        assert(hwcgWrites[3].first==0x1A880 && hwcgWrites[3].second==0xA4);
+        for(ULONG i=0;i<49;++i) {
+            assert(hw.Before[i]==0xA000+i && hw.After[i]==GmuHwcgTable[i][1]);
+            assert(hwcgWrites[4+i].first==GmuHwcgTable[i][0] && hwcgWrites[4+i].second==GmuHwcgTable[i][1]);
+        }
+        assert(hwcgWrites[53].first==0x1A880 && hwcgWrites[53].second==0xA5);
+        assert(hwcgWrites[54].first==0xAE && hwcgWrites[54].second==0x8AA8AA82);
+        assert(GmuGxHwcgRestore(&probe,reinterpret_cast<HANDLE>(1),&hw)==0);
+        for(ULONG i=0;i<3;++i) assert(hw.CgcRestored[i]==0x10+i && gPages[2][0x309+i]==0x10+i);
+        seedHwcg(); hw=GmuGxHwcgTrace(); gPages[8][0xAE]=0x8AA8AA82;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+        assert(hw.Skipped==1 && hw.Count==0 && hw.Attempted==0 && hwcgWrites.empty());
+        // Every table breadcrumb failure must still re-enable SP, and must skip CLOCK_CNTL.
+        for(ULONG fail=0;fail<49;++fail) {
+            seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x890+fail;
+            assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+            assert(hw.Reason==6 && hw.Count==3+fail && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
+            for(ULONG i=fail;i<49;++i) assert(hw.After[i]==0xFFFFFFFF);
+        }
+        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=GmuHwcgTable[5][0];
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Reason==7 && hw.Count==9 && hw.After[5]==0xA005 && hw.After[6]==0xFFFFFFFF && hw.SptpracAfterSet==0xA5);
+        // Even a failed re-enable breadcrumb must not suppress the actual recovery write.
+        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x8C1;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Reason==6 && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
+        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgSpSet=true;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Reason==9 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0);
+        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x845;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Count==0 && hw.Attempted==0 && hwcgWrites.empty());
+        seedHwcg(); hw=GmuGxHwcgTrace();
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+        failHwcgDword=0x23B09;
+        assert(GmuGxHwcgRestore(&probe,reinterpret_cast<HANDLE>(1),&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.CgcRestored[0]==GmuHwcgCgc[0] && hw.CgcRestored[1]==0x11 && hw.CgcRestored[2]==0x12);
+        failHwcgDword=0xFFFFFFFF;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;
