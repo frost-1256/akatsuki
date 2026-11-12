@@ -212,16 +212,36 @@ int main(int argc,char** argv) {
             assert(hw.Reason==6 && hw.Count==3+fail && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
             for(ULONG i=fail;i<49;++i) assert(hw.After[i]==0xFFFFFFFF);
         }
-        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=GmuHwcgTable[5][0];
-        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
-        assert(hw.Reason==7 && hw.Count==9 && hw.After[5]==0xA005 && hw.After[6]==0xFFFFFFFF && hw.SptpracAfterSet==0xA5);
+        // v55: an ignored write at any table position is recorded, but all later writes complete.
+        for(ULONG fail=0;fail<49;++fail) {
+            seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=GmuHwcgTable[fail][0];
+            assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+            assert(hw.Reason==0 && hw.Count==53 && hw.After[fail]==0xA000+fail && hw.SptpracAfterSet==0xA5);
+            for(ULONG i=0;i<49;++i) assert(hw.After[i]==(i==fail ? 0xA000+i : GmuHwcgTable[i][1]));
+            assert(gPages[8][0xAE]==0x8AA8AA82 && hwcgWrites.size()==55);
+        }
         // Even a failed re-enable breadcrumb must not suppress the actual recovery write.
         seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x8C1;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Reason==6 && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
         seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgSpSet=true;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+        assert(hw.Reason==0 && hw.Count==53 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0x8AA8AA82);
+        // Both SP writes ignored: diagnostic values differ, but the table and CLOCK_CNTL still complete.
+        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0x1A880;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
+        assert(hw.Reason==0 && hw.Count==53 && hw.SptpracAfterClear==0xA5 && hw.SptpracAfterSet==0xA5);
+        // A later SP readback mismatch cannot replace an earlier breadcrumb failure.
+        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x895; failHwcgSpSet=true;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
-        assert(hw.Reason==9 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0);
+        assert(hw.Reason==6 && hw.Count==8 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0);
+        // CGC and final CLOCK_CNTL comparisons remain strict.
+        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0x23B09;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Reason==7 && hw.Count==1 && hw.SptpracAfterClear==0xFFFFFFFF);
+        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0xAE;
+        assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
+        assert(hw.Reason==7 && hw.Count==53 && hw.ClockCntlAfter==0);
         seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x845;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Count==0 && hw.Attempted==0 && hwcgWrites.empty());

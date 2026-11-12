@@ -113,7 +113,9 @@
 // SptpracAfterSet, Before[49], After[49], CgcRestored[3], CgcRestoreStatus}.
 // CGC order: MODE, DELAY, HYST. Table order: a660_hwcg as listed in survey section 9.17.
 // Count counts CGC/table/CLOCK_CNTL writes with readback (0..53); SPTPRAC is separate.
-// Reason 0 success; 1..8 match GxInit; 9 SP clock re-enable failed. Unread=0xFFFFFFFF.
+// Reason 0 success; 1..8 match GxInit; 9 reserved (formerly SP readback mismatch). First failure is retained.
+// SPTPRAC/table readbacks are diagnostic only. CGC/CLOCK_CNTL and CGC restoration still compare strictly.
+// Unread=0xFFFFFFFF; mismatched table/SPTPRAC values alone do not fail or stop the sequence.
 // Status/RestoreStatus are NTSTATUS, unattempted=STATUS_NOT_FOUND. Skipped=1 if CLOCK_CNTL was already enabled.
 // Breadcrumbs: originals 0x840..0x875, CGC 0x880..0x882, SP clear 0x883, table 0x890..0x8C0,
 // mandatory SP set 0x8C1, CLOCK_CNTL 0x8C2, CGC restoration 0x8D0..0x8D2.

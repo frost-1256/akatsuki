@@ -1501,6 +1501,40 @@ shimに2ページの受け口、SPTPRACとhwcgの書き込み記録、書き込�
   - #19：Linux も読み戻しはしない。a660_hwcg は A660 用の表を流用しているので、A635 では bit18 のフィールドが実装されていない予約ビットの可能性がある [U]。
   - 「書いた値と全ビットが一致する」という判定は、hwcg の表には厳しすぎる [I]。
 
+### 9.17.2 v55向け読み戻し判定の緩和（実機未実行）
+
+SPTPRACのbit0クリア・セットは書き込みと直後の読み戻し記録だけにし、値の不一致を失敗にしない。表49個も読み戻しをAfter[]へ記録するが比較せず、不一致だけでは止めずに最後まで書く。breadcrumb・GX確認の失敗時は従来どおり通常の書き込みを中止し、SP停止を試みていれば必須のSP再開書き込みを行ってからOOB解除・slumberへ進む。
+
+SP再開のbreadcrumb/GX確認で後から失敗しても、既に失敗していれば最初のStatus/Reasonを保持する。最初の失敗がSP再開時のbreadcrumb/GX確認なら、その失敗を返す。SPTPRACの読み戻しだけによるReason 9は今回から発生しない（番号は従来の記録解読用に予約）。CGC 3個、最後のCLOCK_CNTL、後片付けのCGC復元の比較は厳密なまま。
+
+`GpuGmuGxHwcg`の480バイトの形式、Count、プローブ指定`0x3FE80`は変更しない。読み戻し不一致だけでほかの失敗がなければReason/Statusは0、Countは53となり、不一致は各Afterの生値で確認する。
+
+ホスト試験を、各表項目の不一致でも全項目とCLOCK_CNTLまで進むこと、SPTPRACのクリア・セット不一致を記録して続けること、先行するbreadcrumb失敗を後続のSP読み戻しで上書きしないことに更新した。CGCとCLOCK_CNTLの不一致は引き続き失敗するケースも追加した。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.17.3 結果（v55）
+
+**結果（2026-11-12、v34-akat、Epinephrine v55 / 20.0.2.55、`EpiGpuProbe=0x3FE80`、23:46 の再起動後）：成功** [P]。**hwcg を ON にしたまま、GX の OFF と後片付けまで通った。**
+
+- 全体：
+  - `GpuGmuStatus=0`、NtStatus 0、KeepCx 0、`GpuCxStatus=0`。
+  - CGC の復元は 0／0／0 に戻り、`CgcRestoreStatus=0`。
+- `GpuGmuGxHwcg`：
+  - Attempted 1、Reason 0、Status 0、Count 53、Skipped 0、Gdscr 0xF8222800、GxHm 0。
+  - CGC：元値は 0／0／0、書き込み後は 0x00020202／0x00010111／0x00005555（一致）。
+  - **`RBBM_CLOCK_CNTL` は 0 から 0x8AA8AA82 になり、読み戻しも一致した。**
+  - SPTPRAC の 3 回の読み戻しは、v54 と同じですべて 0。
+  - 表の元値 49 個はすべて 0。
+- 表の 49 個のうち、47 個は書いた値と一致した。一致しなかったのは 2 個：
+
+  | # | レジスタ（dword） | 書いた値 | 読み戻し | 落ちたビット |
+  |---|---|---|---|---|
+  | 19 | `CLOCK_HYST_RB_CCU0`（0x100） | 0x00040F00 | 0x00000F00 | bit18 |
+  | 43 | `RBBM_ISDB_CNT`（0x533） | 0x00000182 | 0 | 全部 |
+
+  - #19 は v54 と同じ結果で、再現した。
+  - #43 は、書き込み専用か、デバッグ用（ISDB）で読み出せないレジスタの可能性がある [U]。
+- これで `a6xx_set_hwcg(true)` に相当する処理を終えた。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
