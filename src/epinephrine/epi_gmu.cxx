@@ -26,12 +26,13 @@
 //      Bit12 then performs OOB GPU_SET/release and PREPARE_SLUMBER before diagnostics/reset.
 //      Bit13 reads six GX registers once each after OOB ACK and GX-on checks, strictly before release.
 //      Bit14 then clears CX GBIF_HALT and RBBM_GBIF_HALT with immediate posted-write readbacks.
+//      Bit15 then clears four SECVID TSB controls under the same OOB lease (stage A only).
 //      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset, bit12 rpmh_stop, check RSCC/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls, optional GBIF and RSCC, then Unmap / Destroy / free.
 //      A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
-// Not done here: rpmh_start, force_off, CP access, other RBBM writes, GPU PDC (reading it reset the phone on 2026-11-07).
+// Not done here: rpmh_start, force_off, CP access, ADDR_MODE/hwcg, GPU PDC (reading it reset the phone on 2026-11-07).
 // No PLL programming; bit11 uses the existing GCC GPLL0_DIV source.
 // Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
@@ -822,8 +823,57 @@ static VOID GmuGxReadReg(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
     { Halt->Status=GmuGxClearHalt(S,Params,Cc,T,static_cast<volatile ULONG*>(map),Halt); }
     MmUnmapIoSpace(map,PAGE_SIZE);
 }
+struct GMU_GX_INIT_TRACE {
+    ULONG Attempted, Reason, Gdscr, GxHm, Count;
+    NTSTATUS Status;
+    ULONG Before[16], After[16];
+};
+static_assert(sizeof(GMU_GX_INIT_TRACE)==152,"GX init diagnostic ABI");
+static GMU_GX_INIT_TRACE GmuGxInitTrace()
+{
+    GMU_GX_INIT_TRACE t={}; t.Reason=GX_REG_NOT_REACHED; t.Status=STATUS_NOT_FOUND;
+    t.Gdscr=0xFFFFFFFF; t.GxHm=0xFFFFFFFF;
+    for (ULONG i=0;i<16;++i) { t.Before[i]=0xFFFFFFFF; t.After[i]=0xFFFFFFFF; }
+    return t;
+}
+static NTSTATUS GmuGxSecvid(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
+                             const GMU_GX_TRACE* T, GMU_GX_INIT_TRACE* I)
+{
+    // Only stage A is enabled: one page, no ADDR_MODE/TRUST_CNTL/hwcg accesses.
+    const ULONG offsets[]={3,0,1,2}; // TSB_CNTL, TRUSTED_BASE low/high, TRUSTED_SIZE
+    GMU_GX_REG_TRACE guard={};
+    const BOOLEAN readyToMap=GmuGxRegReady(Cc,S,T,&guard);
+    I->Gdscr=guard.Gdscr; I->GxHm=guard.GxHm;
+    if (!readyToMap) { I->Reason=guard.Reason; return STATUS_INVALID_DEVICE_STATE; }
+    PHYSICAL_ADDRESS pa; pa.QuadPart=EPI_GMU_GPU_BASE+0x3E000;
+    PVOID map=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+    if (map==NULL) { I->Reason=GX_REG_MAP_FAILED; return STATUS_INSUFFICIENT_RESOURCES; }
+    NTSTATUS st=STATUS_SUCCESS;
+    for (ULONG phase=0;phase<2 && NT_SUCCESS(st);++phase)
+    {
+        for (ULONG i=0;i<RTL_NUMBER_OF(offsets);++i)
+        {
+            st=GmuStep(Params,(phase==0 ? 0x800 : 0x810)+i);
+            if (!NT_SUCCESS(st)) { I->Reason=GX_REG_BREADCRUMB_FAILED; break; }
+            const BOOLEAN ready=GmuGxRegReady(Cc,S,T,&guard);
+            I->Gdscr=guard.Gdscr; I->GxHm=guard.GxHm;
+            if (!ready) { I->Reason=guard.Reason; st=STATUS_INVALID_DEVICE_STATE; break; }
+            volatile ULONG* reg=static_cast<volatile ULONG*>(map)+offsets[i];
+            if (phase==0) { I->Before[i]=READ_REGISTER_ULONG(reg); continue; }
+            I->Attempted=1;
+            WRITE_REGISTER_ULONG(reg,0);
+            I->After[i]=READ_REGISTER_ULONG(reg); // drain the posted write immediately
+            I->Count=i+1;
+            if (I->After[i]!=0) { I->Reason=7; st=STATUS_IO_DEVICE_ERROR; break; }
+        }
+    }
+    if (NT_SUCCESS(st)) { I->Reason=0; }
+    MmUnmapIoSpace(map,PAGE_SIZE);
+    return st;
+}
 static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_TRACE* T,
-                         GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL)
+                         GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL,
+                         GMU_GX_INIT_TRACE* Init = NULL)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -849,6 +899,12 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
             Halt->Gdscr=GxReg->Gdscr; Halt->GxHm=GxReg->GxHm;
             Halt->Status=STATUS_INVALID_DEVICE_STATE; // six reads did not complete; no writes allowed
         }
+    }
+    if (Init!=NULL)
+    {
+        if (Halt!=NULL && NT_SUCCESS(Halt->Status) && Halt->Count==2)
+        { Init->Status=GmuGxSecvid(S,Params,Cc,T,Init); }
+        else { Init->Reason=8; Init->Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
     WRITE_REGISTER_ULONG(GmuReg(S,R_HOST2GMU_INTR_SET),0x80000000UL);
@@ -958,7 +1014,7 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx, BOOLEAN FastClock,
-                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt)
+                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
@@ -969,6 +1025,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (GxOn && (!FastClock || !VoteGx || !StartHfi)) { return EPI_GMU_E_PRECOND; }
     if (GxReg && !GxOn) { return EPI_GMU_E_PRECOND; }
     if (ClearHalt && !GxReg) { return EPI_GMU_E_PRECOND; }
+    if (Secvid && !ClearHalt) { return EPI_GMU_E_PRECOND; }
     if (Cc == NULL || Text == NULL || TextCch==0) { return EPI_GMU_E_PRECOND; }
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -1006,6 +1063,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuGx",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxHalt",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     for (ULONG i=0;i<RTL_NUMBER_OF(s->SmmuCbar);++i)
@@ -1023,6 +1081,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     gxHalt.Status=STATUS_NOT_FOUND; gxHalt.CxIdleStatus=STATUS_NOT_FOUND; gxHalt.CxPolls=0xFFFFFFFF;
     for (ULONG i=0;i<4;++i) { gxHalt.Before[i]=0xFFFFFFFF; gxHalt.After[i]=0xFFFFFFFF; }
     gxHalt.FinalCx[0]=0xFFFFFFFF; gxHalt.FinalCx[1]=0xFFFFFFFF;
+    GMU_GX_INIT_TRACE gxInit=GmuGxInitTrace();
     GMU_GX_TRACE gx={};
     gx.OobStatus=STATUS_NOT_FOUND; gx.HaltStatus=STATUS_NOT_FOUND; gx.SlumberStatus=STATUS_NOT_FOUND;
     gx.BusyStatus=STATUS_NOT_FOUND; gx.RpmhStopStatus=STATUS_NOT_FOUND; gx.IdleStatus=STATUS_NOT_FOUND;
@@ -1252,7 +1311,8 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         if (!NT_SUCCESS(st)) { result=EPI_GMU_E_HFI; }
         else if (GxOn)
         {
-            const NTSTATUS oob=GmuGxOob(s,Params,Cc,&gx,GxReg ? &gxReg : NULL,ClearHalt ? &gxHalt : NULL);
+            const NTSTATUS oob=GmuGxOob(s,Params,Cc,&gx,GxReg ? &gxReg : NULL,
+                                        ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (gx.Attempted)
             {
@@ -1260,11 +1320,12 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                 if (!NT_SUCCESS(slumber)) { hfi.Status=slumber; }
             }
             if (!NT_SUCCESS(oob) || (gx.Attempted && !NT_SUCCESS(slumber)) || !NT_SUCCESS(gx.BreadcrumbStatus) ||
-                (ClearHalt && !NT_SUCCESS(gxHalt.Status)))
+                (ClearHalt && !NT_SUCCESS(gxHalt.Status)) || (Secvid && !NT_SUCCESS(gxInit.Status)))
             {
                 result=EPI_GMU_E_GX;
                 st=!NT_SUCCESS(oob) ? oob : (!NT_SUCCESS(slumber) ? slumber :
-                   (!NT_SUCCESS(gx.BreadcrumbStatus) ? gx.BreadcrumbStatus : gxHalt.Status));
+                   (!NT_SUCCESS(gx.BreadcrumbStatus) ? gx.BreadcrumbStatus :
+                    (ClearHalt && !NT_SUCCESS(gxHalt.Status) ? gxHalt.Status : gxInit.Status)));
             }
         }
         GmuHfiPower(s,Params,Cc,&hfi,1);
@@ -1286,6 +1347,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     }
 cleanup:
     EpiSetDword(Diag,L"GpuGmuNtStatus",static_cast<ULONG>(st));
+    if (Secvid) { EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,&gxInit,sizeof(gxInit)); }
     if (GxReg) { EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,&gxReg,sizeof(gxReg)); }
     if (ClearHalt) { EpiSetValue(Diag,L"GpuGmuGxHalt",REG_BINARY,&gxHalt,sizeof(gxHalt)); }
     if (GxOn)
@@ -1419,6 +1481,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (Secvid) { EpiSetValue(Diag,L"GpuGmuGxInit",REG_BINARY,&gxInit,sizeof(gxInit)); }
     if (ClearHalt) { EpiSetValue(Diag,L"GpuGmuGxHalt",REG_BINARY,&gxHalt,sizeof(gxHalt)); }
     if (GxReg) { EpiSetValue(Diag,L"GpuGmuGxReg",REG_BINARY,&gxReg,sizeof(gxReg)); }
     if (GxOn) { EpiSetValue(Diag,L"GpuSmmuCbar",REG_BINARY,s->SmmuCbar,sizeof(s->SmmuCbar)); }

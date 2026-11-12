@@ -1221,7 +1221,99 @@ shimにはRW/RO写像の確認、両haltのclear応答、片側のclearが効か
 
 - `GBIF_HALT=0`（CX 側）と `RBBM_GBIF_HALT=0`（GX 側）を書いて、電話も固まらず、読み返しも 0 だった。GX 側のレジスタに書けることを初めて確かめた。
 - どちらの HALT も元から 0 だったので、ハードウェアの状態は変わっていない。`hw_init` の最初の手順を、Linux と同じ順に実行できたということになる。
-- 次の候補（§9.15 の最後）：slumber の前にバスの halt（`GBIF_HALT` の bit0 → bit1 → 0）を入れて Linux の普通の停止に合わせる。または `hw_init` の 3（`RBBM_SECVID_TSB_CNTL`、TSB の TRUSTED_BASE/SIZE、`*_ADDR_MODE_CNTL`）に進む。
+- 次：`hw_init` の 3（`RBBM_SECVID_TSB_CNTL`、TSB の TRUSTED_BASE/SIZE、`*_ADDR_MODE_CNTL`）に進む。slumber の前のバスの halt は、v43 からもう入っている（§9.15 の訂正を参照）。
+
+### 9.16 hw_init の次の書き込み（SECVID と ADDR_MODE）の計画（本家 Linux の事実、2026-11-12）
+
+**Linux の順番**（`a6xx_gpu.c` 1210〜1237、GBIF の halt を外した直後）：
+1. `RBBM_SECVID_TSB_CNTL` ← 0
+2. （A619 holi だけ sptprac。A635 には関係ない）
+3. `RBBM_SECVID_TSB_TRUSTED_BASE`（64 ビット、`gpu_write64` なので下位 → 上位の順）← 0、`RBBM_SECVID_TSB_TRUSTED_SIZE` ← 0。コメントは「安全なメモリの範囲を無効にする。使わないし、仮想アドレス空間の一部をふさぎたくない」
+4. A7xx でなければ（A635 は A6xx なので当てはまる）、12 個の `*_ADDR_MODE_CNTL` ← 1（全ブロックで 64 ビットのアドレスを使う）
+5. そのあとに `a6xx_set_hwcg(true)` が続く（今回の範囲外）
+
+`RBBM_SECVID_TRUST_CNTL`（0xF400）は、もっとあとで zap シェーダーがないときだけ書かれるもので、TZ に守られている可能性がある。今回の範囲には入れない。
+
+**レジスタの場所**（`a6xx.xml`。物理アドレス = 0x03D00000 + dword × 4）：
+
+| 段 | 名前 | dword | 窓の中のバイト | ページ | Linux が書く値 |
+|---|---|---|---|---|---|
+| A | `RBBM_SECVID_TSB_CNTL` | 0xF803 | 0x3E00C | 0x3E000 | 0 |
+| A | `RBBM_SECVID_TSB_TRUSTED_BASE` 下位 / 上位 | 0xF800 / 0xF801 | 0x3E000 / 0x3E004 | 0x3E000 | 0 / 0 |
+| A | `RBBM_SECVID_TSB_TRUSTED_SIZE` | 0xF802 | 0x3E008 | 0x3E000 | 0 |
+| B | `CP_ADDR_MODE_CNTL` | 0x0842 | 0x02108 | 0x02000 | 1 |
+| B | `VSC_ADDR_MODE_CNTL` | 0x0C01 | 0x03004 | 0x03000 | 1 |
+| B | `GRAS_ADDR_MODE_CNTL` | 0x8601 | 0x21804 | 0x21000 | 1 |
+| B | `RB_ADDR_MODE_CNTL` | 0x8E05 | 0x23814 | 0x23000 | 1 |
+| B | `PC_ADDR_MODE_CNTL` | 0x9E01 | 0x27804 | 0x27000 | 1 |
+| B | `HLSQ_ADDR_MODE_CNTL` | 0xBE05 | 0x2F814 | 0x2F000 | 1 |
+| B | `VFD_ADDR_MODE_CNTL` | 0xA601 | 0x29804 | 0x29000 | 1 |
+| B | `VPC_ADDR_MODE_CNTL` | 0x9601 | 0x25804 | 0x25000 | 1 |
+| B | `UCHE_ADDR_MODE_CNTL` | 0x0E00 | 0x03800 | 0x03000 | 1 |
+| B | `SP_ADDR_MODE_CNTL` | 0xAE01 | 0x2B804 | 0x2B000 | 1 |
+| B | `TPL1_ADDR_MODE_CNTL` | 0xB601 | 0x2D804 | 0x2D000 | 1 |
+| B | `RBBM_SECVID_TSB_ADDR_MODE_CNTL` | 0xF810 | 0x3E040 | 0x3E000 | 1 |
+
+B の行は Linux が書く順に並べてある。`ADDR_MODE_CNTL` は `a5xx_address_mode` 型で、bit0 が 64 ビットの指定。
+
+**ページの割り当て**：
+- 使うページは 11 枚（0x02000、0x03000、0x21000、0x23000、0x25000、0x27000、0x29000、0x2B000、0x2D000、0x2F000、0x3E000）で、すべて GPU のレジスタ窓（0x03D00000、0x40000 バイト）の中にある。
+- 次のどちらかを選べる。
+  1. 窓全体（0x40000 バイト）を一度に、読み書き可能で割り当てる。Linux と同じ形で、手順が簡単になる。割り当てるだけではハードウェアに触らない。
+  2. 使うページだけを 1 枚ずつ割り当てる。触れる範囲が一番狭くなる。
+- 窓の中には GPU PDC（0x0B290000）は含まれない。
+
+**値の記録と読み返し**：
+- 書く前に、その段のレジスタの元の値をすべて読んで記録する。
+- 1 つずつ、breadcrumb と GX の確かめ（v48 と同じ）→ 書く → すぐ読み返す。
+- 読み返しが書いた値と違っても、その段のそれ以降は書かないで止め、OOB の解除と slumber に進む。
+- B の `GRAS`〜`TPL1` などは、描画の設定（context）のレジスタになる。CPU から読み返したときに書いた値が見えるかどうかは確かめていない [U]。最初は、読み返しが違うことだけを理由にした失敗にはせず、値を記録するだけにする案もある。
+- **元に戻す処理はいらない**と見ている。どれも GX 側の設定で、GX を切ると消える [I]。Linux も戻していない。次の実行の最初に読む元の値で確かめられる（毎回再起動するので、リセット直後の値になる）。
+
+**段に分けて試す**：
+- **段 A（SECVID の 4 つ、1 ページ）**：新しいビット（例：bit15、合わせて `0xFE80`、bit14 が前提）。halt を外したあと、OOB を解除する前に行う。
+- **段 B（ADDR_MODE の 12 個、11 ページ）**：さらに新しいビット（例：bit16、合わせて `0x1FE80`、bit15 が前提）。段 A のあとに続けて行う。
+- 段 A だけで 1 回実機で試し、通ってから段 B を足す。
+
+**診断**（案）：
+- `GpuGmuGxInit`：`{Attempted, Reason, Gdscr, GxHm, Count, Status, Before[16], After[16]}`。並び順は上の表と同じ（A の 4 つ → B の 12 個）。
+- まだ読んでいない値は 0xFFFFFFFF。Reason は v48 の 0〜6 と、7 = 読み返しが違う、8 = 前の段が終わっていない。
+
+**机上の試験**：
+- shim の 0x03D00000 からの 0x40000 バイト（または 11 ページ）に受け口を作る。
+- 試すこと：
+  - 書いた値が上の順で読み返せること
+  - 途中で breadcrumb が失敗したら、それ以降を書かないこと
+  - 段 A だけのときは、段 B のページに何も書かないこと
+  - 読み返しが違うときに止まること
+
+### 9.16.1 段Aの実装（実機未実行）
+
+`EPI_GMU_PROBE_SECVID=0x8000` を追加。bit14と全前提が必要で、`0xFE80` で段Aだけを実行する。bit16は今回は予約扱いとし、指定時はワンショット解除・flush後にstatus 6で拒否する。段Bは段Aの実機確認後に追加する。
+
+既存の6読み取りと2組のhalt解除が成功したあと、同じOOBの解除前に、物理0x03D3E000の1ページだけをRW・非キャッシュでmapする。元値を4個すべて記録してから、TSB_CNTL、TRUSTED_BASE下位、上位、TRUSTED_SIZEの順に0を書き、各書き込み直後に読み返す。元値の各読み取り前（0x800〜0x803）と各書き込み前（0x810〜0x813）にbreadcrumbを保存・flushし、OOB ACK成功・GDSCR bit31・GX HM bit6/7を再確認する。
+
+確認・breadcrumb・mapの失敗、または読み戻し不一致で後続の書き込みを止め、mapを解除してOOB解除と既存のslumberへ進む。元値の復元は行わない。安全な後片付けが成功すれば試験失敗はstatus 13、既存のGX OFF・idle・CX HALT確認や後片付けが失敗すればstatus 8 / KeepCx。CX ACKは記録だけで、0を要求しない。
+
+`GpuGmuGxInit` はREG_BINARY・152バイト（38 DWORD）：`{Attempted, Reason, Gdscr, GxHm, Count, Status, Before[16], After[16]}`。cleanup/keepの両経路で保存する。Before/Afterの先頭4個は段Aの上記順序、残り12個は予約で0xFFFFFFFF。未読値は0xFFFFFFFF、未試行StatusはSTATUS_NOT_FOUND。Countは完了した書き込み・読み返し数（不一致も含む0〜4）、Attemptedは最初の書き込み直前に1。Reasonは0=完了、1=未到達、2=OOB ACK失敗、3=GDSCR OFF、4=GX HM不成立、5=map失敗、6=breadcrumb失敗、7=読み戻し不一致、8=前提のhalt解除未完了。Statusは段AのNTSTATUS。
+
+shimとホスト試験に、書き込み順と全元値の保存、予約スロット未読、元値読み取り中・書き込み途中のbreadcrumb失敗、読み戻し不一致での停止を追加。試験・ビルド・配置・実機実行は未実施。TRUST_CNTL、ADDR_MODE、hwcgには触れない。
+
+**結果（2026-11-12、v34-akat を起動した直後、Epinephrine v52 / 20.0.2.52、`EpiGpuProbe=0xFE80`）：段 A が成功し、後片付けまで通った** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuGxInit` | Attempted 1、Reason 0、GDSCR 0xF8222800、GX HM 0、Count 4、Status 0 |
+| Before[0..3]（TSB_CNTL、TRUSTED_BASE 下位、上位、TRUSTED_SIZE） | 0、0、0、0 |
+| After[0..3] | 0、0、0、0 |
+| Before/After[4..15] | 0xFFFFFFFF（段 B は予約のまま） |
+| `GpuGmuGxReg` / `GpuGmuGxHalt` | v51 と同じ（Count 6 / Count 2、Before = After = {0, 3, 0, 0}） |
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 |
+| HFI / idle の判定 / GBIF / クロック / SMMU の Disable / RSCC と各復元 | すべて 0 |
+
+- SECVID の 4 つのレジスタに書いても、TZ に止められることはなく、電話も固まらなかった。
+- 4 つとも元から 0 だったので、halt のときと同じく、ハードウェアの状態は変わっていない。書き込みが本当に効いているかどうかは、この結果からは区別できない [I]。
+- 段 B（`*_ADDR_MODE_CNTL` ← 1）では、リセット直後の値（0 と見られる）とは違う値を書くことになる。書いた値が読み返せるかどうかで、GX 側への書き込みが効くことを初めて確かめられる。
 
 ## 参照
 

@@ -48,6 +48,7 @@ static std::vector<UCHAR> Image() {
     ULONG version=0x30010008; Block(f,0x10007FE0,4,0,0,&version); return f;
 }
 static void Reset() {
+    std::memset(secvidPage,0,sizeof(secvidPage)); secvidWrites.clear(); failSecvidOffset=0xFFFFFFFF;
     assert(allocations.empty() && !g_KeptGmu);
     std::memset(gPages,0,sizeof(gPages)); std::memset(cc,0,sizeof(cc));
     cc[0x106C/4]=0x80000000; cc[0x100C/4]=1; gPages[1][0]=1; gPages[1][0x340/4]=0xC0;
@@ -103,6 +104,33 @@ int main(int argc,char** argv) {
         gPages[6][0x46]=3;
         assert(GmuGxCxHaltIdle(&probe,reinterpret_cast<HANDLE>(1),&halt)==0);
         assert(halt.FinalCx[0]==0 && halt.FinalCx[1]==3 && halt.CxPolls==0);
+        // Stage A: all originals precede ordered writes; stage B slots stay unread.
+        for(ULONG i=0;i<4;++i) secvidPage[i]=0x10+i;
+        GMU_GX_INIT_TRACE init=GmuGxInitTrace();
+        assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
+        assert(init.Reason==0 && init.Attempted==1 && init.Count==4);
+        const ULONG order[]={3,0,1,2};
+        assert(secvidWrites.size()==4);
+        for(ULONG i=0;i<4;++i) {
+            assert(secvidWrites[i]==order[i] && init.Before[i]==0x10+order[i] && init.After[i]==0);
+        }
+        for(ULONG i=4;i<16;++i) assert(init.Before[i]==0xFFFFFFFF && init.After[i]==0xFFFFFFFF);
+        // Failure at the second write breadcrumb leaves the remaining registers untouched.
+        secvidWrites.clear(); for(ULONG i=0;i<4;++i) secvidPage[i]=0x10+i;
+        init=GmuGxInitTrace(); failGmuStep=0x811;
+        assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+        assert(init.Reason==6 && init.Count==1 && secvidWrites.size()==1 && secvidPage[0]==0x10);
+        // A failed original-read breadcrumb prevents every write.
+        secvidWrites.clear(); init=GmuGxInitTrace(); failGmuStep=0x802;
+        assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+        assert(init.Reason==6 && init.Count==0 && init.Attempted==0 && secvidWrites.empty());
+        // Readback mismatch at BASE low stops before BASE high and SIZE.
+        failGmuStep=0xFFFFFFFF; failSecvidOffset=0;
+        init=GmuGxInitTrace();
+        assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+        assert(init.Reason==7 && init.Count==2 && secvidWrites.size()==2);
+        assert(init.After[1]==0x10 && init.After[2]==0xFFFFFFFF && secvidPage[1]==0x11);
+        failSecvidOffset=0xFFFFFFFF;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;

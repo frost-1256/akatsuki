@@ -21,6 +21,9 @@ template<class... T> inline void RtlStringCchPrintfW(wchar_t* p,SIZE_T n,const w
 }
 inline void RtlStringCchCatW(wchar_t* p,SIZE_T n,const wchar_t* a) { wcsncat_s(p,n,a,_TRUNCATE); }
 static ULONG gPages[9][4096];
+static ULONG secvidPage[PAGE_SIZE/sizeof(ULONG)];
+static std::vector<ULONG> secvidWrites;
+static ULONG failSecvidOffset=0xFFFFFFFF;
 static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
@@ -36,6 +39,7 @@ inline void GmuSeedGxRegs() {
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
+    if(a.QuadPart==0x03D3E000) { assert(protection==(PAGE_READWRITE|PAGE_NOCACHE)); return secvidPage; }
     if(a.QuadPart==0x03D00000) gxPageProtection=protection;
     const ULONGLONG bases[]={0x03D7D000,0x03D7E000,0x03D8E000,0x03D6D000,0x03D71000,0x03DE0000,
                             0x03D0F000,0x00152000,0x03D00000};
@@ -44,6 +48,11 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
+    for(ULONG i=0;i<4;++i) if(p==secvidPage+i) {
+        secvidWrites.push_back(i);
+        if(i!=failSecvidOffset) *p=v;
+        return;
+    }
     if(p==gPages[1] && v==1 && resetFails) return;
     if(v==0 && ((p==gPages[6]+0x45 && failCxHaltClear) || (p==gPages[8]+0x16 && failRbbmHaltClear))) return;
     *p=v;

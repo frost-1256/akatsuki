@@ -11,6 +11,7 @@
 #define EPI_GMU_PROBE_GX_ON    0x1000UL    // modifier: requires 0xE80 (0x1E80 total), OOB GPU_SET + slumber / rpmh_stop
 #define EPI_GMU_PROBE_GX_REG   0x2000UL    // modifier: requires 0x1E80 (0x3E80 total), read six GX registers under OOB
 #define EPI_GMU_PROBE_GX_HALT  0x4000UL    // modifier: requires 0x3E80 (0x7E80 total), clear CX/RBBM GBIF halt under OOB
+#define EPI_GMU_PROBE_SECVID   0x8000UL    // modifier: requires 0x7E80 (0xFE80 total), SECVID stage A only
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -26,7 +27,7 @@
 #define EPI_GMU_E_HFI           10          // HFI init or a requested message failed after successful FW init
 #define EPI_GMU_E_GBIF          11          // GBIF precondition/read/write/breadcrumb failed (CM3 never released)
 #define EPI_GMU_E_CLOCK         12          // clock setup failed (CM3 never released); failed restoration returns 8
-#define EPI_GMU_E_GX            13          // OOB/slumber/optional halt-clear failed, but safe teardown succeeded
+#define EPI_GMU_E_GX            13          // OOB/slumber/optional GX initialization failed, but safe teardown succeeded
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -91,12 +92,19 @@
 // Reason: 0 completed, 1 not reached, 2 OOB ACK failed, 3 GDSCR off, 4 GX HM off, 5 map failed, 6 breadcrumb failed.
 // Value order: STATUS (0x210), STATUS3 (0x213), INT_0_STATUS (0x201), CLOCK_CNTL (0xAE), GBIF_HALT/ACK (0x16/17).
 // Count is completed reads (0..6); Attempted becomes 1 before the first read. Stop on a failed guard/flush.
-// Six reads precede optional halt clears. The page is RO for 0x3E80, RW only for 0x7E80; breadcrumbs 0x7C8..0x7CD.
+// Six reads precede optional halt clears. The page is RW only when ClearHalt is requested; breadcrumbs 0x7C8..0x7CD.
 // GpuGmuGxHalt: 72 bytes {Attempted, Reason, Gdscr, GxHm, Count, Status, CxIdleStatus,
 // Before[4], After[4], FinalCx[2], CxPolls}; Before/After order: CX HALT/ACK, RBBM HALT/ACK.
 // Reason 0 success; 1..6 match GxReg; 7 nonzero HALT readback; 8 incomplete prerequisite reads.
 // Count is completed write/readback pairs (0..2). Status/CxIdleStatus are NTSTATUS; unattempted=STATUS_NOT_FOUND.
 // FinalCx is the CX HALT/ACK after slumber/reset/idle; require HALT=0, otherwise KeepCx. ACK is diagnostic only.
+// GpuGmuGxInit: 152 bytes {Attempted, Reason, Gdscr, GxHm, Count, Status, Before[16], After[16]}.
+// Stage A slots 0..3: SECVID TSB_CNTL, TRUSTED_BASE low, high, TRUSTED_SIZE (all target 0).
+// Stage B slots 4..15 are reserved/unread (0xFFFFFFFF); bit16 is rejected until stage A is validated.
+// Reason 0 success; 1..6 match GxReg; 7 readback mismatch; 8 prerequisite halt clears incomplete.
+// Count includes a mismatched write/readback (0..4); Attempted is set before the first write.
+// Status is NTSTATUS (unattempted=STATUS_NOT_FOUND). Unread values=0xFFFFFFFF.
+// Breadcrumbs 0x800..0x803 precede original reads, 0x810..0x813 precede writes; each flush is followed by a GX guard.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -109,9 +117,10 @@
 // GxOn: requires all three modifiers; OOB then slumber before reset, rpmh_stop after reset (probe 0x1E80).
 // GxReg: requires GxOn and its prerequisites; optional six-register read under OOB (probe 0x3E80).
 // ClearHalt: requires GxReg and its prerequisites; clear GBIF/RBBM halt after the six reads (probe 0x7E80).
+// Secvid: requires ClearHalt and its prerequisites; stage A after halt clears, before OOB release (probe 0xFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
-                     BOOLEAN ClearHalt = FALSE);
+                     BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE);

@@ -745,7 +745,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
                                                (Flags & EPI_GMU_PROBE_CLOCK) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_GX_ON) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_GX_REG) ? TRUE : FALSE,
-                                               (Flags & EPI_GMU_PROBE_GX_HALT) ? TRUE : FALSE);
+                                               (Flags & EPI_GMU_PROBE_GX_HALT) ? TRUE : FALSE,
+                                               (Flags & EPI_GMU_PROBE_SECVID) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -859,6 +860,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit12 = requires bits7/9/10/11 (0x1E80), add OOB GPU_SET and slumber/rpmh_stop,
     // bit13 = requires bit12 and its prerequisites (0x3E80), read six GX registers once before OOB release,
     // bit14 = requires bit13 and its prerequisites (0x7E80), clear CX/RBBM GBIF halt after those reads.
+    // bit15 = requires bit14 and its prerequisites (0xFE80), SECVID stage A; bit16 remains rejected.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
     if (flags & EPI_RSCC_PROBE_WRITE)
@@ -874,11 +876,13 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         { EpiSetDword(hDiag, L"GpuRsccWStatus", 6); status = 6; goto done; }
     }
     else if (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE | EPI_GMU_PROBE_CLOCK |
-                      EPI_GMU_PROBE_GX_ON | EPI_GMU_PROBE_GX_REG | EPI_GMU_PROBE_GX_HALT))
+                      EPI_GMU_PROBE_GX_ON | EPI_GMU_PROBE_GX_REG | EPI_GMU_PROBE_GX_HALT |
+                      EPI_GMU_PROBE_SECVID | 0x10000UL))
     {
         const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
         if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
-        if (!(flags & EPI_GMU_PROBE_BOOT) ||
+        if ((flags & 0x10000UL) || // stage B is reserved until the SECVID-only hardware trial succeeds
+            !(flags & EPI_GMU_PROBE_BOOT) ||
             ((flags & EPI_GMU_PROBE_GX_VOTE) && !(flags & EPI_GMU_PROBE_HFI_START)) ||
             ((flags & EPI_GMU_PROBE_CLOCK) &&
              (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE)) !=
@@ -887,7 +891,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
              (flags & (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE | EPI_GMU_PROBE_CLOCK)) !=
                       (EPI_GMU_PROBE_HFI_START | EPI_GMU_PROBE_GX_VOTE | EPI_GMU_PROBE_CLOCK)) ||
             ((flags & EPI_GMU_PROBE_GX_REG) && !(flags & EPI_GMU_PROBE_GX_ON)) ||
-            ((flags & EPI_GMU_PROBE_GX_HALT) && !(flags & EPI_GMU_PROBE_GX_REG)))
+            ((flags & EPI_GMU_PROBE_GX_HALT) && !(flags & EPI_GMU_PROBE_GX_REG)) ||
+            ((flags & EPI_GMU_PROBE_SECVID) && !(flags & EPI_GMU_PROBE_GX_HALT)))
         { status = 6; goto done; }
     }
     else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }
