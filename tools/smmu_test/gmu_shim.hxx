@@ -20,7 +20,7 @@ template<class... T> inline void RtlStringCchPrintfW(wchar_t* p,SIZE_T n,const w
     _snwprintf_s(p,n,_TRUNCATE,f,args...);
 }
 inline void RtlStringCchCatW(wchar_t* p,SIZE_T n,const wchar_t* a) { wcsncat_s(p,n,a,_TRUNCATE); }
-static ULONG gPages[8][4096];
+static ULONG gPages[9][4096];
 static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
@@ -28,7 +28,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG) {
     const ULONGLONG bases[]={0x03D7D000,0x03D7E000,0x03D8E000,0x03D6D000,0x03D71000,0x03DE0000,
-                            0x03D0F000,0x00152000};
+                            0x03D0F000,0x00152000,0x03D00000};
     for(ULONG i=0;i<RTL_NUMBER_OF(bases);++i) if(static_cast<ULONGLONG>(a.QuadPart)==bases[i]) return gPages[i];
     assert(false); return nullptr;
 }

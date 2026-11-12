@@ -998,6 +998,87 @@ rpmh_stopを省く試験、OOBだけでslumberを省く試験、GX/RBBM/CPやPDC
 - 電話を再起動した直後の 1 回目で、GMU の起動 → HFI 6 通 → GX ON → slumber で GX OFF → rpmh_stop → SMMU Disable → 全復元 → CX OFF まで、初めて最後まで通った。
 - 次：GX が ON の間に、GX 側のレジスタ（chip id など）を読むだけの試験。GPU 本体のレジスタに触れるのは初めてになる。
 
+### 9.14 GX 側のレジスタを初めて読む試験の計画（本家 Linux の事実、2026-11-12）
+
+出典は手元の参照コピーの `a6xx_gpu.c`、`a6xx.xml`、`a6xx_gmu.c`、`kodiak.dtsi`。行番号は手元の参照コピーのもの。コードは持ち込まない。実装はユーザーが書く。
+
+**1. chip id は読めない** [P]
+- A6xx の GPU には、chip id を返すレジスタがない。Linux の `chip_id`（0x06030500）は、カタログと DT の compatible（`qcom,adreno-635.0`）から決まる（`adreno_gpu.c` 1207 行）。
+- Linux はこの値の並びを変えて、GMU のファームウェアを起動するときに `GMU_HFI_SFR_ADDR`（0x1F982）へ書く（`a6xx_gmu.c` 1012〜1038 行）。Epinephrine もすでに 0x06035000 を書いている（`epi_gmu.cxx` の `V_GMU_CHIPID`）。
+- そこで最初に読む相手は、chip id の代わりに **`RBBM_STATUS`** にする。
+
+**2. GX 側のレジスタの位置** [P]
+- GPU のレジスタの窓は `kgsl_3d0_reg_memory` = 0x03D00000、大きさ 0x40000（`kodiak.dtsi` 3218 行）。RBBM はその先頭にある。今の実装が持っている窓は GBIF のページ（+0xF000、CX 側）だけなので、**先頭のページ（0x03D00000〜0x03D00FFF）を新しく map する必要がある。**
+
+| レジスタ | dword | 物理アドレス | 中身 |
+|---|---|---|---|
+| `RBBM_STATUS` | 0x210 | 0x03D00840 | 各ブロックの BUSY。bit0 = CP_AHB_BUSY_CX_MASTER、bit2 = CP_BUSY、bit23 = GPU_BUSY_IGN_AHB |
+| `RBBM_STATUS3` | 0x213 | 0x03D0084C | bit24 = SMMU_STALLED_ON_FAULT |
+| `RBBM_INT_0_STATUS` | 0x201 | 0x03D00804 | 割り込みの状態 |
+| `RBBM_CLOCK_CNTL` | 0xAE | 0x03D002B8 | ハードウェアのクロックゲーティング |
+| `RBBM_GBIF_HALT` / `_ACK` | 0x16 / 0x17 | 0x03D00058 / 0x5C | GX 側の GBIF の halt |
+
+**3. Linux が GX 側に触るタイミング** [P]
+- `hw_init`（`a6xx_gpu.c` 1179 行）の最初に OOB GPU_SET を立て、「GMU が GPU を ON のまま保つ」ようにする（1190 行）。ACK が返ったら、待たずにすぐ GX 側に触る。最初に書くのは `GBIF_HALT=0` と `RBBM_GBIF_HALT=0`（1203〜1207 行）で、どちらも書いたあと読み戻している。
+- `hw_init` の最後で OOB を解除する（1533 行、「GPU に触り終わったので、電源の管理を始めてよい」）。**GX 側に触ってよいのは、OOB の ACK から解除までの間だけ。**
+- `RBBM_STATUS` は、idle の判定（128 行：`RBBM_STATUS & ~bit0` が 0 なら idle）とダンプ（1565 行）で読むだけのレジスタ。読んでも状態は変わらない。
+
+**4. 試験の形（案）**
+- 新しい試験用のビット 0x2000 を足す。0x1E80 の 5 ビットをすべて前提にして、全体は `EpiGpuProbe=0x3E80`。
+- 読むのは **`RBBM_STATUS` を 1 回だけ**。書き込みはしない。
+- 読む場所は、今の `GmuGxOob` の **0x7C3（ACK のクリア、Snap 1）と 0x7C4（OOB の解除）の間**。解除のあとでは読まない。
+- 読む直前にもう一度確かめ、どれかが外れていたら読まずに飛ばして記録する：
+  - OOB の ACK が成功した
+  - GX GDSCR（GPU_CC +0x100C）の bit31 が 1
+  - 0x1F8D0 の bit6／bit7 が 0
+- 読む直前にブレッドクラム（例：0x7C8）を保存して flush する。読んだ瞬間に電話が固まっても、再起動のあとで `EpiGpuProbeStep` に 0x7C8 が残り、この読み取りが原因だとわかる。
+- 記録（例）：`GpuGmuGxReg` = {Attempted、Skipped の理由、そのときの GDSCR、0x1F8D0、`RBBM_STATUS`}。
+- 期待する値 [U]：CP も SQE も動かしていないので、0、または bit0（CX 側からの AHB アクセス）だけが立つ値。Linux の idle の判定（bit0 を除いて 0）に合うかを見る。
+
+**5. 危険** [I]
+- GX 側のレジスタに CPU から触るのは初めて。GX の GDSC が ON でも、クロックが来ていないとバスが応答せず、電話が固まるか再起動するかもしれない（GPU PDC を読んだときと同じ）。
+- 今回わかっていること：OOB のあと GX GDSC は ON で、GPU_CC の PLL0 も動いていた（0xD8000005）。上の 3 つの確認は、残る危険を減らすためのもの。
+- `RBBM_CLOCK_CNTL` などほかのレジスタは、`RBBM_STATUS` が無事に読めてから、次の試験で 1 つずつ足す。
+
+### 9.14.1 RBBM_STATUSの単発読み取りの実装（実機未実行）
+
+bit13 `EPI_GMU_PROBE_GX_REG=0x2000` を追加し、`EpiGpuProbe=0x3E80` のときだけ RBBM_STATUS を1回読む。bit13にはbit7/9/10/11/12（0x1E80）をすべて要求し、不足する指定はワンショット解除・flush後、ハードウェアアクセス前に `GpuProbeStatus=6` で拒否する。既存モードのOOB・slumber・後始末は維持する。
+
+読み取りは `GmuGxOob()` のACKクリア・Snap 1（0x7C3）とOOB解除（0x7C4）の間だけで行う。OOB ACK成功、GX GDSCR bit31=1、GX HM（0x1F8D0）のbit6/7=0を確認し、GPU先頭ページ（物理0x03D00000、0x1000バイト）をPAGE_READONLY / non-cacheableで一時mapする。ブレッドクラム0x7C8の保存とflushを確認した後、同じ3条件を再確認してから dword 0x210（物理0x03D00840）を一度だけ読む。OOBのACK判定は保存済みの待ち結果を使う（INFO bit31は既にクリア済み）。ページは解除前にunmapする。
+
+条件不成立・map失敗・ブレッドクラム保存/flush失敗の場合は読まず、理由を記録して必須のOOB解除とslumberへ進む。追加読み取りのスキップ自体は既存のGX試験の結果コードを変えない。0または1との一致を成功条件にする処理も入れず、RBBM_STATUSは生値を記録する。GX側への書き込み、他のRBBM/CPレジスタの読み取り、PDCアクセスは追加しない。
+
+追加診断 `GpuGmuGxReg`（REG_BINARY、little endian、20バイト）は5 DWORD：
+
+`{Attempted, Reason, Gdscr, GxHm, RbbmStatus}`。
+
+Attemptedは実際のREAD_REGISTER_ULONG直前に1とし、読み取りを飛ばした場合は0。Gdscr/GxHmは条件確認時の値で、実際に読む場合はmap・flush後の最終確認値。RbbmStatusと未取得の確認値は0xFFFFFFFF。cleanup/keep両経路で保存し、bit13を指定しない場合は空データ。
+
+| Reason | 内容 |
+|---|---|
+| 0 | RBBM_STATUSを読み取った（値の内容は判定しない） |
+| 1 | 読み取り処理未到達（OOB要求前の失敗、HFI失敗など） |
+| 2 | OOB ACKが成功していない |
+| 3 | GX GDSCRのbit31が0 |
+| 4 | GX HMのbit6またはbit7が1（完全ONではない） |
+| 5 | 読み取り専用ページのmap失敗 |
+| 6 | 0x7C8の保存またはflush失敗 |
+
+最初のGXアクセスなので、条件を満たしてもクロック等の状態次第ではバスが応答しない可能性が残る [U]。READで停止した場合はOOB解除まで戻らず、再起動後のブレッドクラム0x7C8で位置を特定する。既存の `GpuGmuGx`（340バイト）、Messages（888バイト）、Queues（252バイト）の形式は変更していない。shimにはGPU先頭ページの受け口を追加した。今回、電話の再起動・テスト・ビルド・署名・配置・実機実行は行っていない。
+
+**結果（2026-11-12、v34-akat を起動した直後、Epinephrine v48 / 20.0.2.48、`EpiGpuProbe=0x3E80`）：GX 側のレジスタを初めて読めた** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuGxReg` | {Attempted 1, Reason 0（読んだ）, GDSCR 0xF8222800, 0x1F8D0 = 0, **`RBBM_STATUS` = 0x00000001**} |
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 |
+| HFI / idle の判定 / SMMU の Disable / 各復元 | すべて 0 |
+
+- 電話は固まらず、バスも応答した。読んだ時点で GX は ON（GDSCR の bit31 = 1、0x1F8D0 = 0）。
+- `RBBM_STATUS` = 0x1：立っているのは bit0（CP_AHB_BUSY_CX_MASTER）だけ。CP も描画のブロックも BUSY ではない。Linux の idle の判定（bit0 を除いて 0）に合う。値は、CPU が CX 側から AHB でこのレジスタを読んでいること自体を示していると見られる [I]。
+- そのあとの OOB の解除、slumber、rpmh_stop、後片付けは v47 と同じく、すべて通った。
+- 次：同じ ON の間に、読むだけのレジスタを 1 つずつ足す（`RBBM_STATUS3`、`RBBM_INT_0_STATUS`、`RBBM_CLOCK_CNTL` など）。そのあと、Linux の `hw_init` の最初の書き込み（`GBIF_HALT=0`、`RBBM_GBIF_HALT=0`）を調べる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

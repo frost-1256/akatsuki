@@ -23,3 +23,6 @@ Release/
 *.user
 *.suo
 build/
+
+# generated docs
+SourceMap.md
