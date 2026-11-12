@@ -1315,6 +1315,34 @@ shimとホスト試験に、書き込み順と全元値の保存、予約スロ�
 - 4 つとも元から 0 だったので、halt のときと同じく、ハードウェアの状態は変わっていない。書き込みが本当に効いているかどうかは、この結果からは区別できない [I]。
 - 段 B（`*_ADDR_MODE_CNTL` ← 1）では、リセット直後の値（0 と見られる）とは違う値を書くことになる。書いた値が読み返せるかどうかで、GX 側への書き込みが効くことを初めて確かめられる。
 
+### 9.16.2 段Bの実装（実機未実行）
+
+v52での段A成功を受け、bit16 `EPI_GMU_PROBE_ADDR_MODE=0x10000` の拒否を解除した。bit15とその全前提が必要で、`EpiGpuProbe=0x1FE80` のとき、段Aが成功したあと、同じOOBを解除する前に段Bを実行する。前提不足はワンショット解除・flush後にstatus 6で拒否する。`0xFE80` までの処理は変更していない。
+
+段Bでは§9.16の11ページだけをRW・非キャッシュでmapする。VSCとUCHEのページは共有する。12個すべての元値を記録してから、CP、VSC、GRAS、RB、PC、HLSQ、VFD、VPC、UCHE、SP、TPL1、SECVID TSBの順に1を書き、各書き込み直後に同じレジスタを読み返す。元値の各読み取り前に0x820〜0x82B、各書き込み前に0x830〜0x83Bのbreadcrumbを保存・flushし、OOB ACK成功、GDSCR bit31=1、GX HM bit6/7=0を再確認する。
+
+最初の試験では読み返しも厳密に1と比較する方を採用した。不一致・breadcrumb・GX確認の失敗でそれ以降の段B書き込みを止める。map失敗なら段Bは書かない。取得済みのmapはすべて解除し、OOB解除・slumberと既存の後片付けへ進む。元値の復元は行わない。安全な後片付けが成功すればstatus 13、既存の安全確認や復元が失敗すればstatus 8 / KeepCxという扱いは段Aと同じ。TRUST_CNTL、hwcg、CP実行、GPU PDCには進まない。
+
+`GpuGmuGxInit` の形式は152バイトのまま。Before/After[0..3]は段A、[4..15]は段Bの上記順序。Countは両段を通した完了済み書き込み・読み返し数（不一致を含む最大16）で、段Bの元値記録やmapで失敗した場合は4のまま。未読値は0xFFFFFFFF。Status/Reasonは最後に実行した段の結果で、段Bの不一致もReason 7となる。段A失敗時は段Bを呼ばず、段Aの結果を保持する。
+
+shimに段Bのページと書き込みの記録、map失敗・書き込み無視の注入を追加。ホスト試験には、12個の順序と全元値の保存、段Aだけなら段Bを書かないこと、段A未完了時の拒否、各書き込み前のbreadcrumb失敗、元値記録中・mapの失敗、各項目の読み戻し不一致による停止を追加した。試験・ビルド・配置・実機実行は未実施。次にGXをONにする実機試験の前には、ユーザー側で再起動する。
+
+**結果（2026-11-12、v34-akat を起動した直後、Epinephrine v53 / 20.0.2.53、`EpiGpuProbe=0x1FE80`）：段 B が成功した。GX 側に書いた値が読み返せることを初めて確かめた** [P]。
+
+| 項目 | 値 |
+|---|---|
+| `GpuGmuGxInit` | Attempted 1、Reason 0、GDSCR 0xF8222800、GX HM 0、Count 16、Status 0 |
+| Before[0..3] → After[0..3]（段 A） | 0 → 0（v52 と同じ） |
+| Before[4..15] → After[4..15]（段 B：CP、VSC、GRAS、RB、PC、HLSQ、VFD、VPC、UCHE、SP、TPL1、SECVID_TSB） | **すべて 0 → 1** |
+| `GpuGmuGxReg` / `GpuGmuGxHalt` | v51 と同じ |
+| `GpuGmuStatus` / `GpuGmuKeepCx` / `GpuCxStatus` | 0 / 0 / 0 |
+| HFI / idle の判定 / GBIF / クロック / SMMU の Disable / RSCC と各復元 | すべて 0 |
+
+- 12 個とも、リセット直後の値は 0 だった（32 ビットのアドレス）。1 を書くと、すぐに 1 が読み返せた。
+- 描画の設定（context）のレジスタ（GRAS、RB、PC、HLSQ、VFD、VPC、SP、TPL1）も、CPU から書いた値がそのまま読み返せた。§9.16 で [U] としていた点は、ADDR_MODE については解決した。
+- 元に戻していないが、後片付け（slumber、rpmh_stop、CX OFF）はすべて通った。次の実行の最初に読む元の値が 0 に戻っていれば、GX を切ると設定が消えることも確かめられる（毎回再起動するので、その確認は再起動のあとになる）。
+- これで `hw_init` の冒頭（OOB → GBIF の halt の解除 → SECVID → ADDR_MODE）を、Linux と同じ順に実行できた。次は `a6xx_set_hwcg(gpu, true)`（クロックゲーティングの表）になる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

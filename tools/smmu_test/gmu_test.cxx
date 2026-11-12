@@ -49,6 +49,8 @@ static std::vector<UCHAR> Image() {
 }
 static void Reset() {
     std::memset(secvidPage,0,sizeof(secvidPage)); secvidWrites.clear(); failSecvidOffset=0xFFFFFFFF;
+    std::memset(addrPages,0,sizeof(addrPages)); addrWrites.clear();
+    failAddrWrite=0xFFFFFFFF; failAddrMap=0xFFFFFFFF;
     assert(allocations.empty() && !g_KeptGmu);
     std::memset(gPages,0,sizeof(gPages)); std::memset(cc,0,sizeof(cc));
     cc[0x106C/4]=0x80000000; cc[0x100C/4]=1; gPages[1][0]=1; gPages[1][0x340/4]=0xC0;
@@ -115,6 +117,7 @@ int main(int argc,char** argv) {
             assert(secvidWrites[i]==order[i] && init.Before[i]==0x10+order[i] && init.After[i]==0);
         }
         for(ULONG i=4;i<16;++i) assert(init.Before[i]==0xFFFFFFFF && init.After[i]==0xFFFFFFFF);
+        assert(addrWrites.empty()); // stage A alone never writes an ADDR_MODE register
         // Failure at the second write breadcrumb leaves the remaining registers untouched.
         secvidWrites.clear(); for(ULONG i=0;i<4;++i) secvidPage[i]=0x10+i;
         init=GmuGxInitTrace(); failGmuStep=0x811;
@@ -131,6 +134,48 @@ int main(int argc,char** argv) {
         assert(init.Reason==7 && init.Count==2 && secvidWrites.size()==2);
         assert(init.After[1]==0x10 && init.After[2]==0xFFFFFFFF && secvidPage[1]==0x11);
         failSecvidOffset=0xFFFFFFFF;
+        // Stage B follows A, saves all originals, and writes exactly the documented order.
+        init=GmuGxInitTrace();
+        assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
+        for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
+        assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
+        assert(init.Reason==0 && init.Count==16 && addrWrites.size()==12);
+        for(ULONG i=0;i<12;++i)
+            assert(addrWrites[i]==addrDwords[i] && init.Before[4+i]==0x100+i && init.After[4+i]==1);
+        // No stage B accesses after a failed/incomplete stage A.
+        addrWrites.clear(); init=GmuGxInitTrace();
+        assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_INVALID_DEVICE_STATE);
+        assert(init.Reason==8 && addrWrites.empty());
+        // Fail each stage B write breadcrumb: only earlier writes may complete.
+        for(ULONG fail=0;fail<12;++fail) {
+            init=GmuGxInitTrace(); init.Reason=0; init.Count=4; init.Attempted=1;
+            addrWrites.clear(); for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
+            failGmuStep=0x830+fail;
+            assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+            assert(init.Reason==6 && init.Count==4+fail && addrWrites.size()==fail);
+            for(ULONG i=0;i<12;++i) assert(init.Before[4+i]==0x100+i);
+            for(ULONG i=fail;i<12;++i) assert(init.After[4+i]==0xFFFFFFFF && *GmuAddrReg(i)==0x100+i);
+        }
+        // A failed original read or map must prevent every stage B write.
+        init=GmuGxInitTrace(); init.Reason=0; init.Count=4;
+        addrWrites.clear(); failGmuStep=0x825;
+        assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+        assert(init.Reason==6 && init.Count==4 && addrWrites.empty());
+        init=GmuGxInitTrace(); init.Reason=0; init.Count=4;
+        failGmuStep=0xFFFFFFFF; failAddrMap=3;
+        assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_INSUFFICIENT_RESOURCES);
+        assert(init.Reason==5 && init.Count==4 && addrWrites.empty()); failAddrMap=0xFFFFFFFF;
+        // A readback mismatch includes that write in Count and stops the remainder.
+        for(ULONG fail=0;fail<12;++fail) {
+            init=GmuGxInitTrace(); init.Reason=0; init.Count=4; init.Attempted=1;
+            addrWrites.clear(); for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
+            failAddrWrite=fail;
+            assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
+            assert(init.Reason==7 && init.Count==5+fail && addrWrites.size()==1+fail);
+            assert(init.After[4+fail]==0x100+fail);
+            for(ULONG i=fail+1;i<12;++i) assert(init.After[4+i]==0xFFFFFFFF && *GmuAddrReg(i)==0x100+i);
+        }
+        failAddrWrite=0xFFFFFFFF;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;

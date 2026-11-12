@@ -27,12 +27,13 @@
 //      Bit13 reads six GX registers once each after OOB ACK and GX-on checks, strictly before release.
 //      Bit14 then clears CX GBIF_HALT and RBBM_GBIF_HALT with immediate posted-write readbacks.
 //      Bit15 then clears four SECVID TSB controls under the same OOB lease (stage A only).
+//      Bit16 follows successful stage A with twelve ADDR_MODE controls set to 1.
 //      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset, bit12 rpmh_stop, check RSCC/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls, optional GBIF and RSCC, then Unmap / Destroy / free.
 //      A failed Disable keeps everything and asks the caller to keep
 //      CX on (*KeepCx).
-// Not done here: rpmh_start, force_off, CP access, ADDR_MODE/hwcg, GPU PDC (reading it reset the phone on 2026-11-07).
+// Not done here: rpmh_start, force_off, CP execution, hwcg, GPU PDC (reading it reset the phone on 2026-11-07).
 // No PLL programming; bit11 uses the existing GCC GPLL0_DIV source.
 // Preserve all RSCC HIDDEN_TCS ADDR and PDC slave/sequence/match values.
 
@@ -871,9 +872,55 @@ static NTSTATUS GmuGxSecvid(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
     MmUnmapIoSpace(map,PAGE_SIZE);
     return st;
 }
+static NTSTATUS GmuGxAddrMode(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc,
+                               const GMU_GX_TRACE* T, GMU_GX_INIT_TRACE* I)
+{
+    if (I->Reason!=0 || I->Count!=4)
+    { I->Reason=8; return STATUS_INVALID_DEVICE_STATE; }
+    const ULONG dwords[]={0x0842,0x0C01,0x8601,0x8E05,0x9E01,0xBE05,
+                          0xA601,0x9601,0x0E00,0xAE01,0xB601,0xF810};
+    const ULONG pages[]={0x02000,0x03000,0x21000,0x23000,0x27000,0x2F000,
+                         0x29000,0x25000,0x2B000,0x2D000,0x3E000};
+    const ULONG pageIndex[]={0,1,2,3,4,5,6,7,1,8,9,10};
+    PVOID maps[RTL_NUMBER_OF(pages)]={};
+    GMU_GX_REG_TRACE guard={};
+    const BOOLEAN readyToMap=GmuGxRegReady(Cc,S,T,&guard);
+    I->Gdscr=guard.Gdscr; I->GxHm=guard.GxHm;
+    if (!readyToMap) { I->Reason=guard.Reason; return STATUS_INVALID_DEVICE_STATE; }
+    NTSTATUS st=STATUS_SUCCESS;
+    for (ULONG i=0;i<RTL_NUMBER_OF(pages);++i)
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart=EPI_GMU_GPU_BASE+pages[i];
+        maps[i]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+        if (maps[i]==NULL) { I->Reason=GX_REG_MAP_FAILED; st=STATUS_INSUFFICIENT_RESOURCES; break; }
+    }
+    // Save every original in this stage before writing any ADDR_MODE register.
+    for (ULONG phase=0;phase<2 && NT_SUCCESS(st);++phase)
+    {
+        for (ULONG i=0;i<RTL_NUMBER_OF(dwords);++i)
+        {
+            st=GmuStep(Params,(phase==0 ? 0x820 : 0x830)+i);
+            if (!NT_SUCCESS(st)) { I->Reason=GX_REG_BREADCRUMB_FAILED; break; }
+            const BOOLEAN ready=GmuGxRegReady(Cc,S,T,&guard);
+            I->Gdscr=guard.Gdscr; I->GxHm=guard.GxHm;
+            if (!ready) { I->Reason=guard.Reason; st=STATUS_INVALID_DEVICE_STATE; break; }
+            volatile ULONG* reg=static_cast<volatile ULONG*>(maps[pageIndex[i]])+((dwords[i]*4)&0xFFF)/4;
+            if (phase==0) { I->Before[4+i]=READ_REGISTER_ULONG(reg); continue; }
+            I->Attempted=1;
+            WRITE_REGISTER_ULONG(reg,1);
+            I->After[4+i]=READ_REGISTER_ULONG(reg);
+            I->Count=5+i;
+            if (I->After[4+i]!=1) { I->Reason=7; st=STATUS_IO_DEVICE_ERROR; break; }
+        }
+    }
+    if (NT_SUCCESS(st)) { I->Reason=0; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(maps);++i)
+    { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
+    return st;
+}
 static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_TRACE* T,
                          GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL,
-                         GMU_GX_INIT_TRACE* Init = NULL)
+                         GMU_GX_INIT_TRACE* Init = NULL, BOOLEAN AddrMode = FALSE)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -903,7 +950,11 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
     if (Init!=NULL)
     {
         if (Halt!=NULL && NT_SUCCESS(Halt->Status) && Halt->Count==2)
-        { Init->Status=GmuGxSecvid(S,Params,Cc,T,Init); }
+        {
+            Init->Status=GmuGxSecvid(S,Params,Cc,T,Init);
+            if (NT_SUCCESS(Init->Status) && AddrMode)
+            { Init->Status=GmuGxAddrMode(S,Params,Cc,T,Init); }
+        }
         else { Init->Reason=8; Init->Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
@@ -1014,7 +1065,7 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx, BOOLEAN FastClock,
-                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid)
+                     BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
@@ -1026,6 +1077,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (GxReg && !GxOn) { return EPI_GMU_E_PRECOND; }
     if (ClearHalt && !GxReg) { return EPI_GMU_E_PRECOND; }
     if (Secvid && !ClearHalt) { return EPI_GMU_E_PRECOND; }
+    if (AddrMode && !Secvid) { return EPI_GMU_E_PRECOND; }
     if (Cc == NULL || Text == NULL || TextCch==0) { return EPI_GMU_E_PRECOND; }
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -1312,7 +1364,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         else if (GxOn)
         {
             const NTSTATUS oob=GmuGxOob(s,Params,Cc,&gx,GxReg ? &gxReg : NULL,
-                                        ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL);
+                                        ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL,AddrMode);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (gx.Attempted)
             {

@@ -12,6 +12,7 @@
 #define EPI_GMU_PROBE_GX_REG   0x2000UL    // modifier: requires 0x1E80 (0x3E80 total), read six GX registers under OOB
 #define EPI_GMU_PROBE_GX_HALT  0x4000UL    // modifier: requires 0x3E80 (0x7E80 total), clear CX/RBBM GBIF halt under OOB
 #define EPI_GMU_PROBE_SECVID   0x8000UL    // modifier: requires 0x7E80 (0xFE80 total), SECVID stage A only
+#define EPI_GMU_PROBE_ADDR_MODE 0x10000UL // modifier: requires 0xFE80 (0x1FE80 total), ADDR_MODE stage B
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -100,11 +101,12 @@
 // FinalCx is the CX HALT/ACK after slumber/reset/idle; require HALT=0, otherwise KeepCx. ACK is diagnostic only.
 // GpuGmuGxInit: 152 bytes {Attempted, Reason, Gdscr, GxHm, Count, Status, Before[16], After[16]}.
 // Stage A slots 0..3: SECVID TSB_CNTL, TRUSTED_BASE low, high, TRUSTED_SIZE (all target 0).
-// Stage B slots 4..15 are reserved/unread (0xFFFFFFFF); bit16 is rejected until stage A is validated.
-// Reason 0 success; 1..6 match GxReg; 7 readback mismatch; 8 prerequisite halt clears incomplete.
-// Count includes a mismatched write/readback (0..4); Attempted is set before the first write.
+// Stage B slots 4..15: CP, VSC, GRAS, RB, PC, HLSQ, VFD, VPC, UCHE, SP, TPL1, SECVID TSB (target 1).
+// Reason 0 success; 1..6 match GxReg; 7 readback mismatch; 8 prerequisite stage incomplete.
+// Count includes a mismatched write/readback (0..16); Attempted is set before the first write.
 // Status is NTSTATUS (unattempted=STATUS_NOT_FOUND). Unread values=0xFFFFFFFF.
 // Breadcrumbs 0x800..0x803 precede original reads, 0x810..0x813 precede writes; each flush is followed by a GX guard.
+// Stage B uses 0x820..0x82B for original reads and 0x830..0x83B for writes; mismatch stops further writes.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -118,9 +120,10 @@
 // GxReg: requires GxOn and its prerequisites; optional six-register read under OOB (probe 0x3E80).
 // ClearHalt: requires GxReg and its prerequisites; clear GBIF/RBBM halt after the six reads (probe 0x7E80).
 // Secvid: requires ClearHalt and its prerequisites; stage A after halt clears, before OOB release (probe 0xFE80).
+// AddrMode: requires Secvid and its prerequisites; stage B follows successful stage A (probe 0x1FE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
-                     BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE);
+                     BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE);

@@ -24,6 +24,20 @@ static ULONG gPages[9][4096];
 static ULONG secvidPage[PAGE_SIZE/sizeof(ULONG)];
 static std::vector<ULONG> secvidWrites;
 static ULONG failSecvidOffset=0xFFFFFFFF;
+static ULONG addrPages[10][PAGE_SIZE/sizeof(ULONG)];
+static const ULONG addrPageOffsets[]={0x02000,0x03000,0x21000,0x23000,0x27000,
+                                      0x2F000,0x29000,0x25000,0x2B000,0x2D000};
+static const ULONG addrDwords[]={0x0842,0x0C01,0x8601,0x8E05,0x9E01,0xBE05,
+                                 0xA601,0x9601,0x0E00,0xAE01,0xB601,0xF810};
+static std::vector<ULONG> addrWrites;
+static ULONG failAddrWrite=0xFFFFFFFF, failAddrMap=0xFFFFFFFF;
+inline ULONG* GmuAddrReg(ULONG i) {
+    const ULONG byte=addrDwords[i]*4, page=byte&~0xFFFUL;
+    if(page==0x3E000) return secvidPage+(byte&0xFFF)/4;
+    for(ULONG j=0;j<RTL_NUMBER_OF(addrPageOffsets);++j)
+        if(page==addrPageOffsets[j]) return addrPages[j]+(byte&0xFFF)/4;
+    assert(false); return nullptr;
+}
 static bool bootCompletes=true, resetFails=false;
 static bool smmuEnableFails=false, smmuDisableFails=false;
 static ULONG gmuWrites=0;
@@ -39,6 +53,10 @@ inline void GmuSeedGxRegs() {
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
+    for(ULONG i=0;i<RTL_NUMBER_OF(addrPageOffsets);++i) if(a.QuadPart==0x03D00000+addrPageOffsets[i]) {
+        assert(protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        return failAddrMap==i ? nullptr : addrPages[i];
+    }
     if(a.QuadPart==0x03D3E000) { assert(protection==(PAGE_READWRITE|PAGE_NOCACHE)); return secvidPage; }
     if(a.QuadPart==0x03D00000) gxPageProtection=protection;
     const ULONGLONG bases[]={0x03D7D000,0x03D7E000,0x03D8E000,0x03D6D000,0x03D71000,0x03DE0000,
@@ -48,6 +66,11 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
+    for(ULONG i=0;i<RTL_NUMBER_OF(addrDwords);++i) if(p==GmuAddrReg(i)) {
+        assert(v==1); addrWrites.push_back(addrDwords[i]);
+        if(i!=failAddrWrite) *p=v;
+        return;
+    }
     for(ULONG i=0;i<4;++i) if(p==secvidPage+i) {
         secvidWrites.push_back(i);
         if(i!=failSecvidOffset) *p=v;
