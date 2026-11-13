@@ -3102,6 +3102,45 @@ shim と試験ケースに、G-5 の Checks=0x17 からの正常続行、4条件
   - TZ の中で何かが壊れても、再起動で元に戻ると考えられる。ただし RPMB などの secure storage には触れない呼び出しだけを使う。
   - 0xF400 は、この段階でも読み書きしない。
 
+**Z-1 の実装の注意（補足）**
+
+- 準備の段階：GX を入れる前に済ませる（PASSIVE）
+  - ファイルを読み、上の表の値をすべて確かめ、メタデータのバッファを作るところまでを、GX を入れる前に行う。GX を入れている時間を短くし、ファイルの問題なら GX に触れる前に止めるためである。
+  - どれかが違ったら、Z-1 は実行しない。Reason を記録して、G-5b までで終える。
+- メモリの書き方
+  - メタデータのバッファ：
+    - 2 ページ（0x2000）を、物理的に連続、4 KB 境界、キャッシュなしで取る。4 GB より下にあると安全 [I]。例：`MmAllocateContiguousNodeMemory(0x2000, 0, 0xFFFFFFFF, 0, PAGE_READWRITE|PAGE_NOCACHE, MM_ANY_NODE_OK)`。
+    - [0, 0x94) と [0x1000, 0x29A0) を続けて置き、残りは 0 で埋める。
+  - 0x8B110000 は `PAGE_READWRITE|PAGE_WRITECOMBINE` でマップする（Linux も `MEMREMAP_WC`）。`PAGE_NOCACHE` だと Device 属性になり、そろっていないアクセスが例外になる。
+  - キャッシュなしのメモリや WC のメモリには、`RtlCopyMemory`／`RtlZeroMemory` を使わない。4 バイト単位の単純なループで書く。これらの関数は、そろっていないアクセスや `DC ZVA` を使うことがあるからである。
+  - 書き終えたら `KeMemoryBarrier` を入れる。0x8B110000 は、先頭の 4 dword を読み返して記録してから、マップを外す。
+- SMC を出す関数（armasm64）
+  - 引数と結果は、`struct EPI_SMC_REGS { ULONG64 X[8]; }` のような構造体 1 つで受け渡す。入るときに X[0..7] を x0..x7 に読み込み、`smc #0` の後で x0..x3 と x6 を書き戻す。
+  - 構造体へのポインタは、callee-saved の x19 などに置く。関数の入口でスタックに退避し、出口で戻す。
+  - x18 は Windows のプラットフォームレジスタ（TEB）なので、読み書きしない。SMCCC では、x18〜x30 は SMC の前後で保たれる。
+  - SMC の前に `dsb sy` を入れておくと安心である。
+  - vcxproj に MARMASM（armasm64）のビルド規則を足す必要がある。
+- やり直しは C の側で扱う：
+  | 返ってきた x0 | 意味 | 扱い |
+  |---|---|---|
+  | 0 | 呼び出しは成功 | x1 で PAS の結果を見る（IS_SUPPORTED は 1、ほかは 0 で成功） |
+  | 1（INTERRUPTED） | TZ の中で割り込まれた | x0 ＝ 1、x6 ＝ 返ってきた x6 にして、ほかはそのままもう一度 SMC する。回数を数え、上限（例：1000 回）で失敗にする |
+  | −12（0xFFFFFFFFFFFFFFF4、EBUSY） | ほかの呼び出し（qcscm など）と重なった | 30 ms 待って（PASSIVE で `KeDelayExecutionThread`）、最初からやり直す。最大 20 回 |
+  | 2（WAITQ_SLEEP） | 新しい TZ だけの仕組み | 失敗として止める |
+  | そのほかの負の値 | SCM のエラー | 生の値を記録して止める |
+- 診断（GpuGmuZ1 として。細かい並びは実装に任せる）
+  - G-5 と同じ描画の記録（画素、番兵、レジスタ、FSR、global fault）。データ[13] の前後。
+  - ファイルのサイズ、ヘッダを確かめた結果（どの項目で違ったか）、メタデータの物理アドレス。
+  - SCM の呼び出しごとに、x0、x1、x2、x3、INTERRUPTED の回数、EBUSY の回数、呼んだかどうか。
+  - 0x8B110000 に書いた後の、先頭 4 dword の読み返し。
+  - ring の 12 dword（Packet）。
+- breadcrumb
+  - SCM の呼び出しの直前と直後、0x8B110000 をマップする直前と書く直前に、それぞれ breadcrumb を書いて、レジストリを flush する。端末がリセットされても、どこで止まったかを読めるようにするためである。
+  - 例：0x1400 前提、0x1401〜0x1408 は C-1〜C-4 の前後、0x1409 マップ、0x140A コピー、0x140B SET_SECURE_MODE の投入、0x140C／0x140D は fence／idle。
+- 配置：
+  - 私が `stock-rom/vx/firmware/a660_zap.elf` を、端末の `C:\Epinephrine\fw\` にコピーする。
+  - SHA-256 が ADB53DED…87965D6E0 であることを確かめてから実行する。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
