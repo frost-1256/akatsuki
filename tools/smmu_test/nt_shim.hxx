@@ -58,7 +58,9 @@ inline void MmFreeNonCachedMemory(void* p, SIZE_T) { assert(allocations.erase(p)
 inline PHYSICAL_ADDRESS MmGetPhysicalAddress(void* p) { return {static_cast<std::int64_t>(allocations.at(p))}; }
 inline void RtlZeroMemory(void* p, SIZE_T n) { std::memset(p,0,n); }
 inline void KeMemoryBarrier() {}
-inline void KeStallExecutionProcessor(int) { ++stalls; }
+static ULONGLONG testInterruptTime=100000;
+inline ULONGLONG KeQueryInterruptTime() {return testInterruptTime;}
+inline void KeStallExecutionProcessor(int us) { ++stalls; testInterruptTime+=static_cast<ULONGLONG>(us)*10; }
 inline ULONG READ_REGISTER_ULONG(volatile ULONG* p) {
     if (p == mmio+(0x107F4/4) && syncTimeout) return 1;
     return *p;

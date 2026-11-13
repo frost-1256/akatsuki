@@ -4402,6 +4402,75 @@ v75（20.0.2.75、oem133）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuPro
 
 **次：** A-1（§9.21.43、回る四角）。
 
+
+#### 9.21.45 A-1 の実装（実機未実行）
+
+§9.21.43 を実装した。実行値は `EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=15`。Probe2 は 0 / 1 / 3 / 7 / 15 だけを許し、0以外は Probe が上記と完全一致する必要がある。A-1 は R-1 / D-1 / V-1 を必須とし、V-1 の成功・復元確認後、同じ OOB の中で続ける。
+
+前段の Status / Reason / Checks / WPTR / data に加えて、RPTR / WPTR / shadow 109、既存の ring / IB / shader / 頂点 / data、MASK 0、外部 band と D-0 の情報を再確認する。ring[109..2277] もすべて0を求める。前段未成功は Reason 8、状態不一致は12、MASK 不一致は15で未投入となる。CPU map と退避は V-1 の復元後に改めて行う。SMMU の追加 region はない。
+
+IB8（61 dw / 18 packet）、VB A/B（96 dwずつ）、data[23..25] を準備・照合する。頂点は最初だけ背景を含めて全体を書き、フレーム1以降は dw48..95 の正方形だけを更新する。`epi_gmu_a1_table.inc` の120段の座標表を整数の bit 列として読む。頂点の生成・更新と期待色の計算に、カーネルでの浮動小数演算はない。IB8 の先頭は CACHE_INVALIDATE と WFI で、毎フレームの VB を読み直す。
+
+フレーム0..240を逐次投入し、ring の9語とバリアの後に WPTR を更新する。次の頂点を書けるのは、そのフレーム固有の data[25]、native RPTR、WPTR、shadow がそろった後だけ。MASK、GX の状態、エラー割り込みも待ちの間に確認する。AHB fenced write は従来の2 ms・再送規則を使い、投入からフレーム完了までの合計に100 msの上限を設ける。最後のフレームでは RBBM / CX_BUSY の idle もこの上限内で確認する。待ちが失敗したら、その後の VB 更新・packet 投入は行わない。
+
+各フレームの完了後に16 ms待つ。最終 WPTR は2278で、静的な上限検査により4096未満を保証する。最後は表の index 0 に戻り、画素を判定した後に2秒保持してから全域を復元・照合する。フレーム待ちや後続の診断が失敗した場合は2秒保持を省略して復元に進む。途中失敗時も退避済みなら復元し、CPU map と退避プールを解放する。診断 trace は既存の GMU_BOOT_TRACES プールに置き、cleanup / keep の両方で保存する。
+
+最終の期待色は2つの三角形の辺関数を展開した整数式を使う。2倍座標の `u=2*column+1-920`、`t=2*view+1-48` に対し、面積51200の R/G/B 重みは `51200-160*u`、`abs(160*u-320*t)`、`320*t`。仕様の3隅の色の重み付き和と同じで、対角線上でも一致する。core の分類と許容誤差は仕様どおり。背景は FF202020、箱の外は退避値との完全一致を求める。
+
+`GpuGmuA1` は **REG_BINARY、464 B（116 DWORD）**。順序は以下。Status は NTSTATUS、ほかは ULONG。IB8 の61語自体は重複して保存せず、照合結果3項目を保存する。
+
+```text
+Cp (140 B、G2 形式), VChecks, VReason, IbBadCount, IbFirstBad, IbBadValue
+FramesDone, FailFrame, FailData25, FailRptr, FailWptr, FenceMaxUs, FenceTotalUs, ElapsedMs
+SqGoodEven, SqGoodOdd, SqBad, SqFirst, SqValue, SqExpected
+BgGoodEven, BgGoodOdd, BgBad, BgFirst, BgValue, MaxErr[3]
+OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[18], DataAfter[3]
+CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, ScanCount, ScanFirst, ScanDwords
+RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus
+```
+
+Checks は仕様の6ビットで期待値3F。FramesDone は fence まで済んだ数で241が目標。FailFrame はフレームループが止まった場合だけ設定する。FailRptr / Wptr はその時点で安全に読めた最後の値で、GX 確認などが先に失敗した場合は直前のフレームの値が残る。時間は KeQueryInterruptTime で測り、FenceMaxUs / TotalUs は WPTR 投入から固有 fence と native / shadow RPTR 確認まで（AHB 再送も含む）。ElapsedMs はフレーム0投入から最後の fence までで、最後の16 ms待機と2秒保持は含まない。
+
+MaxErr は B/G/R 順で正方形と背景の core 全体の最大誤差。Sample は仕様の9標本ごとに偶数行・奇数行の順。SqFirst / BgFirst / OutsideFirst / RestoreFirst は band 内バイト位置、IbFirstBad は IB 内 DWORD 位置、ScanFirst は ring 内バイト位置。走査は仕様の範囲を除く4027 DWORD。未記録・該当なしは FFFFFFFF、未実行 Status は NOT_FOUND。FramesDone / FenceMaxUs / FenceTotalUs / HoldMs / Checks / Prepared は0で初期化する。
+
+Reason は従来の番号に、**16 = フレーム完了の100 ms時間切れ**、**17 = フレーム間待機の失敗**を追加した。AHB fence の2 ms時間切れは10のまま。最初の失敗は後続の診断・復元失敗で上書きしない。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1B00 / 0x1B01 | CP診断用2ページ map / 前段・未使用 ring・MASK |
+| 0x1B02 / 0x1B08 / 0x1B03 | 元の global fault / CPU map・退避 / IB8・頂点・data の準備と照合 |
+| 0x1B40〜0x1B4F | f=0,16,...,240 の進行記録。個々の fence 待ち中は registry を書かない |
+| 0x1B10〜0x1B1B / 0x1B20 | 従来と同じ CP 診断12項目 / 後の global fault |
+| 0x1B30 / 0x1B31 / 0x1B32 | 保持前の診断保存・flushと2秒待機 / 必須復元 / 復元後の全域照合 |
+
+IB8 の61語は文書の表と提示された a1_ib8.txt と一致することを静的に確認した。120段の回転表、header parity、18 packet / 14 register と CP_PROTECT 範囲外、最終 core の画素数・標本9点、464 B の ABI、4027語の走査、ring の上限も確認した。shim には時間を進める時計、逐次 fence と遅延・時間切れ・エラー注入、頂点更新の記録、最終画像の独立した外積による peer を追加した。peer は shader ISA や回転中の全画像を実行するものではない。
+
+試験ケースは241フレームの順序・全頂点・最終標本、待ち時間の集計、背景／正方形／箱外の破壊、途中停止後に VB と ring を進めないこと、100 ms時間切れ、誤った fence 値、エラー割り込み、前段・空き ring・MASK・map・退避・IB照合の失敗、粗い進行記録とその保存失敗、最初の Reason、AHB 再送、診断保存・復元失敗、旧モード、KeepCx を含む。ドライバ／ホスト試験のビルド・実行、版番号変更、署名、配置、実機実行、コミットは行っていない。
+
+#### 9.21.46 v76 の結果（A-1、2026-11-14）：回る四角が画面に出た
+
+v76（20.0.2.76、oem134）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=15` で restart-device を 1 回実行した。D-0 は `E1000000 / 1080x2400 / 4320 / 22`。GpuProbeStatus 0、EpiGpuProbeStep 0xFFFF、デバイスは OK。スタックは GpuStackAtCx 0x11F60、GpuStackMin 0x11448。画面には D-1、V-1 のあと、暗い灰色の箱の中で 4 隅が赤・緑・青・白の正方形が回った（目視で確認）。机上試験の修正は `gmu_test.cxx` のループ変数名だけ（C4456）。
+
+**GpuGmuA1：**
+- Status 0、Reason 0、**Checks 0x3F**、VChecks 0x3F（V-1 も成功）、Prepared 1、IbBadCount 0。
+- **FramesDone 241**、FailFrame なし。WptrWrites 0xF1（241）。RPTR / WPTR / shadow 109 → **2278**。RBBM 1、CX_BUSY bit23 0、割り込み・HW_FAULT・CP_INT・PROTECT・STATUS_1 すべて 0。IB1_BASE 0x70015600（残り 0）、MASK 0 / 0。global fault は前後とも 0。CB の FSR 0x400 / FAR / FSYNR は V-1 と同じ古い値で、新しい fault はない。
+- data[23..25] = CAFE0015 / CAFE0016 / **A10000F0**。
+- 最後のフレーム：正方形の core-in は偶数行・奇数行とも 12324、背景の core は両方とも 19484、不一致 0。**MaxErr は B / G / R とも 0**（整数の期待値と完全に一致）。箱の外の変化 0。
+- 標本 9 点は、偶数行・奇数行とも期待値どおり：FF7F0181、FFF9060B、FF06EE0B、FF0606F4、FFF9EEF4、FFBE0141、FF3F01C1、FF202020、FF202020。
+- ring 走査 4027 dw で該当 0。保持 2000 ms、復元の不一致 0、Backup / Hold / Restore の Status はすべて 0。
+
+**時間：**
+- ElapsedMs 7546（241 フレームで 1 フレーム約 31.3 ms）。16 ms の `KeDelayExecutionThread` は、既定の timer 分解能（約 15.6 ms）で 2 tick に切り上がっている。
+- FenceMaxUs / FenceTotalUs は 0、Cp.Polls 1。`KeQueryInterruptTime` は clock tick ごとにしか進まないので、どのフレームも投入から fence まで 1 tick 未満で終わった、という意味になる（実際の GPU 時間はこの方法では測れない）。
+
+**分かったこと：**
+- ring の連続使用（折り返しなし、dword 109..2277）、毎フレームの WPTR 更新、フレームごとの CACHE_FLUSH_TS による fence、fence 後の CPU による VB 書き換えが、241 回とも順に動いた。
+- IB8 先頭の CACHE_INVALIDATE で、CPU が書き換えた頂点が毎フレーム読み直されている（最後のフレームの絵が角度 0 の期待値と一致した）。
+- StartDevice の中で D-1・V-1・A-1 を続けて約 20 秒かかったが、start の失敗や bugcheck は出なかった。
+
+**次：** T-1（texture）。より細かい時間を測るなら、`KeQueryPerformanceCounter` を使う。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

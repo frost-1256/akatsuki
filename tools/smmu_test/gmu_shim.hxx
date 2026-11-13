@@ -127,6 +127,45 @@ inline bool V1PeerColor(ULONG col,ULONG row,ULONG* value) {
     if(v1BadAlpha) *value&=0x00FFFFFF;
     return true;
 }
+static bool allowA1Writes=false,a1FenceForever=false,a1BadSq=false,a1BadBg=false,a1Outside=false,a1Odd=true,a1SaveFails=false;
+static ULONG a1StopFrame=0xFFFFFFFF,a1WrongFrame=0xFFFFFFFF,a1ErrorFrame=0xFFFFFFFF,a1FenceDrops=0,a1DelayUs=0,a1Fences=3;
+static ULONG a1Pending=0xFFFFFFFF;
+static ULONGLONG a1Due=0;
+static std::vector<ULONG> a1Writes,a1Frames,a1Progress;
+static std::vector<std::vector<ULONG>> a1Vertices;
+inline ULONG* GmuCfgReg(ULONG reg);
+inline ULONG A1PeerColor(ULONG col,ULONG row) {
+    const LONG pt[4][2]={{920,48},{1240,48},{1240,208},{920,208}};
+    const ULONG tris[2][3]={{0,1,2},{0,2,3}};
+    const LONG colors[4][3]={{1,0,0},{0,1,0},{0,0,1},{1,1,1}};
+    const LONG x=static_cast<LONG>(col*2+1),y=static_cast<LONG>(row*2+1);
+    for(const auto& tri:tris) {
+        LONG w[3];
+        for(ULONG j=0;j<3;++j) {const auto a=tri[(j+1)%3],b=tri[(j+2)%3]; w[j]=V1PeerEdge(pt[a][0],pt[a][1],pt[b][0],pt[b][1],x,y);}
+        if(w[0]<0 || w[1]<0 || w[2]<0) continue;
+        ULONG result=0xFF000000;
+        for(ULONG channel=0;channel<3;++channel) {
+            LONG num=0; for(ULONG j=0;j<3;++j) num+=w[j]*colors[tri[j]][channel];
+            result|=static_cast<ULONG>((510*num+51200)/102400)<<((2-channel)*8);
+        }
+        return result;
+    }
+    return 0xFF202020;
+}
+inline void A1PeerComplete(ULONG f) {
+    a1Pending=0xFFFFFFFF;
+    if(f==240) {
+        for(ULONG y=1072;y<1328;++y) if(a1Odd || !(y&1)) for(ULONG x=412;x<668;++x)
+            d1Band[(y*4320+x*4-0x462000)/4]=A1PeerColor(x,(y-1072)/2);
+        if(a1BadSq) d1Band[(1200*4320+540*4-0x462000)/4]=0;
+        if(a1BadBg) d1Band[(1076*4320+414*4-0x462000)/4]=0;
+        if(a1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+    }
+    if(a1Fences&1) g2Ring[0x705C/4]=0xCAFE0015;
+    if(a1Fences&2) g2Ring[0x7060/4]=0xCAFE0016;
+    g2Ring[0x7064/4]=0xA1000000|(f==a1WrongFrame ? 0xFFFF : f);
+    *g2Shadow=109+9*(f+1); *GmuCfgReg(0x806)=*g2Shadow; *GmuCfgReg(0x92A)=0;
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -175,7 +214,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert((allowD1Writes || allowV1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes || allowA1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
         ++d1Maps; d1Restoring=false; return d1Band.data();
     }
@@ -195,6 +234,7 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
 }
 inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(D1BandPointer(p)) return *p;
+    if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
     if(g3cPolling && g3cPending) {
         if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
         if(p==GmuCfgReg(0x201) && g3cShowStatus && g3cSample>=g3cStatusDelay) *p|=1UL<<20;
@@ -211,6 +251,26 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v>=118 && v<=2278 && (v-109)%9==0) {
+        assert(allowG2Writes && allowA1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG f=(v-109)/9-1;
+        const ULONG packet[]={0x70BF8003,0x70015600,0,61,0x70460004,4,0x70017064,0,0xA1000000|f};
+        assert(std::memcmp(g2Ring+109+9*f,packet,sizeof(packet))==0 && v<4096);
+        assert(g2Ring[0x5600/4]==0x70460001 && g2Ring[0x5600/4+1]==0x31 && g2Ring[0x5600/4+25]==12);
+        g2Writes.push_back({0x807,v}); a1Writes.push_back(v);
+        if(a1FenceForever || a1FenceDrops) {if(a1FenceDrops) --a1FenceDrops; gPages[2][0x313]=1; return;}
+        gPages[2][0x313]=0;
+        assert(f==a1Frames.size()); a1Frames.push_back(f);
+        a1Vertices.emplace_back(g2Ring+0x58C0/4,g2Ring+0x5980/4);
+        a1Vertices.back().insert(a1Vertices.back().end(),g2Ring+0x5AC0/4,g2Ring+0x5B80/4);
+        *GmuCfgReg(0x928)=0x70015600; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=61; *p=v;
+        gPages[8][0x210]=1; gPages[8][0x201]=f==a1ErrorFrame ? (1UL<<9) : 0; gPages[2][0x30C]=0;
+        if(f!=a1StopFrame) {
+            if(a1DelayUs) {a1Pending=f; a1Due=testInterruptTime+a1DelayUs*10;}
+            else A1PeerComplete(f);
+        }
+        return;
+    }
     if(p==GmuCfgReg(0x807) && v==109) {
         assert(allowG2Writes && allowV1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG packet[]={0x70BF8003,0x70015100,0,115,0x70460004,4,0x70017058,0,0xCAFE0014};
@@ -542,7 +602,8 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
-        if(v==0x1931 || v==0x1A31) d1Restoring=true;
+        if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
+        if(v==0x1931 || v==0x1A31 || v==0x1B31) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -554,6 +615,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuA1")==0 && value && size && a1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuV1")==0 && value && size && v1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuZapQuery")==0 && value && size) {
         if(zapQuerySnapshots.size()==failZapQuerySave) {failZapQuerySave=0xFFFFFFFF; return STATUS_IO_DEVICE_ERROR;}

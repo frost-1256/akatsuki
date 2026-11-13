@@ -30,9 +30,10 @@
 #define EPI_GMU_PROBE2_R1      0x1UL // EpiGpuProbe2 bit0, valid only with EpiGpuProbe exactly BFFFFE80
 #define EPI_GMU_PROBE2_D1      0x2UL // requires R1; Probe2=3, external framebuffer band with backup/restore
 #define EPI_GMU_PROBE2_V1      0x4UL // requires R1/D1; Probe2=7, interpolated two-pass triangle
+#define EPI_GMU_PROBE2_A1      0x8UL // requires R1/D1/V1; Probe2=15, 241-frame rotating square
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -343,6 +344,29 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // Breadcrumbs 1A00..1A32 have the same allocation as D1 1900..1932. Five-second hold and mandatory
 // CPU restore/unmap, including on breadcrumb/GX failure; first failure Reason is preserved.
 
+// GpuGmuA1: 464 bytes; all ULONG / NTSTATUS fields in this exact order:
+// Cp (140-byte G2 layout), VChecks, VReason, IbBadCount, IbFirstBad, IbBadValue,
+// FramesDone, FailFrame, FailData25, FailRptr, FailWptr, FenceMaxUs, FenceTotalUs, ElapsedMs,
+// SqGoodEven, SqGoodOdd, SqBad, SqFirst, SqValue, SqExpected,
+// BgGoodEven, BgGoodOdd, BgBad, BgFirst, BgValue, MaxErr[3],
+// OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[18], DataAfter[3],
+// CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, ScanCount, ScanFirst, ScanDwords,
+// RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus.
+// Checks: 1 V1 succeeded/restored, 2 all 241 fences + final data25=A10000F0 + idle/endpoints=2278/no errors,
+// 4 data23/24=CAFE0015/16, 8 square core 12324 each parity, 16 background core 19484 each + outside unchanged,
+// 32 exact restore. Require 3F. RGB tolerance +/-2; X must be FF. MaxErr is B/G/R over both cores.
+// Samples (column,view): (540,64),(463,27),(616,27),(616,100),(463,100),(500,44),(580,84),(414,2),(665,125),
+// each even then odd. SqFirst/BgFirst/OutsideFirst/RestoreFirst are band byte offsets;
+// IbFirstBad is an IB DWORD index, ScanFirst a ring byte offset. ScanDwords=4027 (V1 predicate).
+// Unrecorded/absent first matches are FFFFFFFF; statuses NOT_FOUND. FramesDone/FenceMaxUs/FenceTotalUs start at 0.
+// FailFrame is set only when the frame loop stops; FailRptr/Wptr are the last safely sampled values.
+// Fence timing uses KeQueryInterruptTime, covers publication through unique fence + native/shadow RPTR,
+// including fenced-write retries; ElapsedMs excludes the final 16-ms sleep and 2-second hold.
+// Reason 16: frame completion exceeded 100 ms; 17: inter-frame delay failed. Reason 10 remains AHB fence timeout.
+// Breadcrumbs: 1B00/01 map/prior, 1B02 global, 1B08 backup, 1B03 prepare; 1B40..1B4F every 16 frames;
+// 1B10..1B1B diagnostics, 1B20 global, 1B30 hold, 1B31 restore, 1B32 verify. No per-frame registry flush.
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -377,6 +401,7 @@ ULONG EpiGmuStackMinimum();
 // R1: EpiGpuProbe2 bit0 with exactly 0xBFFFFE80, after successful S1; private target VS/FS RECTLIST draw.
 // D1: Probe2 bit1 with R1; external display band map, two draws, 5-second hold and mandatory CPU restore.
 // V1: Probe2=7 after successful D1 restore; integer-checked varying triangle under the same OOB.
+// A1: Probe2=15 after V1 restore; 241 sequential frames, no ring wrap, final 2-second hold and restore.
 // Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -388,4 +413,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE);
