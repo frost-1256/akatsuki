@@ -3501,6 +3501,377 @@ static NTSTATUS GmuD1Submit(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,const G
     for (ULONG i=0;i<2;++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
     return st;
 }
+struct GMU_V1_TRACE {
+    GMU_G2_TRACE Cp;
+    ULONG DChecks,DReason,Packet[9],Fs[32],VertA[24],VertB[24],IbBadCount,IbFirstBad,IbBadValue;
+    ULONG CoreEven,CoreOdd,CoreBad,CoreFirst,CoreValue,CoreExpected,MaxErr[3],EdgeChanged,EdgeSame;
+    ULONG OutsideChanged,OutsideFirst,OutsideOld,OutsideNew,Sample[12];
+    ULONG DataBefore[3],DataAfter[3],CpInterrupt,CpProtect,CpStatus1,IbBaseLow,IbBaseHigh,IbRemaining;
+    NTSTATUS GlobalStatus[2];
+    ULONG GlobalBefore[4],GlobalAfter[4],MaskBefore,MaskAtSubmit,MaskAfter,ScanCount,ScanFirst,ScanDwords;
+    ULONG RestoreMismatch,RestoreFirst,HoldMs,Checks,Prepared;
+    NTSTATUS BackupStatus,HoldStatus,RestoreStatus;
+};
+static_assert(sizeof(GMU_V1_TRACE)==768,"V-1 diagnostic ABI");
+static const ULONG GmuV1Ib[]={
+    0x40BB0801,0x000000BF,0x40A80001,0x00100100,0x70328003,0x00620000,0x70014800,0x00000000,
+    0x40A98001,0x81400100,0x48A98207,0x00000000,0x70015400,0x00000000,0x00000000,0x00000000,
+    0x00000000,0x00000000,0x70348003,0x00720000,0x70015400,0x00000000,0x48A00001,0x00000201,
+    0x40A09202,0xC8200200,0x00000001,0x48A0D101,0x0000004F,0x48A80202,0x00000002,0x0F000F04,
+    0x48A81301,0x00000400,0x40930101,0x00FF0408,0x489B0101,0x00000008,0x40921204,0xFFFFFFF0,
+    0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0x40930401,0xFF01FF04,0x40A99E01,0x00000000,0x48B98001,
+    0x00000002,0x40B98401,0xFCFCFC00,0x40800501,0x00000001,0x48880901,0x00000401,0x48A98E01,
+    0x00000004,0x4080F002,0x0000019C,0x007F029B,0x48840A02,0x0000019C,0x007F029B,0x4880B002,
+    0x0000019C,0x007F029B,0x40A01004,0x70015480,0x00000000,0x00000060,0x00000020,0x40882304,
+    0x00000087,0x00000000,0x71008A00,0x00000000,0x70388003,0x00000084,0x00000001,0x00000003,
+    0x70460004,0x0000001D,0x70017050,0x00000000,0xCAFE0012,0x70268000,0x4080F002,0x000001A4,
+    0x007F02A3,0x48840A02,0x000001A4,0x007F02A3,0x4880B002,0x000001A4,0x007F02A3,0x40A01004,
+    0x70015500,0x00000000,0x00000060,0x00000020,0x40882304,0x00000087,0x00000000,0x71009AC0,
+    0x00000000,0x70388003,0x00000084,0x00000001,0x00000003,0x70460004,0x0000001D,0x70017054,
+    0x00000000,0xCAFE0013,0x70268000,
+};
+static_assert(sizeof(GmuV1Ib)==115*sizeof(ULONG),"V-1 IB length");
+static const ULONG GmuV1Fs[32]={0x2000,0x47308B04,0,0x500,0,0x03000000};
+static const ULONG GmuV1VertA[]={
+    0x44070000,0,0,0x3F800000,0,0,0x3F800000,0x3F800000,
+    0x43CE0000,0x43000000,0,0x3F800000,0,0x3F800000,0,0x3F800000,
+    0x44270000,0x43000000,0,0x3F800000,0x3F800000,0,0,0x3F800000
+};
+static const ULONG GmuV1VertB[]={
+    0x44090000,0,0,0x3F800000,0,0,0x3F800000,0x3F800000,
+    0x43D20000,0x43000000,0,0x3F800000,0,0x3F800000,0,0x3F800000,
+    0x44290000,0x43000000,0,0x3F800000,0x3F800000,0,0,0x3F800000
+};
+static const ULONG GmuV1Packet[]={0x70BF8003,0x70015100,0,115,0x70460004,4,0x70017058,0,0xCAFE0014};
+// Signed edge functions after reversing the triangle winding; coordinates are doubled.
+// With x in [822,1338], y in [-2,258], all intermediates including 510*w fit LONG.
+static VOID GmuV1Weights(LONG X,LONG Y,LONG* W)
+{
+    W[0]=512*(256-Y); W[1]=256*(1080+Y-X); W[2]=256*(X+Y-1080);
+}
+enum { V1_EDGE=0,V1_CORE_IN=1,V1_CORE_OUT=2 };
+static ULONG GmuV1Classify(ULONG Column,ULONG ViewRow)
+{
+    const LONG x=static_cast<LONG>(Column)*2,y=static_cast<LONG>(ViewRow)*2;
+    ULONG allOutside=7; BOOLEAN allInside=TRUE;
+    for (ULONG corner=0;corner<4;++corner)
+    {
+        LONG w[3]; GmuV1Weights(x+((corner&1) ? 4 : -2),y+((corner&2) ? 4 : -2),w);
+        for (ULONG e=0;e<3;++e)
+        { if (w[e]>=0) { allOutside&=~(1UL<<e); } else { allInside=FALSE; } }
+    }
+    return allInside ? V1_CORE_IN : (allOutside ? V1_CORE_OUT : V1_EDGE);
+}
+static ULONG GmuV1Expected(ULONG Column,ULONG ViewRow)
+{
+    LONG w[3]; GmuV1Weights(static_cast<LONG>(Column)*2+1,static_cast<LONG>(ViewRow)*2+1,w);
+    const ULONG r=static_cast<ULONG>((510*w[0]+131072)/262144);
+    const ULONG g=static_cast<ULONG>((510*w[1]+131072)/262144);
+    const ULONG b=static_cast<ULONG>((510*w[2]+131072)/262144);
+    return 0xFF000000UL|(r<<16)|(g<<8)|b;
+}
+static BOOLEAN GmuV1WithinTolerance(ULONG Value,ULONG Expected,ULONG* MaxErr)
+{
+    BOOLEAN good=(Value>>24)==0xFF;
+    for (ULONG channel=0;channel<3;++channel)
+    {
+        const LONG delta=static_cast<LONG>((Value>>(channel*8))&0xFF)-static_cast<LONG>((Expected>>(channel*8))&0xFF);
+        const ULONG error=static_cast<ULONG>(delta<0 ? -delta : delta);
+        if (error>MaxErr[channel]) { MaxErr[channel]=error; }
+        if (error>2) { good=FALSE; }
+    }
+    return good;
+}
+static VOID GmuV1TraceInit(GMU_V1_TRACE* t)
+{
+    RtlFillMemory(t,sizeof(*t),0xFF); GmuG2TraceInit(&t->Cp); t->Checks=0; t->Prepared=0; t->HoldMs=0;
+    t->GlobalStatus[0]=t->GlobalStatus[1]=STATUS_NOT_FOUND;
+    t->BackupStatus=t->HoldStatus=t->RestoreStatus=STATUS_NOT_FOUND;
+}
+static BOOLEAN GmuV1CanFollow(const GMU_D1_TRACE* D)
+{
+    return D!=NULL && NT_SUCCESS(D->Cp.Status) && D->Cp.Reason==0 && D->Checks==0x3F && D->Cp.WptrAfter==100 &&
+           D->DataAfter[0]==0xCAFE000F && D->DataAfter[1]==0xCAFE0010 && D->DataAfter[2]==0xCAFE0011 &&
+           D->RestoreMismatch==0 && NT_SUCCESS(D->RestoreStatus);
+}
+static NTSTATUS GmuV1Submit(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,const GMU_GX_TRACE* T,GMU_V1_TRACE* G,HANDLE Diag,const GMU_D1_TRACE* D)
+{
+    GMU_G2_TRACE* C=&G->Cp;
+    NTSTATUS st=GmuG2Guard(S,Params,Cc,T,C,0x1A00); if (!NT_SUCCESS(st)) { return st; }
+    GMU_REGION* ring=GmuFind(S,GmuG1Iova[1],GmuG1Size[1]);
+    GMU_REGION* shadow=GmuFind(S,GmuG1Iova[2],GmuG1Size[2]);
+    if (S->Smmu==NULL || ring==NULL || shadow==NULL || ring->Va==NULL || shadow->Va==NULL ||
+        !ring->Mapped || !shadow->Mapped || ring->Flags!=GmuG1Flags[1] || shadow->Flags!=GmuG1Flags[2] ||
+        ring->Iova!=0x70010000 || ring->Size<0x8000 || shadow->Iova!=0x70020000)
+    { C->Reason=12; return STATUS_INVALID_DEVICE_STATE; }
+    volatile ULONG* rptr=static_cast<volatile ULONG*>(shadow->Va);
+    volatile ULONG* words=static_cast<volatile ULONG*>(ring->Va);
+    PVOID band=NULL; ULONG* backup=NULL;
+    volatile ULONG* data=words+0x7000/4;
+    PVOID maps[2]={}; const ULONG offsets[]={0,0x2000};
+    for (ULONG i=0;i<2;++i)
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart=EPI_GMU_GPU_BASE+offsets[i];
+        maps[i]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+        if (maps[i]==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; C->Reason=GX_REG_MAP_FAILED; break; }
+    }
+    if (NT_SUCCESS(st))
+    {
+        volatile ULONG* cp=static_cast<volatile ULONG*>(maps[1]);
+        volatile ULONG* gpu=static_cast<volatile ULONG*>(maps[0]);
+        st=GmuG2Guard(S,Params,Cc,T,C,0x1A01);
+        if (NT_SUCCESS(st))
+        {
+            G->MaskBefore=READ_REGISTER_ULONG(gpu+0x38);
+            if (G->MaskBefore!=0) { C->Reason=15; st=STATUS_INVALID_DEVICE_STATE; }
+            else
+            {
+                KeMemoryBarrier(); C->ShadowBefore=*rptr; C->WptrBefore=READ_REGISTER_ULONG(cp+7);
+                C->Rptr=READ_REGISTER_ULONG(cp+6);
+                BOOLEAN previous=C->ShadowBefore==100 && C->WptrBefore==100 && C->Rptr==100;
+                const ULONG meInit[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
+                for (ULONG i=0;i<9;++i)
+                { if (words[i]!=meInit[i] || words[30+i]!=GmuG4Packet[i] || words[39+i]!=GmuG5Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<11;++i) { if (words[9+i]!=GmuG3Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<5;++i)
+                { if (words[20+i]!=GmuG3bPacket[i] || words[25+i]!=GmuG3cPacket[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<13;++i) { if (words[48+i]!=GmuG5bPacket[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<12;++i) { if (words[61+i]!=GmuZ1Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<6;++i) { if (words[0x6000/4+i]!=GmuG4Ib[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<36;++i) { if (words[0x6100/4+i]!=GmuG5Ib[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<10;++i) { if (words[0x6200/4+i]!=GmuG5bIb[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<9;++i) { if (words[73+i]!=GmuS1Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<53;++i) { if (words[0x6300/4+i]!=GmuS1Ib[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<32;++i) { if (words[0x6800/4+i]!=GmuS1Shader[i]) { previous=FALSE; } }
+                const ULONG expected[]={0xCAFE0002,0xFFFFFFFF,0xCAFE0001,0xFFFFFFFF,0xCAFE0003,0xFFFFFFFF,
+                    0xCAFE0004,0xFFFFFFFF,0xCAFE0006,0xCAFE0007,0xCAFE0008,0xCAFE0009,0xCAFE000A,0xCAFE000B,0xCAFE000C};
+                for (ULONG i=0;i<15;++i) { if (data[i]!=expected[i]) { previous=FALSE; } }
+                if (words[0x7C00/4]!=0xC0DE5EED) { previous=FALSE; }
+                for (ULONG i=1;i<16;++i) { if (words[0x7C00/4+i]!=0xFFFFFFFF) { previous=FALSE; } }
+                if (!(D!=NULL && EpiGmuD1DisplayMatches(D->Disp))) { previous=FALSE; }
+                GMU_REGION* ext=GmuFind(S,0x71000000,0x120000);
+                if (ext==NULL || !ext->External || !ext->Mapped || ext->Pa.QuadPart!=0xE1462000 ||
+                    ext->Size!=0x120000 || ext->Flags!=(EPI_SMMU_READ|EPI_SMMU_WRITE)) { previous=FALSE; }
+                if (data[15]!=0xCAFE000D || data[16]!=0xCAFE000E) { previous=FALSE; }
+                for (ULONG i=0;i<9;++i) { if (words[82+i]!=GmuR1Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<314;++i) { if (words[0x4000/4+i]!=GmuR1Ib[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<32;++i)
+                { if (words[0x4800/4+i]!=GmuR1Vs[i] || words[0x4880/4+i]!=GmuR1Fs[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<8;++i) { if (words[0x4900/4+i]!=GmuR1Vertices[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<256;++i)
+                {
+                    const BOOLEAN inside=i%16>=4 && i%16<12 && i/16>=4 && i/16<12;
+                    if (words[0x4C00/4+i]!=(inside ? 0x000033FFUL : 0xFFFFFFFFUL)) { previous=FALSE; }
+                }
+                if (data[17]!=0xCAFE000F || data[18]!=0xCAFE0010 || data[19]!=0xCAFE0011) { previous=FALSE; }
+                for (ULONG i=0;i<9;++i) { if (words[91+i]!=GmuD1Packet[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<72;++i) { if (words[0x4500/4+i]!=GmuD1Ib[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<32;++i) { if (words[0x4A00/4+i]!=GmuD1Fs[i]) { previous=FALSE; } }
+                for (ULONG i=0;i<8;++i)
+                { if (words[0x4A80/4+i]!=GmuD1VertA[i] || words[0x4AA0/4+i]!=GmuD1VertB[i]) { previous=FALSE; } }
+                if (!previous) { C->Reason=12; st=STATUS_INVALID_DEVICE_STATE; }
+            }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A02);
+            if (NT_SUCCESS(st)) { G->GlobalStatus[0]=EpiSmmuQueryGlobalFault(S->Smmu,G->GlobalBefore); }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A08);
+            if (NT_SUCCESS(st))
+            {
+                backup=static_cast<ULONG*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,0x120000,EPI_GMU_TAG));
+                if (backup==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; }
+                else
+                {
+                    PHYSICAL_ADDRESS pa; pa.QuadPart=0xE1462000;
+                    band=MmMapIoSpaceEx(pa,0x120000,PAGE_READWRITE|PAGE_NOCACHE);
+                    if (band==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; }
+                    else
+                    {
+                        for (ULONG i=0;i<0x120000/4;++i) { backup[i]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(band)+i); }
+                        KeMemoryBarrier();
+                    }
+                }
+                G->BackupStatus=st;
+                if (!NT_SUCCESS(st)) { C->Reason=GX_REG_MAP_FAILED; }
+            }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A03);
+            if (NT_SUCCESS(st))
+            {
+                for (ULONG i=0;i<3;++i) { data[20+i]=0xFFFFFFFF; G->DataBefore[i]=data[20+i]; }
+                RtlCopyMemory(static_cast<UCHAR*>(ring->Va)+0x5100,GmuV1Ib,sizeof(GmuV1Ib));
+                RtlCopyMemory(static_cast<UCHAR*>(ring->Va)+0x5400,GmuV1Fs,sizeof(GmuV1Fs));
+                RtlCopyMemory(static_cast<UCHAR*>(ring->Va)+0x5480,GmuV1VertA,sizeof(GmuV1VertA));
+                RtlCopyMemory(static_cast<UCHAR*>(ring->Va)+0x5500,GmuV1VertB,sizeof(GmuV1VertB));
+                RtlCopyMemory(static_cast<ULONG*>(ring->Va)+100,GmuV1Packet,sizeof(GmuV1Packet));
+                KeMemoryBarrier();
+                RtlCopyMemory(G->Fs,static_cast<UCHAR*>(ring->Va)+0x5400,sizeof(G->Fs));
+                RtlCopyMemory(G->VertA,static_cast<UCHAR*>(ring->Va)+0x5480,sizeof(G->VertA));
+                RtlCopyMemory(G->VertB,static_cast<UCHAR*>(ring->Va)+0x5500,sizeof(G->VertB));
+                RtlCopyMemory(G->Packet,static_cast<ULONG*>(ring->Va)+100,sizeof(G->Packet)); G->Prepared=1;
+                G->IbBadCount=0;
+                for (ULONG i=0;i<3;++i) { if (G->DataBefore[i]!=0xFFFFFFFF) { st=STATUS_IO_DEVICE_ERROR; } }
+                for (ULONG i=0;i<115;++i)
+                {
+                    const ULONG v=words[0x5100/4+i];
+                    if (v!=GmuV1Ib[i])
+                    { ++G->IbBadCount; if (G->IbFirstBad==0xFFFFFFFF) { G->IbFirstBad=i; G->IbBadValue=v; } }
+                }
+                for (ULONG i=0;i<32;++i) { if (G->Fs[i]!=GmuV1Fs[i]) { st=STATUS_IO_DEVICE_ERROR; } }
+                for (ULONG i=0;i<24;++i)
+                { if (G->VertA[i]!=GmuV1VertA[i] || G->VertB[i]!=GmuV1VertB[i]) { st=STATUS_IO_DEVICE_ERROR; } }
+                for (ULONG i=0;i<9;++i) { if (G->Packet[i]!=GmuV1Packet[i]) { st=STATUS_IO_DEVICE_ERROR; } }
+                if (G->IbBadCount!=0) { st=STATUS_IO_DEVICE_ERROR; }
+                if (!NT_SUCCESS(st)) { C->Reason=13; }
+            }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A04);
+            if (NT_SUCCESS(st))
+            {
+                G->MaskAtSubmit=READ_REGISTER_ULONG(gpu+0x38);
+                if (G->MaskAtSubmit!=0) { C->Reason=15; st=STATUS_INVALID_DEVICE_STATE; }
+                else { C->Attempted=1; WRITE_REGISTER_ULONG(cp+7,109); KeMemoryBarrier(); ++C->WptrWrites; }
+            }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A05);
+            if (NT_SUCCESS(st)) { st=GmuCpFenceWait(S,Cc,T,C,cp+7,109,gpu+0x38,&G->MaskAtSubmit); }
+        }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuG2Guard(S,Params,Cc,T,C,0x1A06);
+            if (NT_SUCCESS(st)) { st=GmuCpIdleWait(S,Cc,T,C,rptr,gpu,109,(1UL<<1)|(1UL<<9)|(1UL<<24)); }
+        }
+        volatile ULONG* diagRegs[]={cp+6,cp+7,cp+0x21,cp+0x23,cp+0x24,cp+0x25,
+                                   gpu+0x210,gpu+0x201,cp+0x128,cp+0x129,cp+0x12A,gpu+0x38};
+        ULONG* diagValues[]={&C->Rptr,&C->WptrAfter,&C->CpHwFault,&G->CpInterrupt,&G->CpProtect,&G->CpStatus1,
+                             &C->RbbmStatus,&C->IntStatus,&G->IbBaseLow,&G->IbBaseHigh,&G->IbRemaining,&G->MaskAfter};
+        const ULONG firstReason=C->Reason;
+        NTSTATUS sampled=STATUS_SUCCESS;
+        for (ULONG i=0;i<RTL_NUMBER_OF(diagRegs);++i)
+        {
+            sampled=GmuG2Guard(S,Params,Cc,T,C,0x1A10+i); if (!NT_SUCCESS(sampled)) { break; }
+            *diagValues[i]=READ_REGISTER_ULONG(diagRegs[i]);
+        }
+        if (!NT_SUCCESS(st)) { C->Reason=firstReason; }
+        else if (!NT_SUCCESS(sampled)) { st=sampled; }
+        const ULONG prior=C->Reason;
+        sampled=GmuG2Guard(S,Params,Cc,T,C,0x1A20);
+        if (NT_SUCCESS(sampled)) { G->GlobalStatus[1]=EpiSmmuQueryGlobalFault(S->Smmu,G->GlobalAfter); }
+        if (!NT_SUCCESS(st)) { C->Reason=prior; }
+        else if (!NT_SUCCESS(sampled)) { st=sampled; }
+        C->CxBusy=READ_REGISTER_ULONG(GmuReg(S,0x23B0C));
+        KeMemoryBarrier(); C->ShadowAfter=*rptr;
+        for (ULONG i=0;i<3;++i) { G->DataAfter[i]=data[20+i]; }
+        if (G->Prepared)
+        {
+            const ULONG errors=(1UL<<1)|(1UL<<9)|(1UL<<23)|(1UL<<24);
+            if (C->ShadowAfter==109 && C->Rptr==109 && C->WptrAfter==109 && !(C->IntStatus&errors) &&
+                !(C->RbbmStatus&~1UL) && !(C->CxBusy&(1UL<<23))) { G->Checks|=2; }
+            if (G->DataAfter[0]==0xCAFE0012 && G->DataAfter[1]==0xCAFE0013 && G->DataAfter[2]==0xCAFE0014) { G->Checks|=4; }
+        }
+        if (band!=NULL && NT_SUCCESS(G->BackupStatus))
+        {
+            G->CoreEven=0; G->CoreOdd=0; G->CoreBad=0; G->EdgeChanged=0; G->EdgeSame=0; G->OutsideChanged=0;
+            for (ULONG channel=0;channel<3;++channel) { G->MaxErr[channel]=0; }
+            for (ULONG i=0;i<0x120000/4;++i)
+            {
+                const ULONG offset=i*4,fb=0x462000+offset,y=fb/4320,x=(fb%4320)/4;
+                const ULONG value=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(band)+i);
+                const BOOLEAN inBox=x>=412 && x<668 && y>=1072 && y<1328;
+                const ULONG kind=inBox ? GmuV1Classify(x,(y-1072)/2) : V1_CORE_OUT;
+                if (kind==V1_CORE_IN)
+                {
+                    const ULONG expected=GmuV1Expected(x,(y-1072)/2);
+                    if (GmuV1WithinTolerance(value,expected,G->MaxErr))
+                    { if (y&1) { ++G->CoreOdd; } else { ++G->CoreEven; } }
+                    else
+                    {
+                        ++G->CoreBad;
+                        if (G->CoreFirst==0xFFFFFFFF) { G->CoreFirst=offset; G->CoreValue=value; G->CoreExpected=expected; }
+                    }
+                }
+                else if (kind==V1_EDGE)
+                { if (value==backup[i]) { ++G->EdgeSame; } else { ++G->EdgeChanged; } }
+                else if (value!=backup[i])
+                {
+                    ++G->OutsideChanged;
+                    if (G->OutsideFirst==0xFFFFFFFF) { G->OutsideFirst=offset; G->OutsideOld=backup[i]; G->OutsideNew=value; }
+                }
+            }
+            const ULONG sample[][2]={{540,85},{540,6},{420,124},{660,124},{540,124},{476,100}};
+            for (ULONG i=0;i<6;++i) for (ULONG parity=0;parity<2;++parity)
+            { G->Sample[i*2+parity]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(band)+((1072+sample[i][1]*2+parity)*4320+sample[i][0]*4-0x462000)/4); }
+            if (G->CoreEven==15500 && G->CoreOdd==15500) { G->Checks|=8; }
+            if (G->OutsideChanged==0) { G->Checks|=16; }
+        }
+    }
+    KeMemoryBarrier(); G->ScanCount=0; G->ScanDwords=0;
+    for (ULONG off=0;off<0x8000;off+=4)
+    {
+        if (off<109*4 || (off>=0x5100 && off<0x52CC) || (off>=0x5400 && off<0x5560) || (off>=0x4500 && off<0x4620) || (off>=0x4A00 && off<0x4AC0) || (off>=0x4000 && off<0x44E8) || (off>=0x4800 && off<0x4920) ||
+            (off>=0x4C00 && off<0x5040) || (off>=0x6000 && off<0x6240) || (off>=0x6300 && off<0x6400) ||
+            (off>=0x6800 && off<0x6880) || (off>=0x7000 && off<0x705C) ||
+            (off>=0x7400 && off<0x7840) || (off>=0x7C00 && off<0x7C40)) { continue; }
+        ++G->ScanDwords;
+        const ULONG value=words[off/4];
+        if ((value&0xFF000000UL)==0xFF000000UL && value!=0xFFFFFFFF) { ++G->ScanCount; if (G->ScanFirst==0xFFFFFFFF) { G->ScanFirst=off; } }
+    }
+    ULONG fsr=0,syn=0; ULONGLONG faultAddr=0;
+    C->FaultStatus=EpiSmmuQueryFault(S->Smmu,&fsr,&faultAddr,&syn);
+    if (NT_SUCCESS(C->FaultStatus))
+    { C->Fsr=fsr; C->FarLow=static_cast<ULONG>(faultAddr); C->FarHigh=static_cast<ULONG>(faultAddr>>32); C->Fsynr=syn; }
+    if (band!=NULL && NT_SUCCESS(G->BackupStatus))
+    {
+        if (C->Attempted)
+        {
+            C->Status=st;
+            NTSTATUS held=GmuStep(Params,0x1A30);
+            if (NT_SUCCESS(held)) { held=EpiSetValue(Diag,L"GpuGmuV1",REG_BINARY,G,sizeof(*G)); }
+            if (NT_SUCCESS(held)) { held=ZwFlushKey(Diag); }
+            if (NT_SUCCESS(held))
+            {
+#ifdef EPI_GMU_HOST_TEST
+                KeStallExecutionProcessor(5000000); held=STATUS_SUCCESS;
+#else
+                LARGE_INTEGER delay; delay.QuadPart=-50000000;
+                held=KeDelayExecutionThread(KernelMode,FALSE,&delay);
+#endif
+                if (NT_SUCCESS(held)) { G->HoldMs=5000; }
+            }
+            G->HoldStatus=held;
+            if (NT_SUCCESS(st) && !NT_SUCCESS(held)) { st=held; C->Reason=6; }
+        }
+        // Restoring display RAM is mandatory even when a breadcrumb or GX prerequisite failed.
+        NTSTATUS restored=GmuStep(Params,0x1A31);
+        for (ULONG i=0;i<0x120000/4;++i) { WRITE_REGISTER_ULONG(static_cast<volatile ULONG*>(band)+i,backup[i]); }
+        KeMemoryBarrier();
+        const NTSTATUS verified=GmuStep(Params,0x1A32);
+        G->RestoreMismatch=0;
+        for (ULONG i=0;i<0x120000/4;++i) if (READ_REGISTER_ULONG(static_cast<volatile ULONG*>(band)+i)!=backup[i])
+        { ++G->RestoreMismatch; if (G->RestoreFirst==0xFFFFFFFF) { G->RestoreFirst=i*4; } }
+        if (NT_SUCCESS(restored) && !NT_SUCCESS(verified)) { restored=verified; }
+        if (G->RestoreMismatch==0) { G->Checks|=32; }
+        else if (NT_SUCCESS(restored)) { restored=STATUS_IO_DEVICE_ERROR; }
+        G->RestoreStatus=restored;
+        if (NT_SUCCESS(st) && !NT_SUCCESS(restored)) { st=restored; C->Reason=13; }
+    }
+    if (band!=NULL) { MmUnmapIoSpace(band,0x120000); }
+    if (backup!=NULL) { ExFreePoolWithTag(backup,EPI_GMU_TAG); }
+    if (NT_SUCCESS(st) && G->Checks!=0x3F) { C->Reason=13; st=STATUS_IO_DEVICE_ERROR; }
+    if (NT_SUCCESS(st)) { C->Reason=0; }
+    for (ULONG i=0;i<2;++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
+    return st;
+}
 static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_TRACE* T,
                          GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL,
                          GMU_GX_INIT_TRACE* Init = NULL, BOOLEAN AddrMode = FALSE, GMU_GX_HWCG_TRACE* Hwcg = NULL,
@@ -3509,7 +3880,7 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
                          GMU_G3_TRACE* G3 = NULL, GMU_G3B_TRACE* G3b = NULL, GMU_G3C_TRACE* G3c = NULL,
                          GMU_G4_TRACE* G4 = NULL, GMU_G5_TRACE* G5 = NULL, GMU_G5B_TRACE* G5b = NULL,
                          GMU_Z1_TRACE* Z1 = NULL,HANDLE Diag = NULL,const UCHAR* Zap = NULL,ULONG ZapLen = 0,
-                         GMU_S1_TRACE* S1 = NULL, GMU_R1_TRACE* R1 = NULL, GMU_D1_TRACE* D1 = NULL)
+                         GMU_S1_TRACE* S1 = NULL, GMU_R1_TRACE* R1 = NULL, GMU_D1_TRACE* D1 = NULL, GMU_V1_TRACE* V1 = NULL)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -3637,6 +4008,12 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
         if (R1!=NULL) { D1->RChecks=R1->Checks; D1->RReason=R1->Cp.Reason; }
         if (GmuD1CanFollow(R1)) { D1->Checks=1; D1->Cp.Status=GmuD1Submit(S,Params,Cc,T,D1,Diag); }
         else { D1->Cp.Reason=8; D1->Cp.Status=STATUS_INVALID_DEVICE_STATE; }
+    }
+    if (V1!=NULL)
+    {
+        if (D1!=NULL) { V1->DChecks=D1->Checks; V1->DReason=D1->Cp.Reason; }
+        if (GmuV1CanFollow(D1)) { V1->Checks=1; V1->Cp.Status=GmuV1Submit(S,Params,Cc,T,V1,Diag,D1); }
+        else { V1->Cp.Reason=8; V1->Cp.Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
     WRITE_REGISTER_ULONG(GmuReg(S,R_HOST2GMU_INTR_SET),0x80000000UL);
@@ -3789,6 +4166,7 @@ struct GMU_BOOT_TRACES {
     GMU_S1_TRACE s1;
     GMU_R1_TRACE r1;
     GMU_D1_TRACE d1;
+    GMU_V1_TRACE v1;
     GMU_GX_TRACE gx;
     GMU_CLOCK_TRACE clocks;
     GMU_HFI_TRACE hfi;
@@ -3822,6 +4200,7 @@ static VOID GmuBootTracesInit(GMU_BOOT_TRACES* p,BOOLEAN VoteGx,const ULONG* Dis
     GmuS1TraceInit(&p->s1);
     GmuR1TraceInit(&p->r1);
     GmuD1TraceInit(&p->d1, Disp);
+    GmuV1TraceInit(&p->v1);
     RtlZeroMemory(&p->gx,sizeof(p->gx));
     p->gx.OobStatus=STATUS_NOT_FOUND; p->gx.HaltStatus=STATUS_NOT_FOUND; p->gx.SlumberStatus=STATUS_NOT_FOUND;
     p->gx.BusyStatus=STATUS_NOT_FOUND; p->gx.RpmhStopStatus=STATUS_NOT_FOUND; p->gx.IdleStatus=STATUS_NOT_FOUND;
@@ -3888,12 +4267,13 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                      BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode, BOOLEAN Hwcg,
                      BOOLEAN GxCfg, BOOLEAN StageE, BOOLEAN StageF, BOOLEAN G1, const UCHAR* Sqe, ULONG SqeLen,
                      BOOLEAN G2, BOOLEAN G3, BOOLEAN G3b, BOOLEAN G3c, BOOLEAN G4, BOOLEAN G5, BOOLEAN G5b,
-                     BOOLEAN Z1,const UCHAR* Zap,ULONG ZapLen,BOOLEAN S1,BOOLEAN R1,BOOLEAN D1,const ULONG* Disp)
+                     BOOLEAN Z1,const UCHAR* Zap,ULONG ZapLen,BOOLEAN S1,BOOLEAN R1,BOOLEAN D1,const ULONG* Disp,BOOLEAN V1)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
     *KeepCx=FALSE;
     if (g_KeptGmu != NULL) { *KeepCx=TRUE; return EPI_GMU_E_TEARDOWN; }
+    if (V1 && !D1) { return EPI_GMU_E_PRECOND; }
     if (D1 && (!R1 || !EpiGmuD1DisplayMatches(Disp))) { return EPI_GMU_E_PRECOND; }
     if (VoteGx && !StartHfi) { return EPI_GMU_E_PRECOND; }
     if (FastClock && (!VoteGx || !StartHfi)) { return EPI_GMU_E_PRECOND; }
@@ -3975,6 +4355,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuS1",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuR1",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuD1",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuV1",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuSmmuGpuStreams",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { ExFreePoolWithTag(p,EPI_GMU_TAG); return EPI_GMU_E_NOMEM; }
@@ -4157,7 +4538,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                                         GxCfg ? &p->gxCfg : NULL,StageE ? &p->gxStageE : NULL,StageF ? &p->gxStageF : NULL,
                                         G1 ? &p->g1 : NULL,G2 ? &p->g2 : NULL,G3 ? &p->g3 : NULL,G3b ? &p->g3b : NULL,
                                         G3c ? &p->g3c : NULL,G4 ? &p->g4 : NULL,G5 ? &p->g5 : NULL,G5b ? &p->g5b : NULL,
-                                        Z1 ? &p->z1 : NULL,Diag,Zap,ZapLen,S1 ? &p->s1 : NULL,R1 ? &p->r1 : NULL,D1 ? &p->d1 : NULL);
+                                        Z1 ? &p->z1 : NULL,Diag,Zap,ZapLen,S1 ? &p->s1 : NULL,R1 ? &p->r1 : NULL,D1 ? &p->d1 : NULL,V1 ? &p->v1 : NULL);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (p->gx.Attempted)
             {
@@ -4202,6 +4583,8 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
             { result=EPI_GMU_E_CP; st=p->r1.Cp.Status; }
             if (result==EPI_GMU_OK && D1 && !NT_SUCCESS(p->d1.Cp.Status))
             { result=EPI_GMU_E_CP; st=p->d1.Cp.Status; }
+            if (result==EPI_GMU_OK && V1 && !NT_SUCCESS(p->v1.Cp.Status))
+            { result=EPI_GMU_E_CP; st=p->v1.Cp.Status; }
         }
         GmuHfiPower(s,Params,Cc,&p->hfi,1);
         GmuText(Text,TextCch,L"gmu_hfi_status",static_cast<ULONG>(p->hfi.Status));
@@ -4229,6 +4612,7 @@ cleanup:
     if (S1) { EpiSetValue(Diag,L"GpuGmuS1",REG_BINARY,&p->s1,sizeof(p->s1)); }
     if (R1) { EpiSetValue(Diag,L"GpuGmuR1",REG_BINARY,&p->r1,sizeof(p->r1)); }
     if (D1) { EpiSetValue(Diag,L"GpuGmuD1",REG_BINARY,&p->d1,sizeof(p->d1)); }
+    if (V1) { EpiSetValue(Diag,L"GpuGmuV1",REG_BINARY,&p->v1,sizeof(p->v1)); }
     if (G3b) { EpiSetValue(Diag,L"GpuGmuG3b",REG_BINARY,&p->g3b,sizeof(p->g3b)); }
     if (G3) { EpiSetValue(Diag,L"GpuGmuG3",REG_BINARY,&p->g3,sizeof(p->g3)); }
     if (G2) { EpiSetValue(Diag,L"GpuGmuG2",REG_BINARY,&p->g2,sizeof(p->g2)); }
@@ -4395,6 +4779,7 @@ keep:
     if (S1) { EpiSetValue(Diag,L"GpuGmuS1",REG_BINARY,&p->s1,sizeof(p->s1)); }
     if (R1) { EpiSetValue(Diag,L"GpuGmuR1",REG_BINARY,&p->r1,sizeof(p->r1)); }
     if (D1) { EpiSetValue(Diag,L"GpuGmuD1",REG_BINARY,&p->d1,sizeof(p->d1)); }
+    if (V1) { EpiSetValue(Diag,L"GpuGmuV1",REG_BINARY,&p->v1,sizeof(p->v1)); }
     if (G3b) { EpiSetValue(Diag,L"GpuGmuG3b",REG_BINARY,&p->g3b,sizeof(p->g3b)); }
     if (G3) { EpiSetValue(Diag,L"GpuGmuG3",REG_BINARY,&p->g3,sizeof(p->g3)); }
     if (G2) { EpiSetValue(Diag,L"GpuGmuG2",REG_BINARY,&p->g2,sizeof(p->g2)); }

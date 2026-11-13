@@ -4212,6 +4212,196 @@ ring[100..108] = `70BF8003 70015100 00000000 00000073 70460004 00000004 70017058
 
 **この後：** V-1 が通れば T-1（texture）である。R-1 の描画先（0x70014C00、16 × 16）を texture として、`SP_FS_PREFETCH`（または `sam`）で読み、同じ band に拡大して出す。varying で texcoord を渡すので、V-1 の配置をそのまま使う。
 
+#### 9.21.42 V-1 の実装（実機未実行）
+
+§9.21.41 を実装した。実行値は `EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=7`。Probe2 は 0 / 1 / 3 / 7 だけを許し、0以外は Probe が上記と完全一致するときだけ有効。bit2 は R-1 / D-1 を必須とし、D-0 の表示情報検査とワンショット解除も D-1 と共通である。V-1 を要求しない既存の手順は変更しない。
+
+D-1 が Status 成功、Reason 0、Checks 3F、WPTR 100、data[17..19] 一致、RestoreMismatch 0、RestoreStatus 成功となった場合だけ、OOB 解除前に続ける。ring[0..99] と既存 IB / shader / 頂点 / data[0..19]、R-1 の描画先、RPTR / WPTR / shadow 100、MASK 0、外部 region と表示情報を再確認する。親の失敗は Reason 8、前段の状態不一致は12、MASK 不一致は15で未投入になる。
+
+SMMU region は D-1 の外部 band を共有し、新しい map 要求は増やさない。D-1 は CPU map と退避プールをすでに解放しているため、V-1 で同じ band を CPU に map し直し、復元後の内容を改めて退避する。IB7（115 dw / 37 packet）、FS3（32 dw）、頂点 A/B（24 dwずつ）、ring[100..108]、data[20..22] の準備と照合後、WPTR=109 を投入する。fenced write の再送と1秒の idle 待ちは D-1 と同じ。
+
+期待画像は浮動小数を使わない。符号をそろえた3辺の重みを、倍精度座標 X/Y に対して `w0=512*(256-Y)`、`w1=256*(1080+Y-X)`、`w2=256*(X+Y-1080)` と計算する。これは仕様の辺関数を展開したもので、面積は131072。広げた4隅で core-in / core-out / edge を分類し、core-in だけ色を比較する。B/G/R は各成分 ±2、X は FF を要求する。箱の外と core-out は退避値との完全一致を要求し、edge の変化は情報だけにする。
+
+判定後は診断を保存・flush して5秒保持し、退避した band を必ず復元・照合する。breadcrumb や GX 確認が途中で失敗しても、退避済みなら復元を省略しない。保持前の保存・flush 失敗は待機を省略して復元へ進む。CPU map と退避プールは KeepCx 時も解除・解放する。V-1 の trace は `GMU_BOOT_TRACES` のメンバとしてプールに置き、ポインタで初期化する。カーネルのスタック上には作らない。CP 失敗と teardown の結果の優先順位は D-1 と同じである。
+
+`GpuGmuV1` は **REG_BINARY、768 B（192 DWORD）**。すべて ULONG / NTSTATUS で、以下の順。表示情報は親の GpuGmuD1.Disp[6] に残る。
+
+```text
+Cp (140 B、G2 形式)
+DChecks, DReason, Packet[9], Fs[32], VertA[24], VertB[24]
+IbBadCount, IbFirstBad, IbBadValue
+CoreEven, CoreOdd, CoreBad, CoreFirst, CoreValue, CoreExpected, MaxErr[3]
+EdgeChanged, EdgeSame, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[12]
+DataBefore[3], DataAfter[3], CpInterrupt, CpProtect, CpStatus1
+IbBaseLow, IbBaseHigh, IbRemaining
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4]
+MaskBefore, MaskAtSubmit, MaskAfter, ScanCount, ScanFirst, ScanDwords
+RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared
+BackupStatus, HoldStatus, RestoreStatus
+```
+
+Checks は仕様の6ビット、期待値3F。CoreEven / Odd は許容内の core-in の個数で、各15500が目標。MaxErr は B/G/R 順。Sample は仕様の6標本ごとに偶数行、奇数行の順で12語。CoreFirst / OutsideFirst / RestoreFirst は band 内バイト位置、IbFirstBad は IB 内 DWORD 位置、ScanFirst は ring 内バイト位置。未記録・該当なしは FFFFFFFF、未実行 Status は NOT_FOUND。最初の Reason は後続の診断失敗で上書きしない。
+
+ring 走査は仕様の範囲を除く **6551 DWORD** を調べ、上位バイトが FF で FFFFFFFF ではない語を数える。これは情報のみで Checks に加えない。保持前に一度診断を保存し、復元結果を cleanup と keep の両方で再保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1A00 / 0x1A01 | CP診断用2ページ map / 前段と MASK |
+| 0x1A02 | 元の global fault |
+| 0x1A08 | 退避プール確保・band の CPU map・退避（0x1A03 より先） |
+| 0x1A03 | IB7・FS3・頂点・data・ring の準備と照合 |
+| 0x1A04 / 0x1A05 / 0x1A06 | MASK 再確認・WPTR=109 / fence / idle |
+| 0x1A10〜0x1A1B | RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0、IB1_BASE下位／上位、IB1_REM_SIZE、MASK |
+| 0x1A20 | 後の global fault |
+| 0x1A30 | 保持前の診断保存・flush、5秒待機 |
+| 0x1A31 / 0x1A32 | band の必須復元 / 復元後の全域照合 |
+
+IB7 は文書の表から組み立て、提示された v1_ib7.txt の115語と一致することを静的に確認した。header の parity、37 packet / 44 register、CP_PROTECT 範囲外、標本6点、core-in 15500 / edge 1768 / core-out 15500（各パリティ）、768 B の ABI、6551語の走査範囲も確認した。
+
+shim は独立した一般の外積で色を計算する peer を追加した。これは shader ISA や rasterizer の実行ではない。試験ケースは成功、±2 / ±3、alpha 不一致、片側パス未描画、箱外・core-out 破壊、edge の判定除外、標本と MaxErr、準備時の読み返し破壊、前段・MASK・map・退避失敗、fence 再送・時間切れ、idle 時間切れ、エラー割り込み、途中の GX / breadcrumb / 診断保存失敗、最初の Reason、復元不一致、走査境界、D-1 失敗時の未実行、旧モードと KeepCx を含む。ドライバ／ホスト試験のビルド・実行、版番号変更、署名、配置、実機実行、コミットは行っていない。
+
+#### 9.21.43 A-1 の提案：回る四角（毎フレーム投入するアニメーション、文章仕様、未実装）
+
+V-1 の三角形描画を毎フレーム繰り返して、4 隅に色を付けた正方形を回す。初めての「連続投入」の段階で、CPU と GPU の同期（fence 待ち）、毎フレームの頂点更新、ring の連続使用を確かめる。表示は D-1 / V-1 と同じ band と 2 パス方式で行う。
+
+**前提の事実：**
+- ring は 32 KB（`CP_RB_CNTL` = 0x20C、BUFSZ 12。§9.20.1）で、IOVA 0x70010000..0x70018000 全体が ring である。0x4000 以降には IB5 などを置いているので、**ring packet は dword 4096 未満に収め、折り返さない**。A-1 の packet は 1 フレーム 9 dw で、241 フレームで dword 109..2277 を使い、WPTR は 2278 で終わる。折り返し（WPTR を 0 に戻す処理）は、IB を ring の外に移す後の段階で扱う。
+- 状態は V-1 の IB7 が設定したもの（VFD 2 属性、VPC、bary.f の FS3、TRILIST）をそのまま使う。A-1 で新しく書く register は、IB8 の 14 個だけ（すべて D-1 / V-1 と同じ register。prot.py で確認済み）。
+
+**絵：**
+- 箱（列 412..667、行 1072..1327）全体を、まず暗い灰色（0.125 → 0xFF202020）の三角形 2 枚で塗る。続けて、4 隅が赤・緑・青・白の正方形を三角形 2 枚 (0,1,2)、(0,2,3) で描く。1 回の draw は 12 頂点で、背景が先、正方形が後である。同じ draw 内では primitive の順に書かれるので、正方形が上に出る。背景で毎フレーム箱全体を塗り直すため、前のフレームを消す処理は要らない。
+- 正方形は、実際の画素で一辺 160、中心は (540, 行 1200)。view 座標では、中心が (540, v 64)、隅は物理座標のずれ (dx, dy) を角度 θ だけ回して `x = 540 + dx'`、`v = 64 + dy'/2` とする（v の 1 行が実際の 2 行なので、y を半分にすると画面では正方形のまま回る）。0° のとき、隅 0..3 は左上 (460, 24)・右上 (620, 24)・右下 (620, 104)・左下 (460, 104) で、色は赤・緑・青・白。
+- 角度は 3° 刻みで 120 段階とする。表 `GmuA1Table[120][12]` は、角度ごとに隅 0..3 の `xA, xB (= xA+8), v` を float の bit 列で持つ。カーネルでは浮動小数を計算せず、表の値を VB にコピーするだけにする。表は生成器が出力する（下記）。
+
+**配置：**
+
+| 項目 | 場所 | 内容 |
+|---|---|---|
+| IB8 | 0x70015600（61 dw、18 packet） | 下表。全フレーム共通で、一度だけ書く |
+| VB A | 0x70015800（96 dw = 12 頂点 × 32 B） | dw 0..47 は背景（固定）、dw 48..95 は正方形（毎フレーム書き換える） |
+| VB B | 0x70015A00（96 dw） | VB A の x を +8 したもの |
+| data[23..24] | 0x7001705C / 60 | パス A / B の PC_CCU_FLUSH_COLOR_TS：0xCAFE0015 / 0xCAFE0016（毎フレーム同じ値） |
+| data[25] | 0x70017064 | フレームの fence：`0xA1000000 | f` |
+
+- VB の 1 頂点は `x, v, 0, 1.0, B, G, R, 1.0`（V-1 と同じ）。
+- 背景の頂点（パス A）は、(412,0)(668,0)(668,128) と (412,0)(668,128)(412,128)。色の dword は `3E000000 3E000000 3E000000 3F800000`。
+- 正方形の 6 頂点は、隅 0,1,2,0,2,3 の順。色の dword は隅ごとに次のとおり：
+  - 赤 `0 0 3F800000 3F800000`
+  - 緑 `0 3F800000 0 3F800000`
+  - 青 `3F800000 0 0 3F800000`
+  - 白 `3F800000 3F800000 3F800000 3F800000`
+
+**IB8：**
+
+| # | 群 | dw | packet | header | 値 | 内容 |
+|---|---|---|---|---|---|---|
+| 1 | C | 0 | pkt7 0x46 ×1 | 0x70460001 | 0x31 | CP_EVENT_WRITE CACHE_INVALIDATE (VB is rewritten by the CPU every frame) |
+| 2 | C | 2 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 3 | A | 3 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x19C、0x7F029B | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 4 | A | 6 | pkt4 0x840A ×2 | 0x48840A02 | 0x19C、0x7F029B | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 5 | A | 9 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x19C、0x7F029B | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 6 | A | 12 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70015800、0、0x180、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 7 | A | 17 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71008A00、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 8 | A | 22 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、0xC | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 12 vertices) |
+| 9 | A | 26 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x7001705C、0、0xCAFE0015 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[23] |
+| 10 | A | 31 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 11 | B | 32 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x1A4、0x7F02A3 | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 12 | B | 35 | pkt4 0x840A ×2 | 0x48840A02 | 0x1A4、0x7F02A3 | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 13 | B | 38 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x1A4、0x7F02A3 | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 14 | B | 41 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70015A00、0、0x180、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 15 | B | 46 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71009AC0、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 16 | B | 51 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、0xC | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 12 vertices) |
+| 17 | B | 55 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017060、0、0xCAFE0016 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[24] |
+| 18 | B | 60 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+- 先頭の CACHE_INVALIDATE は必須である。CPU が毎フレーム VB を書き換えるので、UCHE に古い頂点が残っていると前のフレームの絵が出る。
+- フレーム f の ring packet は `70BF8003 70015600 00000000 0000003D 70460004 00000004 70017064 00000000 (0xA1000000|f)`。CACHE_FLUSH_TS で data[25] に f を書く。
+
+**手順（V-1 の復元の後、OOB 解除前）：**
+1. 前段：V-1 の Status 成功、Reason 0、Checks 0x3F、WPTR 109、data[20..22] 正しい。RPTR / WPTR / shadow 109、ring[0..108] と既存 IB / シェーダ / 頂点 / data[0..22] の照合、**ring[109..2277] がすべて 0**、MASK 0。不成立なら Reason 8 / 12 / 15 で未投入とする。
+2. band の map と退避は V-1 と同じ（V-1 の復元後の band を改めて退避する）。
+3. 準備：IB8、VB A/B（背景 + 角度 0 の正方形）、data[23..25] = 0xFFFFFFFF を書いて読み返し、照合する。
+4. フレーム f = 0..240 について、次を繰り返す（f = 240 が最後のフレームで、表の index は `f % 120`。最後は角度 0 に戻る）：
+   1. f > 0 なら、VB A/B の dw 48..95 に表 `f % 120` の正方形を書く（xA を A に、xB を B に。色と 0 / 1.0 は固定）。
+   2. バリアを置き、ring[109 + 9f .. 117 + 9f] に packet を書き、もう一度バリアを置いて、WPTR = 109 + 9(f+1) を書く。
+   3. data[25] == `0xA1000000|f` かつ RPTR == WPTR になるまで待つ。1 フレームの上限は 100 ms。超えたら Reason（新番号）を記録して繰り返しを止め、復元に進む。
+   4. 待ちが済んだら、`KeDelayExecutionThread` で 16 ms 待つ（PASSIVE）。Windows の timer 分解能では 16〜32 ms になるので、全体で 4〜8 秒程度回る。
+5. 最後のフレームのあとで判定し、**2 秒保持**してから復元する。保持中の画面は、角度 0 の正方形が止まった状態になる。回っている間に動画を撮る。
+6. 復元と照合は D-1 と同じ。途中で止まった場合も、band を map できていれば必ず復元する。
+
+**最後のフレーム（角度 0）の期待画像（整数だけで計算）：**
+- 正方形の隅は整数（2 倍座標で (920, 48)、(1240, 48)、(1240, 208)、(920, 208)）。期待色は V-1 と同じ重みの式で、画素中心が入る方の三角形の 3 隅の色から求める。対角線上ではどちらの三角形でも同じ値になる。
+- 分類（各パリティ。偶数行と奇数行で同じ）：
+  - 正方形の core-in は `461 ≤ 列 ≤ 618` かつ `25 ≤ v ≤ 102` で、**12324** 画素。
+  - 背景の core は `列 ≤ 458` または `列 ≥ 621` または `v ≤ 22` または `v ≥ 105` で、**19484** 画素。期待値は 0xFF202020。
+  - それ以外の 960 画素は辺の上なので判定に使わない。箱の中で合計 32768。
+- 許容誤差は B / G / R の各成分 ±2、X バイトは 0xFF。
+- 標本（偶数行）：
+
+| 列 | v | 行 | 期待値 |
+|---|---|---|---|
+| 540 | 64 | 1200 | 0xFF7F0181（中心） |
+| 463 | 27 | 1126 | 0xFFF9060B（赤の隅付近） |
+| 616 | 27 | 1126 | 0xFF06EE0B（緑の隅付近） |
+| 616 | 100 | 1272 | 0xFF0606F4（青の隅付近） |
+| 463 | 100 | 1272 | 0xFFF9EEF4（白の隅付近） |
+| 500 | 44 | 1160 | 0xFFBE0141 |
+| 580 | 84 | 1240 | 0xFF3F01C1 |
+| 414 | 2 | 1076 | 0xFF202020（背景） |
+| 665 | 125 | 1322 | 0xFF202020（背景） |
+
+**probe：** `EpiGpuProbe2` の bit3 を A-1 とする。A-1 は bit0..2 を必要とし、実行値は Probe 0xBFFFFE80 + Probe2 **15**。許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15} だけ（0 以外は Probe 0xBFFFFE80 のときだけ）。それ以外は status 6。
+
+**判定（Checks）：**
+- bit0：V-1 成功（前段の条件すべて）。
+- bit1：241 フレームすべてが順に fence され、data[25] の最終値が 0xA10000F0。idle、RPTR / WPTR / shadow 2278、エラー割り込みなし。
+- bit2：最後のフレームの後で data[23] = 0xCAFE0015、data[24] = 0xCAFE0016。
+- bit3：最後のフレームで、正方形の core-in が偶数行・奇数行とも 12324 画素すべて許容内。
+- bit4：最後のフレームで、背景の core が両パリティとも 19484 画素すべて許容内。かつ、箱の外の band が退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**診断 `GpuGmuA1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`VChecks`、`VReason`、`Ib[61]` の照合結果（`IbBadCount / IbFirstBad / IbBadValue`）。
+- `FramesDone`（fence まで済んだフレーム数、期待値 241）、`FailFrame`、`FailData25`、`FailRptr`、`FailWptr`（止まった場合）。
+- `FenceMaxUs`（1 フレームの fence 待ちの最大値）、`FenceTotalUs`、`ElapsedMs`（フレーム 0 の投入から最後の fence まで）。時間は `KeQueryInterruptTime` で測る。
+- `SqGoodEven / SqGoodOdd / SqBad / SqFirst / SqValue / SqExpected`、`BgGoodEven / BgGoodOdd / BgBad / BgFirst / BgValue`、`MaxErr[3]`、`OutsideChanged / OutsideFirst / OutsideOld / OutsideNew`。
+- `Sample[18]`：上の 9 標本の偶数行と奇数行の値（標本ごとに偶数、奇数の順）。
+- `DataAfter[3]`（data[23..25]）、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`。
+- `ScanCount / ScanFirst / ScanDwords`：V-1 と同じ走査。除外に、ring packet `off < 2278×4`、`[0x5600, 0x5B80)`、data `[0x7000, 0x7068)` を加える。
+- `RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- breadcrumb は 0x1B00 番台。毎フレームの breadcrumb は flush が重いので書かない。代わりに 16 フレームごとに 0x1B40 + (f/16) を書く。
+
+**危険と対策：**
+- 時間：StartDevice の中で、D-1 の 5 秒、V-1 の 5 秒、A-1 の 4〜8 秒 + 2 秒を足すと、最大で約 20 秒かかる。いままでの保持で問題は出ていないが、長すぎて PnP や dxgkrnl が待ちきれない兆候（start の失敗、bugcheck 0x9F など）が出たら、FRAMES を 120 に減らす。
+- VB の書き換えは、fence を待ってから行う。待ちが上限を超えたときは書き換えず、そのまま止める。こうすれば、GPU が読んでいる途中の VB を CPU が書くことはない。
+- 画面の更新は DPU の autorefresh 任せで、フレームとは同期しない。途中で絵が裂けて見える（tearing）ことがあるが、判定には影響しない。
+- 書き込み先は D-1 / V-1 と同じく scissor で箱に限られる。
+
+**生成器：** scratchpad の `tools/a1ib.py`。IB8 の dword 一覧は `a1_ib8.txt`、表は `a1_table.inc`（C の初期化子 `GmuA1Table[120][12]`、そのまま include できる）。
+
+**この後：** T-1（texture）。A-1 が通れば、texture を貼った正方形を回すこともできる。
+
+#### 9.21.44 v75 の結果（V-1、2026-11-14）：varying で補間した三角形が画面に出た
+
+v75（20.0.2.75、oem133）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=7` で restart-device を 1 回実行した。D-0 は `E1000000 / 1080x2400 / 4320 / 22`。GpuProbeStatus 0、GpuGmuStatus 0、EpiGpuProbeStep 0xFFFF、デバイスは OK。スタックは GpuStackAtCx 0x11F60、GpuStackMin 0x11468。画面には D-1 の正方形のあと、上が赤・左下が緑・右下が青の三角形が出た（目視で確認）。
+
+**GpuGmuV1：**
+- Status 0、Reason 0、**Checks 0x3F**、DChecks 0x3F（D-1 も成功）、Prepared 1、IbBadCount 0。
+- RPTR / WPTR / shadow 100 → **109**、WptrWrites 1、RBBM 1、割り込み・HW_FAULT・CP_INT・PROTECT・STATUS_1 すべて 0、IB1_BASE 0x70015100（残り 0）、MASK 0 / 0 / 0。global fault は前後とも 0。CB の FSR 0x400 / FAR は S-1 以来の古い値で、増えていない。
+- data[20..22] = CAFE0012 / CAFE0013 / CAFE0014。
+- core-in：偶数行 15500、奇数行 15500、不一致 0。**MaxErr は B / G / R とも 0**（許容 ±2 を使わず、整数の期待値と完全に一致）。
+- 標本 6 点は、偶数行・奇数行とも期待値どおり：FF555556、FFF20607、FF07F305、FF0704F4、FF077C7D、FF37A325。
+- edge 画素 3536 のうち、変化 1768、不変 1768（情報のみ）。箱の外と core-out の変化 0。
+- ring 走査 6551 dw で該当 0。保持 5000 ms、復元の不一致 0、Backup / Hold / Restore の Status はすべて 0。
+
+**分かったこと：**
+- TRILIST、VPC の varying 配置（var0 を loc 0..3、位置を loc 4..7）、`bary.f` による重心補間、FS 出力 r1 が、どれも仕様どおりに動いた。
+- GPU の補間と UNORM 変換の結果は、整数で計算した `(510·w + AREA) / (2·AREA)` と全画素で一致した（丸めは最近接）。
+- restart-device はすぐに戻る。probe は start の中で続くので、EpiDiag は EpiGpuProbeStep が 0xFFFF になってから読む。
+
+**次：** A-1（§9.21.43、回る四角）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

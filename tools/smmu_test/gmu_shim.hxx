@@ -105,6 +105,28 @@ static bool allowD1Writes=false,d1Completes=true,d1Odd=true,d1Fences=true,d1Outs
 static bool d1MapFails=false,d1Restoring=false;
 static ULONG d1RestoreDrop=0xFFFFFFFF,d1ErrorBits=0,d1FenceDrops=0,d1Maps=0,d1Unmaps=0;
 static std::vector<ULONG> d1Band(0x120000/4),d1Writes;
+static bool allowV1Writes=false,v1Completes=true,v1Odd=true,v1BadAlpha=false,v1Outside=false,v1CoreOut=false,v1EdgeOnly=false;
+static bool v1FenceForever=false,v1BadRptr=false,v1SaveFails=false;
+static LONG v1Delta[3]={};
+static ULONG v1Fences=7,v1FenceDrops=0,v1ErrorBits=0,v1Scatter=0xFFFFFFFF,v1BadCore=0xFFFFFFFF;
+static std::vector<ULONG> v1Writes;
+// Independent barycentric reference for the peer: generic cross products, not the driver's simplified formula.
+inline LONG V1PeerEdge(LONG ax,LONG ay,LONG bx,LONG by,LONG x,LONG y) {
+    return (bx-ax)*(y-ay)-(by-ay)*(x-ax);
+}
+inline bool V1PeerColor(ULONG col,ULONG row,ULONG* value) {
+    const LONG x=static_cast<LONG>(2*col+1),y=static_cast<LONG>(2*row+1);
+    const LONG w[]={-V1PeerEdge(824,256,1336,256,x,y),-V1PeerEdge(1336,256,1080,0,x,y),-V1PeerEdge(1080,0,824,256,x,y)};
+    if(w[0]<0 || w[1]<0 || w[2]<0) return false;
+    *value=0xFF000000;
+    for(ULONG channel=0;channel<3;++channel) {
+        LONG c=(510*w[2-channel]+131072)/262144+v1Delta[channel];
+        if(c<0) c=0; if(c>255) c=255;
+        *value|=static_cast<ULONG>(c)<<(channel*8);
+    }
+    if(v1BadAlpha) *value&=0x00FFFFFF;
+    return true;
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -153,9 +175,9 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert(allowD1Writes && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
-        ++d1Maps; return d1Band.data();
+        ++d1Maps; d1Restoring=false; return d1Band.data();
     }
     if(a.QuadPart==0x8B110000) { assert(allowZ1Writes && size==0x1000 && protection==(PAGE_READWRITE|PAGE_NOCACHE)); return z1Reserved; }
     if(a.QuadPart==0x03D01000) return hwcgIsdbPage;
@@ -189,6 +211,38 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v==109) {
+        assert(allowG2Writes && allowV1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70BF8003,0x70015100,0,115,0x70460004,4,0x70017058,0,0xCAFE0014};
+        const ULONG fs[32]={0x2000,0x47308B04,0,0x500,0,0x03000000};
+        assert(std::memcmp(g2Ring+100,packet,sizeof(packet))==0 && std::memcmp(g2Ring+0x5400/4,fs,sizeof(fs))==0);
+        assert(g2Ring[0x5100/4+72]==135 && g2Ring[0x5100/4+74]==0x71008A00 && g2Ring[0x5100/4+103]==0x71009AC0);
+        assert(g2Ring[0x5100/4+77]==0x84 && g2Ring[0x5100/4+79]==3 && g2Ring[0x5100/4+106]==0x84);
+        assert(g2Ring[0x5480/4]==0x44070000 && g2Ring[0x5500/4]==0x44090000);
+        g2Writes.push_back({0x807,v}); v1Writes.push_back(v);
+        if(v1FenceForever || v1FenceDrops) {
+            if(v1FenceDrops) --v1FenceDrops;
+            gPages[2][0x313]=1; return;
+        }
+        gPages[2][0x313]=0;
+        *GmuCfgReg(0x928)=0x70015100; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=115;
+        if(v1Completes) {
+            for(ULONG y=1072;y<1328;++y) if(v1Odd || !(y&1)) for(ULONG x=412;x<668;++x) {
+                ULONG color=0; if(V1PeerColor(x,(y-1072)/2,&color)) d1Band[(y*4320+x*4-0x462000)/4]=color;
+            }
+            if(v1BadCore<d1Band.size()) d1Band[v1BadCore]=0;
+            if(v1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+            if(v1CoreOut) d1Band[(1072*4320+412*4-0x462000)/4]^=1;
+            if(v1EdgeOnly) d1Band[(1072*4320+540*4-0x462000)/4]=0x12345678;
+            if(v1Scatter<0x8000) g2Ring[v1Scatter/4]=0xFF123456;
+            if(v1Fences&1) g2Ring[0x7050/4]=0xCAFE0012;
+            if(v1Fences&2) g2Ring[0x7054/4]=0xCAFE0013;
+            if(v1Fences&4) g2Ring[0x7058/4]=0xCAFE0014;
+            *g2Shadow=109; *GmuCfgReg(0x806)=v1BadRptr ? 108 : 109; *GmuCfgReg(0x92A)=0;
+        }
+        gPages[8][0x210]=g2RbbmBusy ? 2 : 1; gPages[8][0x201]=v1ErrorBits|(g2Hang ? (1UL<<23) : 0);
+        gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0; *p=v; return;
+    }
     if(p==GmuCfgReg(0x807) && v==100) {
         assert(allowG2Writes && allowD1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG packet[]={0x70BF8003,0x70014500,0,72,0x70460004,4,0x7001704C,0,0xCAFE0011};
@@ -488,7 +542,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
-        if(v==0x1931) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -500,6 +554,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuV1")==0 && value && size && v1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuZapQuery")==0 && value && size) {
         if(zapQuerySnapshots.size()==failZapQuerySave) {failZapQuerySave=0xFFFFFFFF; return STATUS_IO_DEVICE_ERROR;}
         const UCHAR* p=static_cast<const UCHAR*>(value); zapQuerySnapshots.emplace_back(p,p+size);

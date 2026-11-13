@@ -29,9 +29,10 @@
 #define EPI_GMU_PROBE_S1        0x80000000UL // requires Z-1c (0xBFFFFE80 total); one compute invocation/global store
 #define EPI_GMU_PROBE2_R1      0x1UL // EpiGpuProbe2 bit0, valid only with EpiGpuProbe exactly BFFFFE80
 #define EPI_GMU_PROBE2_D1      0x2UL // requires R1; Probe2=3, external framebuffer band with backup/restore
+#define EPI_GMU_PROBE2_V1      0x4UL // requires R1/D1; Probe2=7, interpolated two-pass triangle
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -323,6 +324,25 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // 1904 submit, 1905 fence, 1906 idle, 1910..191B diagnostics, 1920 global, 1930 hold/save+flush,
 // 1931 restore, 1932 verify. Restore/verify run even if their breadcrumbs cannot be saved.
 
+// GpuGmuV1: 768 bytes; all ULONG / NTSTATUS fields in this exact order:
+// Cp (140-byte G2 layout), DChecks, DReason, Packet[9], Fs[32], VertA[24], VertB[24],
+// IbBadCount, IbFirstBad, IbBadValue, CoreEven, CoreOdd, CoreBad, CoreFirst, CoreValue, CoreExpected,
+// MaxErr[3], EdgeChanged, EdgeSame, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[12],
+// DataBefore[3], DataAfter[3], CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAtSubmit, MaskAfter,
+// ScanCount, ScanFirst, ScanDwords, RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared,
+// BackupStatus, HoldStatus, RestoreStatus. Display metadata is the parent D1 Disp[6].
+// Checks: 1 D1 succeeded/restored, 2 idle/endpoints=109/no errors, 4 data[20..22]=CAFE0012/13/14,
+// 8 all core-in pixels within tolerance (15500 even/odd each), 16 box-exterior/core-out unchanged,
+// 32 exact band restore. Require 3F. RGB tolerance is +/-2; X must be FF. MaxErr order is B/G/R.
+// Sample order: (540,85),(540,6),(420,124),(660,124),(540,124),(476,100), each even then odd;
+// pairs are (screen column, view row); screen y=1072+2*view+parity. Edge counts are information only.
+// CoreFirst/OutsideFirst/RestoreFirst are band byte offsets; IbFirstBad is an IB DWORD index;
+// ScanFirst is a ring byte offset. ScanDwords=6551; predicate is high byte FF except FFFFFFFF.
+// Unrecorded values/absent first matches are FFFFFFFF. Unexecuted statuses are STATUS_NOT_FOUND.
+// Breadcrumbs 1A00..1A32 have the same allocation as D1 1900..1932. Five-second hold and mandatory
+// CPU restore/unmap, including on breadcrumb/GX failure; first failure Reason is preserved.
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -355,7 +375,8 @@ ULONG EpiGmuStackMinimum();
 // Z1: requires G5b Checks=B and blank pixels; direct PAS zap then SET_SECURE_MODE and repeat fill (0x3FFFFE80).
 // S1: requires successful Z-1c; one compute invocation/global store under the same OOB (0xBFFFFE80).
 // R1: EpiGpuProbe2 bit0 with exactly 0xBFFFFE80, after successful S1; private target VS/FS RECTLIST draw.
-// D1: Probe2=3 after R1; external display band map, two draws, 5-second hold and mandatory CPU restore.
+// D1: Probe2 bit1 with R1; external display band map, two draws, 5-second hold and mandatory CPU restore.
+// V1: Probe2=7 after successful D1 restore; integer-checked varying triangle under the same OOB.
 // Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -367,4 +388,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE);

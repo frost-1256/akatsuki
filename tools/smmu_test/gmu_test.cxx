@@ -127,6 +127,9 @@ extern "C" VOID EpiSmcInvoke(EPI_SMC_REGS* r) {
 }
 static void Reset() {
     EpiGmuStackReset(); testRemainingStack=72*1024; testExpandStatus=STATUS_SUCCESS; testExpandCalls=0;
+    allowV1Writes=false; v1Completes=true; v1Odd=true; v1BadAlpha=false; v1Outside=false; v1CoreOut=false; v1EdgeOnly=false;
+    v1FenceForever=false; v1BadRptr=false; v1SaveFails=false; v1Fences=7; v1FenceDrops=0; v1ErrorBits=0; v1Scatter=0xFFFFFFFF; v1BadCore=0xFFFFFFFF;
+    v1Delta[0]=0; v1Delta[1]=0; v1Delta[2]=0; v1Writes.clear();
     allowD1Writes=false; d1Completes=true; d1Odd=true; d1Fences=true; d1Outside=false; d1FenceForever=false;
     d1MapFails=false; d1Restoring=false; d1RestoreDrop=0xFFFFFFFF; d1ErrorBits=0; d1FenceDrops=0;
     d1Maps=0; d1Unmaps=0; d1Writes.clear();
@@ -193,7 +196,7 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false,BOOLEAN d1=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false,BOOLEAN d1=false,BOOLEAN v1=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
     allowG4Writes=g4;
@@ -201,11 +204,11 @@ static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
     allowG5bWrites=g5b;
     allowZ1Writes=z1; const auto zap=ZapImage();
     allowS1Writes=s1;
-    allowR1Writes=r1; allowD1Writes=d1;
+    allowR1Writes=r1; allowD1Writes=d1; allowV1Writes=v1;
     const ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1,d1,d1 ? disp : nullptr);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1,d1,d1 ? disp : nullptr,v1);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -219,13 +222,29 @@ int main(int argc,char** argv) {
     // Probe2 is optional, but R-1 must have exactly the full S-1 value and no unknown bits.
     assert(EpiGmuProbe2Valid(0,0) && EpiGmuProbe2Valid(0x80,0) && EpiGmuProbe2Valid(0xBFFFFE80,1));
     for(ULONG invalid:{0UL,0x3FFFFE80UL,0x80000000UL,0xFFFFFF80UL}) assert(!EpiGmuProbe2Valid(invalid,1));
-    for(ULONG invalid:{2UL,4UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{2UL,4UL,5UL,6UL,8UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
     assert(EpiGmuProbe2Valid(0xBFFFFE80,3) && !EpiGmuProbe2Valid(0x3FFFFE80,3));
     {
         ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
         assert(EpiGmuD1DisplayMatches(disp)); disp[5]=22; assert(EpiGmuD1DisplayMatches(disp));
         for(ULONG i=0;i<6;++i) {const ULONG v=disp[i]; disp[i]=0xFFFFFFFF; assert(!EpiGmuD1DisplayMatches(disp)); disp[i]=v;}
         assert(!EpiGmuD1DisplayMatches(nullptr));
+    }
+    assert(EpiGmuProbe2Valid(0xBFFFFE80,7) && !EpiGmuProbe2Valid(0x3FFFFE80,7));
+    // Integer edge classification and six documented sample expectations, independent of the GPU peer.
+    {
+        ULONG count[3]={};
+        for(ULONG row=0;row<128;++row) for(ULONG col=412;col<668;++col) ++count[GmuV1Classify(col,row)];
+        assert(count[V1_CORE_IN]==15500 && count[V1_CORE_OUT]==15500 && count[V1_EDGE]==1768);
+        const ULONG sample[][3]={{540,85,0xFF555556},{540,6,0xFFF20607},{420,124,0xFF07F305},
+            {660,124,0xFF0704F4},{540,124,0xFF077C7D},{476,100,0xFF37A325}};
+        for(const auto& pt:sample) {
+            assert(GmuV1Classify(pt[0],pt[1])==V1_CORE_IN && GmuV1Expected(pt[0],pt[1])==pt[2]);
+        }
+        ULONG maxErr[3]={};
+        assert(GmuV1WithinTolerance(0xFF535754,0xFF555556,maxErr) && maxErr[0]==2 && maxErr[1]==2 && maxErr[2]==2);
+        assert(!GmuV1WithinTolerance(0xFF555559,0xFF555556,maxErr) && maxErr[0]==3);
+        assert(!GmuV1WithinTolerance(0xFE555556,0xFF555556,maxErr));
     }
     // Z-1b: only read-only SMCs; independent of ZapOnce and every GPU power/memory prerequisite.
     {
@@ -1571,6 +1590,113 @@ int main(int argc,char** argv) {
             seedD1(); d1=d1Trace(); d1FenceForever=true;
             assert(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))==STATUS_IO_TIMEOUT);
             assert(d1.Cp.Reason==10 && d1.Cp.WptrWrites==201 && d1Band==bandBefore && d1Unmaps==1);
+            // V-1 re-backs-up the restored band and runs only after successful D-1.
+            const auto seedV1=[&]() {
+                seedD1(); allowV1Writes=true; v1Completes=true; v1Odd=true; v1BadAlpha=false; v1Outside=false;
+                v1CoreOut=false; v1EdgeOnly=false; v1FenceForever=false; v1BadRptr=false; v1SaveFails=false;
+                v1Delta[0]=0; v1Delta[1]=0; v1Delta[2]=0; v1Fences=7; v1FenceDrops=0; v1ErrorBits=0;
+                v1Scatter=0xFFFFFFFF; v1BadCore=0xFFFFFFFF; v1Writes.clear();
+                std::memcpy(cpRing.data()+0x4500/4,GmuD1Ib,sizeof(GmuD1Ib));
+                std::memcpy(cpRing.data()+0x4A00/4,GmuD1Fs,sizeof(GmuD1Fs));
+                std::memcpy(cpRing.data()+0x4A80/4,GmuD1VertA,sizeof(GmuD1VertA));
+                std::memcpy(cpRing.data()+0x4AA0/4,GmuD1VertB,sizeof(GmuD1VertB));
+                std::memcpy(cpRing.data()+91,GmuD1Packet,sizeof(GmuD1Packet));
+                cpShadow[0]=100; *GmuCfgReg(0x806)=100; *GmuCfgReg(0x807)=100;
+                cpRing[0x7044/4]=0xCAFE000F; cpRing[0x7048/4]=0xCAFE0010; cpRing[0x704C/4]=0xCAFE0011;
+                GmuD1TraceInit(&d1,disp); d1.Cp.Status=0; d1.Cp.Reason=0; d1.Checks=0x3F;
+                d1.Cp.WptrAfter=100; d1.DataAfter[0]=0xCAFE000F; d1.DataAfter[1]=0xCAFE0010;
+                d1.DataAfter[2]=0xCAFE0011; d1.RestoreMismatch=0; d1.RestoreStatus=0;
+            };
+            GMU_V1_TRACE v1;
+            const auto initV1=[&]() {GmuV1TraceInit(&v1); v1.DChecks=d1.Checks; v1.DReason=d1.Cp.Reason; v1.Checks=1;};
+            const auto submitV1=[&]() {return GmuV1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&v1,reinterpret_cast<HANDLE>(2),&d1);};
+            seedV1(); initV1(); assert(GmuV1CanFollow(&d1) && submitV1()==0);
+            assert(v1.Checks==0x3F && v1.Cp.Reason==0 && v1.Cp.WptrAfter==109 && v1.Cp.ShadowAfter==109 && v1.Cp.Rptr==109);
+            assert(v1.CoreEven==15500 && v1.CoreOdd==15500 && v1.CoreBad==0 && v1.OutsideChanged==0);
+            assert(v1.MaxErr[0]==0 && v1.MaxErr[1]==0 && v1.MaxErr[2]==0 && v1.EdgeChanged+v1.EdgeSame==3536);
+            assert(v1.HoldMs==5000 && v1.RestoreMismatch==0 && v1.RestoreStatus==0 && d1Band==bandBefore);
+            assert(v1.ScanDwords==6551 && v1.ScanCount==0 && v1.IbBadCount==0 && d1Maps==1 && d1Unmaps==1 && allocations.size()==poolBefore);
+            const ULONG samples[]={0xFF555556,0xFFF20607,0xFF07F305,0xFF0704F4,0xFF077C7D,0xFF37A325};
+            for(ULONG i=0;i<6;++i) assert(v1.Sample[i*2]==samples[i] && v1.Sample[i*2+1]==samples[i]);
+            for(ULONG bad=0;bad<8;++bad) {
+                seedV1();
+                if(bad==0) d1.Cp.Status=STATUS_IO_DEVICE_ERROR;
+                if(bad==1) d1.Cp.Reason=13;
+                if(bad==2) d1.Checks&=~32UL;
+                if(bad==3) d1.Cp.WptrAfter=99;
+                if(bad==4) d1.DataAfter[0]=0;
+                if(bad==5) d1.DataAfter[2]=0;
+                if(bad==6) d1.RestoreMismatch=1;
+                if(bad==7) d1.RestoreStatus=STATUS_IO_DEVICE_ERROR;
+                assert(!GmuV1CanFollow(&d1));
+            }
+            for(LONG delta:{-2L,2L,3L}) {
+                seedV1(); initV1(); v1Delta[0]=delta; v1Delta[1]=delta; v1Delta[2]=delta;
+                const NTSTATUS result=submitV1();
+                if(delta==3) {assert(result==STATUS_IO_DEVICE_ERROR && !(v1.Checks&8) && v1.CoreBad && v1.MaxErr[0]==3);}
+                else {assert(result==0 && v1.Checks==0x3F && v1.MaxErr[0]==2 && v1.MaxErr[1]==2 && v1.MaxErr[2]==2);}
+                assert(d1Band==bandBefore && d1Unmaps==1);
+            }
+            seedV1(); initV1(); v1EdgeOnly=true;
+            assert(submitV1()==0 && v1.Checks==0x3F && v1.OutsideChanged==0 && v1.EdgeChanged>0);
+            for(ULONG bad=0;bad<9;++bad) {
+                seedV1(); initV1();
+                if(bad==0) v1Odd=false;
+                if(bad==1) v1Outside=true;
+                if(bad==2) v1CoreOut=true;
+                if(bad==3) v1BadAlpha=true;
+                if(bad==4) v1Fences=6;
+                if(bad==5) v1BadCore=(1242*4320+540*4-0x462000)/4;
+                if(bad==6) v1BadRptr=true;
+                if(bad==7) v1Completes=false;
+                if(bad==8) v1ErrorBits=1UL<<9;
+                assert(!NT_SUCCESS(submitV1()) && v1.RestoreMismatch==0 && d1Band==bandBefore && d1Unmaps==1);
+                assert(allocations.size()==poolBefore);
+                if(bad==7) assert(v1.Cp.Reason==9);
+                if(bad==8) assert(v1.Cp.Reason==14);
+            }
+            for(ULONG off:{0x5100UL,0x5400UL,0x5480UL,0x5500UL,400UL}) {
+                seedV1(); initV1(); r1CopyTarget=cpRing.data()+off/4; r1CopyBadDword=3;
+                assert(submitV1()==STATUS_IO_DEVICE_ERROR && v1Writes.empty() && v1.RestoreMismatch==0 && d1Band==bandBefore);
+                if(off==0x5100) assert(v1.IbBadCount==1 && v1.IbFirstBad==3);
+            }
+            for(ULONG step:{0x1A00UL,0x1A01UL,0x1A02UL,0x1A08UL,0x1A03UL,0x1A04UL,0x1A05UL,0x1A06UL,
+                            0x1A10UL,0x1A1BUL,0x1A20UL,0x1A30UL,0x1A31UL,0x1A32UL}) {
+                seedV1(); initV1(); failGmuStep=step;
+                assert(submitV1()==STATUS_IO_DEVICE_ERROR && d1Band==bandBefore && allocations.size()==poolBefore);
+                if(d1Maps) assert(d1Unmaps==1 && v1.RestoreMismatch==0);
+            }
+            seedV1(); initV1(); v1Completes=false; failGmuStep=0x1A20;
+            assert(submitV1()==STATUS_IO_TIMEOUT && v1.Cp.Reason==9 && d1Band==bandBefore);
+            seedV1(); initV1(); dropGxAtStep=0x1A10;
+            assert(submitV1()==STATUS_INVALID_DEVICE_STATE && v1.RestoreMismatch==0 && d1Band==bandBefore && d1Unmaps==1);
+            seedV1(); initV1(); v1SaveFails=true;
+            assert(submitV1()==STATUS_IO_DEVICE_ERROR && v1.HoldMs==0 && v1.Cp.Reason==6 && d1Band==bandBefore);
+            seedV1(); initV1(); d1RestoreDrop=(1242*4320+540*4-0x462000)/4;
+            assert(submitV1()==STATUS_IO_DEVICE_ERROR && v1.RestoreMismatch==1 && !(v1.Checks&32) && d1Unmaps==1);
+            for(ULONG off:{0x52CCUL,0x53FCUL,0x5560UL,0x705CUL,0x50FCUL}) {
+                seedV1(); initV1(); v1Scatter=off;
+                assert(submitV1()==0 && v1.ScanCount==1 && v1.ScanFirst==off && d1Band==bandBefore);
+            }
+            for(ULONG bad=0;bad<10;++bad) {
+                seedV1(); initV1();
+                if(bad==0) cpRing[91]=0;
+                if(bad==1) cpRing[0x4500/4]=0;
+                if(bad==2) cpRing[0x4A00/4]=1;
+                if(bad==3) cpRing[0x4A80/4]=0;
+                if(bad==4) cpRing[0x7044/4]=0;
+                if(bad==5) cpShadow[0]=99;
+                if(bad==6) probe.Regions[3].Mapped=false;
+                if(bad==7) *GmuCfgReg(0x38)=1;
+                if(bad==8) d1MapFails=true;
+                if(bad==9) failAfter=0;
+                assert(!NT_SUCCESS(submitV1()) && v1Writes.empty() && d1Maps==0 && allocations.size()==poolBefore);
+            }
+            seedV1(); initV1(); v1FenceDrops=3;
+            assert(submitV1()==0 && v1.Cp.WptrWrites==4 && d1Band==bandBefore);
+            seedV1(); initV1(); v1FenceForever=true;
+            assert(submitV1()==STATUS_IO_TIMEOUT && v1.Cp.Reason==10 && v1.Cp.WptrWrites==201 && d1Band==bandBefore);
+            allowV1Writes=false;
             allowD1Writes=false; failAfter=-1;
             r1CopyTarget=nullptr; r1CopyBadDword=0xFFFFFFFF; allowR1Writes=false;
             allowS1Writes=false;
@@ -1901,6 +2027,23 @@ int main(int argc,char** argv) {
         GMU_REGION* ext=GmuFind(g_KeptGmu,0x71000000,0x120000);
         assert(ext && ext->External && ext->Mapped && !ext->Va && ext->Pa.QuadPart==0xE1462000);
         assert(d1Band==original && d1Unmaps==1); ClearQuarantine(); Reset();
+    }
+    // Full V-1 follows D-1 restore under one OOB lease, with no extra SMMU map requests.
+    {
+        const auto sqe=SqeImage();
+        Reset(); g5Fill=false; g5bFill=false; const auto original=d1Band;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(v1Writes.size()==1 && testMaps.size()==12 && d1Maps==2 && d1Unmaps==2 && d1Band==original);
+        assert(g2Writes.back().second==109);
+        Reset(); g5Fill=false; g5bFill=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true)==0 && v1Writes.empty() && d1Maps==1);
+        Reset(); g5Fill=false; g5bFill=false; d1Odd=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_CP && !keep && v1Writes.empty());
+        Reset(); g5Fill=false; g5bFill=false; g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep);
+        assert(d1Band==original && d1Maps==2 && d1Unmaps==2);
+        GMU_REGION* ext=GmuFind(g_KeptGmu,0x71000000,0x120000);
+        assert(ext && ext->External && ext->Mapped && !ext->Va); ClearQuarantine(); Reset();
     }
     std::puts("GMU tests passed: firmware regions, synthetic/real image load, allocation failures, boot timeout, reset and SMMU teardown quarantine.");
 }
