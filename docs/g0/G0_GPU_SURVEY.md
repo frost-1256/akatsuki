@@ -3003,6 +3003,105 @@ shim と試験ケースに、G-5 の Checks=0x17 からの正常続行、4条件
   1. zap shader を読み込んで `CP_SET_SECURE_MODE 0` を送る道（§9.20.5）。TZ の PAS（SCM）を呼ぶ手段が要る。qcscm を戻すか、自前の SCM 呼び出しを作るかを決める必要がある。
   2. その前に、残りの magic レジスタを全部書く G-5c で、候補 2 を完全に消しておく道。安くて安全だが、効く見込みは低い [I]。
 
+#### 9.21.23 zap shader の調査と Z-1 の提案（文章仕様、未実装）
+
+ユーザーの判断で 1（zap）に進む。この節は調査と仕様だけで、コードは書いていない。
+
+**Linux の手順**（master：`a6xx_gpu.c` の `hw_init`、`adreno_gpu.c` の `zap_shader_load_mdt`、`soc/qcom/mdt_loader.c`、`firmware/qcom/qcom_scm.c`、`qcom_scm-smc.c`、`qcom_scm.h`）
+1. `a6xx_cp_init`（ME_INIT）が終わって idle になった後、GX が入ったまま `a6xx_zap_shader_init` を呼ぶ。1 回の起動で 1 回だけ（`static bool loaded`）。
+2. `qcom_mdt_load`：
+   1. メタデータ（ELF ヘッダ＋ハッシュのセグメント）を、物理的に連続で 4 KB 境界、キャッシュなしのバッファに置く。
+   2. SCM `PAS_INIT_IMAGE(13, メタデータの物理アドレス)` を呼ぶ。
+   3. 再配置できる（relocatable）イメージなら、`PAS_MEM_SETUP(13, 読み込み先, サイズ)` を呼ぶ。
+   4. PT_LOAD のセグメントを、読み込み先にコピーする。
+3. `qcom_pas_auth_and_reset(13)`：TZ がイメージを検証し、GPU の secure 側を設定する [I]。
+4. 成功したら、ring で `CP_SET_SECURE_MODE`（0x70E60001、本体 0）を送って idle を待つ。zap がない端末だけ、代わりに 0xF400 を 0 にする（Epinephrine では禁止のまま）。
+
+**SCM の呼び出し形式**（SMCCC、SiP、64 ビット、std call）
+- x0 ＝ 0x42000000 ｜ (svc << 8) ｜ cmd、x1 ＝ arginfo、x2..x5 ＝ 引数、x6 ＝ 0、x7 ＝ 0。
+- 戻り値：x0 ＝ 0 なら成功（負なら SCM のエラー）、x1..x3 ＝ 結果。PAS の呼び出しは、x0 が 0 で x1 も 0 のときだけ成功とみなす。
+- arginfo ＝ 引数の数 ｜ (型 << (4 + 2×i))。型は VAL＝0、RO＝1、RW＝2。
+
+  | 呼び出し | x0 | x1（arginfo） | 引数 |
+  |---|---|---|---|
+  | PAS_IS_SUPPORTED | 0x42000207 | 0x01 | 13 |
+  | PAS_INIT_IMAGE | 0x42000201 | **0x82**（VAL, RW） | 13、メタデータの物理アドレス |
+  | PAS_MEM_SETUP | 0x42000202 | 0x03 | 13、読み込み先の物理アドレス、サイズ |
+  | PAS_AUTH_AND_RESET | 0x42000205 | 0x01 | 13 |
+
+- やり直しの規則（`qcom_scm-smc.c`）：
+  - x0 ＝ 1（INTERRUPTED）：x0 ＝ 1、x6 ＝ 返ってきた x6（セッション ID）、ほかの引数は同じで、もう一度 SMC する。
+  - x0 ＝ −12（V2_EBUSY）：30 ms 待って、最初から同じ呼び出しをやり直す。最大 20 回。
+  - x0 ＝ 2（WAITQ_SLEEP）：新しい TZ だけの仕組み。この端末で出たら、失敗として止める。
+- Linux は呼び出しの前後に、暗号エンジンの帯域（interconnect）を投票している。Windows では、これを同じようには行えない [U]。TZ が自分で投票していれば問題ない。
+
+**ファームウェア**（`stock-rom/vx/firmware/`。Nothing の署名なので、この端末の TZ で検証が通るはず [I]）
+- `a660_zap.elf`（14264 B、SHA-256 ADB53DED…87965D6E0）を 1 つだけ使う。`.mdt`（6708 B）＝`.b00`＋`.b01`、`.b01` と `.b02` は `.elf` の 0x1000 と 0x3000 にある中身と同じことを確かめた。
+- プログラムヘッダは 3 つ：
+  | # | type | ファイル上の位置 | paddr | filesz／memsz | flags | 意味 |
+  |---|---|---|---|---|---|---|
+  | 0 | NULL | 0 | 0 | 0x94／0 | 0x07000000 | ELF ヘッダ |
+  | 1 | NULL | 0x1000 | 0x6000 | 0x19A0／0x2000 | 0x02200000 | ハッシュのセグメント（flags & 0x07000000 ＝ 0x02000000） |
+  | 2 | LOAD | 0x3000 | 0x5000 | 0x7B8／0x7B8 | **0x08000007** | 本体。bit27 ＝ **relocatable** |
+- メタデータ ＝ `.elf` の [0, 0x94) ＋ [0x1000, 0x29A0)、合計 0x1A34（6708）B。
+- relocatable なので、`MEM_SETUP` のサイズは ALIGN(0x5000＋0x7B8, 4K) − 0x5000 ＝ **0x1000**。セグメントは読み込み先の先頭（オフセット 0）に 0x7B8 B をコピーする。
+
+**読み込み先：Linux の 0x8B71A000 は使わない**
+- Linux の DT（`kodiak.dtsi`）は `gpu_zap_mem: zap@8b71a000`（0x2000）を使う。
+- しかしこの端末の Windows では、PIL ドライバ（qcPILC、`ACPI\QCOM06E0`）の `SubsystemLoad\DHMS` が 0x8B200000..0x8B7FFFFF を使っている。0x8B71A000 はその中にある。書けば DHMS を壊す恐れがある。
+- 代わりに、同じ設定にある **`SubsystemLoad\GFXSUC`（0x8B110000、0x5000、境界 0x1000）** を使う。これは Windows で GPU の secure microcode（zap）のために取ってある場所で、qcdx を入れていない今は使われていない [I]。イメージは relocatable なので、場所は `MEM_SETUP` で TZ に伝わる。
+- [U] `PilConfig\HypProtectionEnabled` ＝ 1。この場所が HLOS（Windows）から書ける状態かどうかはわからない。書けなければ、CPU のコピーが例外になり、端末が bugcheck する恐れがある（再起動で戻る）。
+
+**Windows の状況**
+- `HypervisorPresent` は False。Windows は EL1 で動いている。
+- qcPILC、qcPILFC、qcsubsys、QcTrEE に加えて、**qcscm、qcsecapp、QCRPEN も Running になっている**。メモリには「この 3 つは入れない」という 2026-11-07 の記録があるので、いつ戻ったのかをユーザーに確かめたい。
+- qcscm が SCM の呼び出しを直列化しているはずなので、Epinephrine が自分で SMC すると、別の CPU からの呼び出しと重なることがある。TZ はそのとき EBUSY を返すので、上のやり直しの規則で扱う [I]。
+
+**SMC の出し方**
+- MSVC には `smc` の intrinsic がない。armasm64 の .asm に、x0..x7 を構造体から読んで `smc #0` を実行し、x0..x3 と x6 を書き戻す関数を 1 つ置く。vcxproj に MARMASM のビルド規則を足す必要がある。
+- PASSIVE_LEVEL で呼ぶ。std call は時間がかかることがある（ハッシュの検証）。
+
+**Z-1 の提案（bit29、0x3FFFFE80。G-5b の後に置く）**
+- 前提：G-5b まで（G-5b の Checks ＝ 0xB と、画素が全部 0xFFFFFFFF のままであることを含む）。
+- 置く場所：G-5b の後、同じ OOB の中。TZ の GPU の reset が GPU のレジスタを触るので、GX が入っている間に行う [I]。
+- 手順：
+  1. `C:\Epinephrine\fw\a660_zap.elf` を読む（SQE と同じ仕組み）。サイズ 14264 と、上のプログラムヘッダの値がすべて一致することを確かめる。
+  2. `PAS_IS_SUPPORTED(13)`。x0 ＝ 0 かつ x1 ＝ 1 でなければ止める。
+  3. メタデータ用に、連続で 4 KB 境界、キャッシュなしのバッファ（2 ページ）を取り、6708 B をコピーする。
+  4. `PAS_INIT_IMAGE(13, そのバッファの物理アドレス)`。
+  5. `PAS_MEM_SETUP(13, 0x8B110000, 0x1000)`。
+  6. 0x8B110000 の 1 ページを、キャッシュなしでマップする。`.elf` の 0x3000 から 0x7B8 B をコピーし、残りは 0 で埋める。バリアを入れてからマップを外す。
+  7. `PAS_AUTH_AND_RESET(13)`。
+  8. メタデータのバッファを解放する。
+  9. 2〜7 のどれかが失敗したら、`CP_SET_SECURE_MODE` は送らない。そのまま後片付けへ進む。一度でも INIT_IMAGE が成功していたら、TZ に状態が残るので、同じ起動の中で Z-1 をやり直さない。
+  10. すべて成功したら、ring（dword 61..）に次を置く。
+      - `CP_SET_SECURE_MODE`：0x70E60001、0。
+      - `WAIT_FOR_IDLE`：0x70268000。
+      - `INDIRECT_BUFFER`：0x70BF8003、0x70016100、0、36（G-5 の IB2 をもう一度）。
+      - `EVENT_WRITE` CACHE_FLUSH_TS：0x70460004、4、0x70017034（データ[13]）、0、0xCAFE000B。
+      - 合計 12 dword で、WPTR は 73。
+  11. G-5 と同じく、fence 待ちと idle 待ちをする。
+- 記録する項目：
+  - SCM の呼び出しごとに、x0、x1、x2、x3、やり直しの回数（INTERRUPTED と EBUSY を別に）。
+  - ファイルのサイズと、確かめたヘッダの値。メタデータの物理アドレス。
+  - 0x8B110000 にコピーした後の先頭 4 dword を読み返した値。
+  - G-5 と同じ項目（画素、番兵、データ[12..13]、レジスタ、FSR、global fault）。
+- 成功の条件（Checks）：
+  - bit0：4 つの SCM 呼び出しがすべて成功。
+  - bit1：RPTR／WPTR／shadow が 73 で、エラーがない。
+  - bit2：データ[13] ＝ 0xCAFE000B。
+  - bit3：256 画素がすべて 0x78563412。
+  - bit4：番兵が不変。
+  - 全成功は 0x1F。
+- 読み方 [I]：
+  - bit0 だけが立たない：TZ が拒否した。どの呼び出しで、どのエラーかを見る。INIT_IMAGE で失敗なら署名かメタデータ、MEM_SETUP なら場所、AUTH なら帯域かイメージを疑う。
+  - SCM が成功して、bit3 も立った：secure mode が原因だったことが確定する。
+  - SCM が成功したのに、画素が出ない：secure mode 以外の原因がまだある（SP 側の magic レジスタなど）。
+- 危険：
+  - 0x8B110000 への書き込みが hyp に止められれば、bugcheck になる（再起動で戻る）。
+  - TZ の中で何かが壊れても、再起動で元に戻ると考えられる。ただし RPMB などの secure storage には触れない呼び出しだけを使う。
+  - 0xF400 は、この段階でも読み書きしない。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
