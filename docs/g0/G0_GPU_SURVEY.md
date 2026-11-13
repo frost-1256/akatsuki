@@ -2630,6 +2630,183 @@ shim とホスト試験ケースを追加した。IB の内容と ring の呼び
   2. 描画やコンピュートの準備。必要なものが多いので、Linux の調査から始める。
      - 例：シェーダの投入、`CP_SET_MARKER`、CCU の invalidate、ビンの設定。
 
+#### 9.21.16 割り込みの準備：GPU の vector と ISR の設計（文章仕様、未実装）
+
+**GPU の割り込み線**
+- v32 系 DSDT の GPU0 `_CRS` には割り込みが 3 本あり、すべて Level／ActiveHigh／Exclusive。
+- RESI の名前の並びから、Resources の順番との対応は次のとおり。
+
+  | 順番 | GSIV | 名前 | 出どころ |
+  |---|---|---|---|
+  | 1 本目 | 0x73（SPI 83） | VSYNC_INTERRUPT | MDSS。今の HW VSync（EpiHwVsync=1）が使っている |
+  | 2 本目 | **0x14C（SPI 300）** | **GFX_INTERRUPT** | **Adreno（RBBM）** |
+  | 3 本目 | 0xCE | VIDC_INTERRUPT | ビデオ。使わない |
+
+- SPI 300 は Linux の `kodiak.dtsi` にある gpu ノードの `interrupts = <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH>` と一致する。
+- 今の `InterruptRoutine`（bdd.cxx:891）は、MessageNumber を見ずに `EpiVsyncIsr` の結果だけを返す。
+- 今は RBBM_INT_0_MASK が 0 のままなので、SPI 300 がアサートされることはない。G-3c／G-4 で IRQ 付きのイベントを出したときも、立ったのは raw status（`GMU_RBBM_INT_UNMASKED_STATUS` 0x23B15）だけだった。
+
+**わかっていないこと**
+- [U] dxgkrnl が DOD の 2 本目以降の line 割り込みにも ISR をつなぐかどうか。
+- [U] line 割り込みのとき MessageNumber が何になるか（0 になると思われる）。
+- このため ISR は、MessageNumber で区別せずに、VSync と GPU の両方を毎回調べる作りにする。
+- [U] `DxgkCbSynchronizeExecution` が 2 本目の割り込みとも同期をとるかどうか。とらない場合は、arm／disarm を GPU レジスタの操作の順番で安全にする必要がある（下の「disarm」を参照）。I-1 の試験でこれも確かめる。
+
+**危険**
+- line は level 割り込みである。ソースを unmask したのに誰も CLEAR しないと、割り込みが鳴りっぱなしになり、端末が固まる。
+- GX が切れている状態で GX のレジスタ（0x201 など）を読むと、バスが止まる恐れがある。
+
+**ISR の設計（文章仕様。実装はユーザー）**
+- 状態（nonpaged、デバイス拡張に置く）：
+  - `Armed`（BOOLEAN）：GX が入っていて、GPU の MMIO がマップ済みで、MASK を書いた後だけ TRUE。
+  - `Mask`：今 unmask しているビット。
+  - `Count`：claim した回数。
+  - `Pending`：まだ DPC が処理していない status の OR。
+  - `LastStatus`。
+  - `StormTrip`：鳴りっぱなし対策が働いたかどうか。
+- ISR の流れ：
+  1. まず VSync 側を調べる（今の `EpiVsyncIsr`）。結果は覚えておくが、ここで return はしない。
+  2. `Armed` が FALSE なら GPU のレジスタには触らず、VSync の結果を返す。
+  3. `Armed` が TRUE なら RBBM_INT_0_STATUS（0x201）を読む。0x201 は masked status なので、unmask したビットしか出てこない。
+  4. 値が 0 なら GPU の割り込みではない。VSync の結果を返す。
+  5. 0 でなければ RBBM_INT_CLEAR_CMD（0x37）に同じ値を書く。そのあと `Pending |= status`、`LastStatus = status`、`Count++` として、DPC をキューする。DPC は VSync と共通の `DxgkCbQueueDpc` を使い、DPC の中で両方を処理する。
+  6. 鳴りっぱなし対策：`Count` が上限（試験では 64）を超えたら、ISR の中で MASK（0x38）に 0 を書く。そして `Armed` を FALSE、`StormTrip` を TRUE にする。
+  7. TRUE を返す。
+  - Linux の `a6xx_irq` も同じ順番で、status を読んで CLEAR_CMD に同じ値を書き、そのあとビットごとに処理する。
+  - Linux は status を読む前に GMU の keepalive に投票している。これは IFPC で GX が勝手に落ちる場合のためのものである。今の Epinephrine は試験の間ずっと GX を入れたままで、IFPC もないので、keepalive は要らない [I]。IFPC を入れるときに追加する。
+- arm の手順（PASSIVE で、GX が入っている間）：
+  1. CLEAR_CMD に、unmask する予定のビットを書く。これで、前の段階で残った raw status（G-3c／G-4 の bit20）を消す。
+  2. `GMU_RBBM_INT_UNMASKED_STATUS` を読み、そのビットが 0 になったことを確かめる。0 にならなければ arm しない。
+  3. SynchronizeExecution の中で `Armed=TRUE`、`Mask=…` とし、MASK（0x38）に書く。
+- disarm の手順（GX を切る前、CP を止める前、MMIO のマップを外す前に必ず行う。失敗の経路でも行う）：
+  1. MASK（0x38）に 0 を書く。これで新しいアサートが起きなくなる。
+  2. CLEAR_CMD に 0xFFFFFFFF を書く。
+  3. SynchronizeExecution の中で `Armed=FALSE` とする。ここを抜けた後は、ISR が GPU のレジスタを読むことはない。
+  4. 2 本目の割り込みとは同期がとれない場合に備えて、最初に MASK を 0 にしておく。そうすれば、ISR が走っていても 0x201 が 0 を読むだけになる。マップを外すのは、さらに `KeFlushQueuedDpcs` を呼んだ後にする。
+- 対象ビット：最初は bit20（CP_CACHE_FLUSH_TS）だけにする。
+  - Linux は 1, 6, 9, 13, 14, 15, 20, 22, 23, 24, 25 を unmask している。
+  - エラーのビット（CP_HW_ERROR、CP_AHB_ERROR、UCHE_OOB など）は、DPC がそれを処理できるようになってから足す。
+
+**I-1 の試験の提案（bit28、0x1FFFFE80。G-5 の後に置く。G-5 より先にする場合は bit27）**
+- 前提：
+  - G-4 まで（G-5 を先にする場合は G-5 まで）成功していること。
+  - データ[12] = 0xFFFFFFFF であること。CPU が先に書いておく。
+- 手順：
+  1. 上の arm の手順で、bit20（0x00100000）だけを unmask する。
+  2. ring に `EVENT_WRITE`（CACHE_FLUSH_TS | IRQ）を 5 dword 置く。
+     - 内容：0x70460004、0x80000004、0x70017030（データ[12]）、0、0xCAFE000A。
+     - G-5 の後なら ring の dword 48..52 で、WPTR は 53 になる。
+  3. WPTR を進める。
+  4. `Count` が 1 以上になるまで待つ。PASSIVE で 1 ms ずつ、最大 100 ms。
+  5. disarm の手順で disarm する。
+- 記録する項目：
+  - `Count`、`LastStatus`、`StormTrip`。
+  - データ[12]。
+  - 試験の前と後の 0x201 と 0x23B15。
+  - RPTR／WPTR。
+  - MASK の前／arm 後／disarm 後。
+- 成功の条件：
+  - `Count` が 1 以上 4 以下。
+  - `LastStatus` に bit20 がある。
+  - `StormTrip` が FALSE。
+  - データ[12] が 0xCAFE000A。
+  - disarm の後、0x201 が 0 で、0x23B15 の bit20 も 0。
+- `Count` が 0 のままで、0x23B15 の bit20 が 1 のとき：dxgkrnl が 2 本目の線に ISR をつないでいない可能性がある。MASK を 0 に戻せば線は下がるので、危険はない。その場合は、次に `DXGK_INTERRUPT_TYPE` 側か、自分で `IoConnectInterruptEx` する方法を調べる [U]。
+
+#### 9.21.17 描画・コンピュートの調査と G-5 の提案：2D の単色塗りつぶし（文章仕様、未実装）
+
+**比べた候補**
+| 候補 | 必要なもの | 判断 |
+|---|---|---|
+| コンピュート（`CP_EXEC_CS`） | ir3 のシェーダバイナリ、SP／HLSQ の状態、定数、UAV の設定。turnip の `tu6_init_hw` の SP／HLSQ 部分（tu_cmd_buffer.c の 716〜823 行）も要る | 大きい。後回し |
+| 3D の draw | 上に加えて VS／FS、VFD、VPC、GRAS、RB の状態、ビンの設定 | もっと大きい |
+| **2D ブリット（`CP_BLIT`）の単色塗りつぶし** | シェーダは要らない。RB_2D／GRAS_2D の十数個のレジスタと CCU の設定だけ | **最初の描画にちょうどよい** |
+
+- turnip は `vkCmdClearColorImage` の一部を、この 2D エンジン（`r2d_*`）で行っている。
+- 出典：Mesa の `src/freedreno/vulkan/tu_clear_blit.c`（`r2d_setup_common`、`r2d_dst_buffer`、`r2d_clear_value`、`r2d_coords`、`r2d_run`）、`tu_cmd_buffer.c`（`tu_emit_cache_flush_ccu`、`tu6_init_hw`）、`registers/adreno/a6xx.xml` と `adreno_pm4.xml`。取得元は Chromium のミラー（古い main）。
+
+**turnip の手順（sysmem に直接描く場合）**
+1. CCU を sysmem（bypass）モードにする（`tu_emit_cache_flush_ccu`）。
+   - CCU の状態が変わるときは、COLOR／DEPTH を flush し（PC_CCU_FLUSH_COLOR_TS 29、PC_CCU_FLUSH_DEPTH_TS 28）、invalidate し（PC_CCU_INVALIDATE_COLOR 25、PC_CCU_INVALIDATE_DEPTH 24）、WFI してから RB_CCU_CNTL（0x8E07）を書く。
+   - RB_CCU_CNTL の OFFSET はビット 23..31 で、バイト数を 12 ビット右にずらした値を入れる。GMEM（bit22）は 0 にする。
+2. `r2d_setup_common`：RB_2D_UNKNOWN_8C01（0x8C01）＝0。RB_2D_BLIT_CNTL（0x8C00）と GRAS_2D_BLIT_CNTL（0x8400）に同じ値。SP_2D_DST_FORMAT（0xACC0）。
+3. `r2d_dst_buffer`：RB_2D_DST_INFO（0x8C17）、RB_2D_DST（0x8C18／0x8C19、64 ビット）、RB_2D_DST_PITCH（0x8C1A）を 4 dword の PKT4 でまとめて書く。
+4. `r2d_clear_value`：RB_2D_SRC_SOLID_C0..C3（0x8C2C..0x8C2F）。UNORM8 のときは、各チャンネルを 0〜255 のバイト値で入れる。
+5. `r2d_coords`：GRAS_2D_DST_TL（0x8405）と GRAS_2D_DST_BR（0x8406）。X はビット 0..13、Y はビット 16..29。BR は端を含む。
+6. `r2d_run`：`CP_BLIT`（opcode 0x2C）、1 dword ＝ BLIT_OP_SCALE（3）。
+7. 後始末：CP_BLIT は CCU に書くので、CPU が読む前に PC_CCU_FLUSH_COLOR_TS が必要。
+
+**CCU の bypass オフセット（a635）**
+- Mesa の古い表の値：a618 は 0x10000、a630／a640 は 0x20000、a650 は 0x30000。これは「CCU の数 × 64 KB」になっている。
+- この古いミラーには a635／a660 の項目がない（`freedreno_devices.py` は見つからなかった）。
+- [U] a635（7c+ Gen 3 と同じ系統）は CCU が 2 つだと記憶している。そうなら 0x20000 で、RB_CCU_CNTL ＝ 0x20 << 23 ＝ **0x10000000** になる。
+- 新しい Mesa の gen4（a660 系）では、RB_CCU_CNTL にほかのビットもある [U]。まず書く前の値を CPU から読んで記録し（0x8E07 は CP_PROTECT の対象外）、その値と比べる。
+
+**レジスタの保護**
+- G-1 の CP_PROTECT 表を見ると、0x8C00..0x8C2F、0x8400..0x8406、0xACC0、0x8E07 はどれも対象外。ring や IB の PKT4 から書いてよい。
+- 保護されているのは 0x8E00、0x8E08、0x8E50..、0xA630..0xA7FF など。
+
+**G-5 の提案（bit27、0xFFFFE80）**
+- 描く先：16×16 画素の RGBA8（FMT6_8_8_8_8_UNORM ＝ 0x30）、リニア、pitch 64 バイト、合計 1 KB。
+  - 置き場所は IOVA 0x70017400..0x700177FF（ring の RW 領域の中、64 バイト境界）。
+  - その後ろの 0x70017800..0x7001783F（16 dword）を番兵にする。
+  - CPU が先に、画素と番兵の 272 dword すべてに 0xFFFFFFFF を書いておく。
+- 色：R=0x12、G=0x34、B=0x56、A=0x78。メモリ上の 1 画素は 0x78563412 になるはず [I]。
+- IB2：IOVA 0x70016100（G-4 の IB の後ろ）、36 dword。
+
+  | # | 中身 | dword |
+  |---|---|---|
+  | 1 | `EVENT_WRITE` PC_CCU_INVALIDATE_COLOR：0x70460001、25 | 2 |
+  | 2 | `EVENT_WRITE` PC_CCU_INVALIDATE_DEPTH：0x70460001、24 | 2 |
+  | 3 | `WAIT_FOR_IDLE`：0x70268000 | 1 |
+  | 4 | RB_CCU_CNTL：0x408E0701、0x10000000 [U] | 2 |
+  | 5 | RB_2D_UNKNOWN_8C01：0x488C0101、0 | 2 |
+  | 6 | RB_2D_BLIT_CNTL：0x408C0001、**0x10F03080** | 2 |
+  | 7 | GRAS_2D_BLIT_CNTL：0x48840001、0x10F03080 | 2 |
+  | 8 | SP_2D_DST_FORMAT：0x48ACC001、**0x0000F180** | 2 |
+  | 9 | RB_2D_DST_INFO..PITCH：0x408C1704、0x30、0x70017400、0、1 | 5 |
+  | 10 | RB_2D_SRC_SOLID_C0..C3：0x488C2C04、0x12、0x34、0x56、0x78 | 5 |
+  | 11 | GRAS_2D_DST_TL／BR：0x48840502、0、0x000F000F | 3 |
+  | 12 | `CP_BLIT`：0x702C0001、3 | 2 |
+  | 13 | `EVENT_WRITE` PC_CCU_FLUSH_COLOR_TS：0x70460004、29、0x70017028（データ[10]）、0、0xCAFE0008 | 5 |
+  | 14 | `WAIT_FOR_IDLE`：0x70268000 | 1 |
+
+  - 値の中身：
+    - BLIT_CNTL ＝ SOLID_COLOR（bit7）｜COLOR_FORMAT 0x30（<<8）｜MASK 0xF（<<20）｜IFMT R2D_UNORM8 0x10（<<24）。SCISSOR と ROTATE は 0。
+    - SP_2D_DST_FORMAT ＝ COLOR_FORMAT 0x30（<<3）｜MASK 0xF（<<12）。turnip は UNORM のとき NORM ビットを立てていない。
+    - DST_INFO ＝ COLOR_FORMAT 0x30。TILE_MODE は 0（リニア）、COLOR_SWAP は 0（WZYX）、FLAGS は 0。
+    - PITCH ＝ 64 >> 6 ＝ 1。
+  - ヘッダは、ME_INIT（0x70C80008）、IB（0x70BF8003）、PKT4 0x885（0x48088501）と同じ計算で出した。既知の 3 つとも一致した。
+- ring（G-4 の後、dword 39..47、9 dword）：
+  - `INDIRECT_BUFFER`：0x70BF8003、0x70016100、0、36。
+  - `EVENT_WRITE` CACHE_FLUSH_TS：0x70460004、4、0x7001702C（データ[11]）、0、0xCAFE0009。UCHE も flush する。
+  - WPTR は 48 になる。
+- 待ち方：G-4 と同じく `GmuCpIdleWait` を使う。
+- 記録する項目：
+  - RB_CCU_CNTL の前と後（CPU から読む）。
+  - shadow／WPTR／RPTR、Polls。
+  - RBBM_STATUS、INT0、CP_HW_FAULT、CP_INTERRUPT_STATUS、CP_PROTECT_STATUS、CP_STATUS_1。
+  - CP_IB1_BASE、CP_IB1_REM_SIZE。
+  - データ[10]／[11]。
+  - 画素の一致数（0..256）、最初に一致しなかった番号と値、画素[0]・[15]・[16]・[255] の値。
+  - 番兵が全部 0xFFFFFFFF のままか。
+  - FSR。
+- 成功の条件（Checks のビット）：
+  - bit0：RPTR＝WPTR＝48 で、エラーのビットがない。
+  - bit1：データ[10] ＝ 0xCAFE0008。
+  - bit2：データ[11] ＝ 0xCAFE0009。
+  - bit3：256 画素すべてが 0x78563412。
+  - bit4：番兵が変わっていない。
+- 失敗したときの読み方 [I]：
+  - 画素がすべて 0x12345678 になったとき：チャンネルの並びが逆なだけである。描画そのものは成功している。
+  - 画素が 0xFFFFFFFF のままで、データ[10] だけが書かれたとき：CCU の flush が sysmem まで届いていない。または RB_CCU_CNTL が違う。
+  - CP が idle にならないとき（ハング）：turnip の `tu6_init_hw` の一部を、ring の G-5 の前に足して試す。足すのは CACHE_INVALIDATE（49）、RB_UNKNOWN_8E04 ＝ 0x00100000、RB_UNKNOWN_8E01 ＝ 0、UCHE_UNKNOWN_0E12 ＝ 0x3200000、UCHE_CLIENT_PF ＝ 4。その前に、0x8E01／0x8E04 が CP_PROTECT に入っていないかを確かめる。
+  - 番兵が変わったとき：BR が端を含むことの扱いか、pitch の解釈が違う。
+- G-5 の後の候補 [I]：
+  1. 描く先を scanout のフレームバッファ（MDSS が今読んでいるもの）の一部にする。色の付いた矩形が画面に出れば、目で確かめられる。SMMU に、そのフレームバッファの物理アドレスをマップする必要がある。
+  2. `BLIT_OP_COPY`（SP_PS_2D_SRC_* を使うコピー）。
+  3. その後でコンピュート（ir3 のシェーダを手で組む）に進む。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
