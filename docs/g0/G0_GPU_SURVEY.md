@@ -3141,6 +3141,393 @@ shim と試験ケースに、G-5 の Checks=0x17 からの正常続行、4条件
   - 私が `stock-rom/vx/firmware/a660_zap.elf` を、端末の `C:\Epinephrine\fw\` にコピーする。
   - SHA-256 が ADB53DED…87965D6E0 であることを確かめてから実行する。
 
+#### 9.21.24 Z-1 の実装（実機未実行）
+
+- bit29（`EPI_GMU_PROBE_Z1=0x20000000`、合計 `0x3FFFFE80`）を追加した。bit28 以下の前提を要求し、ワンショット解除に含める。G-5b の Checks=`0xB`、Reason=13、`STATUS_IO_DEVICE_ERROR` だけを許容して続行する。実際の入口でも WPTR / shadow=61、旧 ring / IB、データ[0..12]、全画素 `0xFFFFFFFF`、番兵を確認する。
+- `epi_zap.cxx/.hxx` が ELF 検査と PAS を担当する。`epi_smc.asm` は x0..x7 をロードして `smc #0`、x0..x3 と x6 を保存する。x19 と fp/lr を保存し、WDK の unwind マクロを使う。vcxproj に ARM64 の MARMASM props / targets と入力ファイルを追加した。x64 で SMC は発行しない。
+- `C:\Epinephrine\fw\a660_zap.elf` は CX 窓に入る前にファイルとして読む。14264バイト、ELF32 little-endian の ident、ヘッダ全フィールド、3個のプログラムヘッダ全フィールドを固定値で検査し、PAS の前にも再検査する。署名の検証は PAS が行う。元ファイルの SHA-256 は `adb53ded0ba4e37cd7204f2399cac80c12aa1188c5ce010929323d687965d6e0`。
+- PAS の順と引数は §9.21.23 の表どおり。ISSUPPORTED は raw x0=0 / x1=1、残り3個は raw x0=0 / x1=0 を要求する。INTERRUPTED は同じ引数、x0=1、返った x6 を使って続行する。無限ループを避け、合計1024回で停止する。EBUSY は30 ms待って最初の呼び出しを最大20回再試行する。WAITQ_SLEEP は停止し、WAITQ サービスは呼ばない。
+- メタデータは連続・非キャッシュの2ページ。ファイルの `[0,0x94)` と `[0x1000,0x29A0)` を連結し、残りを0にする。MEM_SETUP は `0x8B110000` / `0x1000`。対象ページには、MMIO 向けの整列した DWORD 書き込みで本体1976バイトと残りの0を置き、バリア後に先頭4 dwordを読む。Linux の `0x8B71A000` は使わない。
+- **最初の対象書き込みの直前は breadcrumb `0x1403`。** `GpuGmuZ1Pas` と EpiGpuProbeStep の保存・flush、GX の前提確認がすべて成功したときだけ書く。各 SMC の直前と結果の後にも同じ保存を行う。保存・GX 確認の失敗では先へ進まない。
+- 自前の呼び出しは interlocked の所有権で直列化する。さらに `EpiDiag\ZapOnce` を volatile キーとして最初の SMC より前に作る。既存なら SMC を出さず停止する。INIT 成功、または未完了の monitor session があればキーを残すため、ドライバーを再ロードしても同じブート中には再実行できない。INIT より前の通常失敗や、INIT が完了してエラーを返した経路では、自分が作ったキーを削除する。途中でクラッシュしてキーが残った場合も、再起動まで再実行しない。
+- 通常の完了経路ではメタデータを解放する。WAITQ_SLEEP、INTERRUPTED 上限、未完了の session を残したままの checkpoint 失敗などでは、TZ が参照中かもしれないのでメタデータを隔離して保持する（MetadataKept=1）。PAS_SHUTDOWN は送らない。qcscm / qcsecapp / QCRPEN の設定変更や呼び出しはしない。
+- 4個の PAS がすべて成功した場合だけ、CP の WPTR / shadow=61 が保たれていることを再確認し、仕様の12 dwordを ring[61..72] に置く。SET_SECURE_MODE 0、WFI、既存 G-5 IB、CACHE_FLUSH_TS の順。WPTR=73、データ[13]=`0xCAFE000B`。MASK は引き続き読むだけ、0xF400 にも触れない。
+- 全成功は Checks=`0x1F`。bit0 は4個の raw SCM 結果、bit1 は RPTR / WPTR / shadow=73 と idle / エラーなし、bit2 はデータ[13]、bit3 は全画素、bit4 は全番兵。G-5 / G-5b の既存診断は保持し、許容した画素不一致だけで全体を失敗にしない。Z-1 の失敗は安全に片付けば GMU status=15、後片付け失敗は従来どおり8 / KeepCx。
+
+診断は次の2つを追加した（どちらも REG_BINARY）。未記録は `0xFFFFFFFF` / `0xFFFFFFFFFFFFFFFF`、NTSTATUS の未実行は `STATUS_NOT_FOUND`。
+
+```text
+GpuGmuZ1Pas (592 bytes):
+{ Step, FileSize, Header[13], Phdr[3][8], [4-byte alignment padding], MetadataPa (64-bit),
+  MetadataBytes, TargetBytes, TargetReadback[4], InitSucceeded, Consumed, MetadataKept, Status,
+  Call[4] }
+Call (96 bytes each):
+{ Function, ArgInfo, Args[3], Result[4], Session (all 64-bit),
+  Calls, Interrupted, Busy, Completed (all ULONG) }
+GpuGmuZ1 (1368 bytes):
+{ Gpu (764-byte GpuGmuG5b layout), Reserved (ULONG, 0), Pas (592 bytes), Data12Before, Data12After }
+```
+
+- Call の順は IS_SUPPORTED / INIT_IMAGE / MEM_SETUP / AUTH_AND_RESET。Args は x2..x4、Result は raw x0..x3、Session は最後に返った x6。Completed は terminal の成功／負のエラーで1、未完了の正の戻りで0。InitSucceeded / Consumed / MetadataKept の初期値は0。
+- Header の順は e_type / e_machine / e_version / e_entry / e_phoff / e_shoff / e_flags / e_ehsize / e_phentsize / e_phnum / e_shentsize / e_shnum / e_shstrndx。Phdr は ELF32 の8フィールドをそのまま保存する。
+- Gpu の Data12Before / After は Z-1 では **データ[13]**、最外側の Data12Before / After が本来のデータ[12]。Gpu.Packet の先頭12 dwordが今回の ring（末尾1個は未使用）。Draw.Packet は未使用、Draw.Ib は再利用した G-5 IB。走査は ring[0..72] を除外し、対象は7687 dword。Cp.Reason=16 は PAS／ファイル／ブート内実行制限の失敗で、Pas.Status と Call を参照する。他の Reason は既存どおり。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x430 | zap ファイルを読む前 |
+| 0x1400 / 0x1405 | PAS 入口 / ブート内実行の権利取得 |
+| 0x1401 | メタデータ確保・準備 |
+| **0x1402 / 0x1403 / 0x1404** | **対象 map / 対象への最初の書き込み直前 / コピー・unmap 後** |
+| 0x1420 / 0x1424 / 0x1428 / 0x142C | IS_SUPPORTED / INIT / MEM_SETUP / AUTH の直前（再開も同じ値） |
+| 各 SMC の直前番号+1 / +2 | EBUSY の30 ms待ち前 / 成功結果の保存後 |
+| 0x1500〜0x1507 | GX・旧状態・magic・CCU・global の記録 |
+| 0x1508〜0x150B | PAS 後の CP 状態確認・準備、投入、fence、idle |
+| 0x1510〜0x151C / 0x1520〜0x1524 | GX 診断 / magic・global 診断 |
+
+ホスト用 shim には SMC の応答と予約ページの配列を用意した。ELF 改変の拒否、PAS の各段階の失敗、INTERRUPTED / EBUSY / WAITQ、INIT 成功後の保存失敗、コピー前の breadcrumb 失敗、再ロード後の再実行防止、PAS 成功後だけ WPTR=73 に進むこと、描画不一致・時間切れ・KeepCx のケースを追加した。テスト、ビルド、署名、配置、実機実行、版番号の変更は行っていない。
+
+#### 9.21.25 v68 の結果（Z-1、2026-11-13）
+
+v68（20.0.2.68、oem126）。ビルド修正は1点だけ行った。`epi_zap.cxx` の `PHYSICAL_ADDRESS high={0xFFFFFFFFFLL}` は共用体の先頭の `LowPart` に入って切り詰められ、C4838 になっていた。これを `QuadPart` への代入に直した。sys の逆アセンブルで `smc #0` が入っていることを確認した。a660_zap.elf は phone の `C:\Epinephrine\fw\` に置いた（SHA-256 一致）。phone を 17:44 に再起動したあと、EpiGpuProbe=0x3FFFFE80 を実行した。phone は落ちていない（LastBootUpTime は変わらず）。
+
+- 全体：Step 0xFFFF、GpuGmuStatus 0xF（E_CP）、NtStatus 0xC0000185、KeepCx 0、DisableStatus 0、FaultStatus 0。GpuZapFwStatus 0、Len 0x37B8。
+- G-5b は前回と同じで Checks 0xB / Reason 13 だった。GmuZ1CanFollow を満たしたので Z-1 に進んだ。
+- **PAS：** Step 0x1420 で止まった。`IS_SUPPORTED`（x0=0x42000207、x1=1、x2=13）が1回で完了し、返り値は **x0=0、x1=0、x2=0、x3=0、x6=0** だった。期待値 x1=1 と違うので STATUS_IO_DEVICE_ERROR になった。INIT_IMAGE 以降は呼んでいない（Call[1..3] は 0xFF のまま）。metadata は確保しておらず、0x8B110000 にも書いていない。InitSucceeded・Consumed・MetadataKept はどれも 0。
+- **GPU 側：** Z-1 の Reason は 16（PAS 失敗）。ring は 61/61 のままで、SET_SECURE_MODE は送っていない（期待どおり）。magic レジスタは G-5b の値を保っている（04100000 / DEAFBEAD / 1 / 0x81）。global fault は前後とも 0。
+
+解釈：monitor は呼び出しを処理した（x0 が書き換わって 0 になった）が、「PAS 13 は非対応」と答えた。Linux の `qcom_scm_pas_supported()` なら false になる場合に当たる。考えられる原因は次の3つ。
+1. この TZ では GPU の PAS ID が 13 ではない。
+2. TZ が、HLOS カーネルから直接来た PIL 呼び出しを受け付けない。Windows では qcPILC が HypProtectionEnabled=1 で PIL を担っている。
+3. この monitor では IS_SUPPORTED の返し方が違う。
+
+区別するには、副作用のない問い合わせが必要になる。`QCOM_SCM_INFO_IS_CALL_AVAIL`（x0=0x42000601、x1=1、x2=0x42000207 などの関数 ID）、および phone で実際に動いている他の PAS ID に対する IS_SUPPORTED（ADSP 1、CDSP 18、WPSS 6、venus 9 など）を使う。どちらも GX を必要としない。
+
+#### 9.21.26 Z-1b の提案：SCM の問い合わせだけを行う（文章仕様、未実装）
+
+##### 追加で分かったこと
+
+- **Windows の経路。** QcTrEE.sys（woa-kodiak の `Drivers\SOC\TrEE`）の SMC 呼び出しは RVA 0x1080 にあり、64 ビット版である。呼び出し元（RVA 0x1EBD4）は `x0 = 関数 ID | 0x40000000` を作る。たとえば 0x02000201 は 0x42000201 になる。これは std call の SMC64 で、私たちの Z-1 と同じ形である。`smc #0` のあと w0 が正なら同じ命令を再発行し、x1..x3 と x6 を返す。
+- **qcPILC の順序。** qcPILC は `PAS_INIT_IMAGE` → 条件付きで `PAS_MEM_SETUP` → authenticate の順に送る（GX9 §3）。**IS_SUPPORTED は呼ばない。**
+- **Windows では読み込みが成功している。** qcdxkm は PAS ID 13 と GFXSUC GUID で `qcdxkmsuc7325.mbn` を読み込ませる。このファイルは a660_zap.elf と本体が完全に一致し、違うのは署名だけである。GX18 の後のセッションでは、この読み込みが成功している。つまり、この TZ は少なくとも QcTrEE 経由の PAS 13 の INIT/AUTH を受け付けている。
+- **Linux の例。** upstream の spacewar DT は `gpu_zap_shader`（a660_zap.mbn、gpu_zap_mem 0x8B71A000）を使う。Linux の `qcom_scm_pas_supported()` は、先に `__qcom_scm_is_call_available(PIL, IS_SUPPORTED)` で確かめてから IS_SUPPORTED を呼ぶ。そのため「IS_SUPPORTED という呼び出しが存在するか」と「PAS 13 に対応しているか」が別々に分かる。Z-1 は前者を確かめていなかった。
+
+##### 目的
+
+Z-1 で得た「x0=0、x1=0」が次のどれなのかを区別する。
+
+1. IS_SUPPORTED が実装されておらず、意味のない 0 が返った。
+2. PAS ID 13 だけが非対応。
+3. HLOS からの PIL 呼び出しがすべて非対応扱いになっている（hyp や TZ の方針）。
+
+ここで送るのは状態を変えない問い合わせだけである。INIT_IMAGE、MEM_SETUP、AUTH_AND_RESET は送らない。
+
+##### 起動と前提
+
+- 新しい probe bit を **bit30（0x40000000）単独**で割り当てる。他の bit と同時に指定されたら status 6 で拒否する。GX の連鎖には入れない。
+- 実行は EpiGpuProbe を読んで 0 に戻し flush した直後に行い、GCC の map より前とする。GPU、GMU、SMMU には一切触らない。そのため実行前の再起動は不要である。また ZapOnce の対象外とする。
+- 実行は PASSIVE_LEVEL で行い、Z-1 と同じ `EpiSmcInvoke` を使う。x6=x7=0 とし、x3..x5 も 0 にする。
+
+##### 問い合わせの表（この順に1回ずつ）
+
+| # | x0 | x1 | x2 | 意味 | 期待 |
+|---|---|---|---|---|---|
+| 0 | 0x42000601 | 1 | 0x02000601 | IS_CALL_AVAIL（自分自身）。SMC 経路の確認 | x0=0、x1=1 |
+| 1 | 0xC2000601 | 1 | 0x02000601 | 0 と同じ問い合わせを fast call で送る。Linux の規約判定と同じ形 | x0=0、x1=1 |
+| 2 | 0x42000601 | 1 | 0x02000207 | PIL IS_SUPPORTED が存在するか | ? |
+| 3 | 0x42000601 | 1 | 0x02000201 | PIL INIT_IMAGE が存在するか | ? |
+| 4 | 0x42000601 | 1 | 0x02000202 | PIL MEM_SETUP が存在するか | ? |
+| 5 | 0x42000601 | 1 | 0x02000205 | PIL AUTH_AND_RESET が存在するか | ? |
+| 6〜11 | 0x42000207 | 1 | 1、18、6、4、9、13 | IS_SUPPORTED。順に ADSP、CDSP、WPSS、MPSS、venus、GPU | ? |
+
+`IS_CALL_AVAIL` の x2 は Linux と同じく `SMC_FNID(svc,cmd) | (SIP << 24)` とする。0x40000000 や 0x80000000 の bit は付けない。
+
+##### 再試行
+
+- x0=1（INTERRUPTED）のときは、Z-1 と同じく、返った x6 を使い x0=1 で再開する。合計1024回で止める。
+- x0=−12（EBUSY）のときは、30 ms 待って最大20回まで再試行する。
+- それ以外の値は、そのまま記録して次の行へ進む。負の値も含む。
+
+一つの行が失敗しても、残りの行は続けて実行する。どの行も状態を変えないからである。
+
+##### 記録
+
+- **breadcrumb：** 各 SMC の直前に `EpiGpuProbeStep = 0x1600 + #` を書いて flush する。終了したら 0xFFFF にする。
+- **EpiDiag `GpuZapQuery`（REG_BINARY）：** 先頭に ULONG Count と ULONG Status を置き、その後に各行 64 B の記録を続ける。1行の中身は次のとおり。
+  - ULONGLONG Function, Arg, X0, X1, X2, X3, X6（7×8 = 56 B）
+  - ULONG Calls
+  - ULONG Flags（bit0 Interrupted あり、bit1 Busy あり、bit2 上限で停止）
+
+  12行で 8 + 768 = **776 B** になる。
+- **保存の時機：** 各 SMC のあとで逐次保存し、flush もする。途中で止まった場合も、そこまでの記録が残るようにする。
+
+##### 結果の読み方
+
+| 観測 | 判断 | 次 |
+|---|---|---|
+| 0 または 1 が x1≠1 | 私たちの SMC の出し方がずれている（あるいは filter されている） | 呼び出し規約と trampoline を見直す |
+| 2 が x1=0、3〜5 が x1=1 | IS_SUPPORTED が存在しない。Z-1 の 0 は意味のない値だった | Z-1c：qcPILC と同じく IS_SUPPORTED を省き、INIT から始める |
+| 2〜5 が x1=1、6〜10 のどれかが x1=1、11 が x1=0 | PAS 13 だけが HLOS に非対応 | Windows の GFXSUC との違いを調べる（qcPILC が INIT 前に行う登録処理など） |
+| 2〜5 が x1=1、6〜11 がすべて x1=0 | HLOS 側からの PAS がすべて非対応と答える（hyp や TZ の方針） | IS_SUPPORTED の答えを信頼せず、Z-1c で INIT を1回だけ試すかどうかを決める |
+| 3〜5 のどれかが x1=0 | その経路は直接の SMC では使えない | QcTrEE PassThrough 経由（qcPILC の IOCTL）を検討する |
+
+#### 9.21.27 Z-1b の実装（実機未実行）
+
+- `EPI_ZAP_PROBE_QUERY=0x40000000`（bit30）を単独 probe として追加した。他のビットとの組み合わせは status=6。最初に EpiGpuProbe を0に戻して flush し、その失敗は status=7 で停止する。問い合わせへの分岐は GPU_CC のリソース確認、ファームウェア読み込み、GCC / GPU_CC の map、CX 窓より前。GPU / GMU / SMMU、ZapOnce、Z-1 の所有権には触れない。
+- `epi_zap.cxx` の `EpiZapQuery` が、§9.21.26 の12行をその順番で送る。使う関数 ID は `0x42000601` / `0xC2000601` / `0x42000207` だけ。IS_CALL_AVAIL の引数は fast / 64-bit のビットなしの `0x0200xxxx`。INIT_IMAGE / MEM_SETUP / AUTH_AND_RESET そのものは呼ばない。x1=1、x2 が表の引数、初回と EBUSY 再送時の x3..x7 はすべて0。
+- 各 SMC の直前に `0x1600+行番号` を保存・flush する。INTERRUPTED の再開も同じ breadcrumb。返るたびに raw x0..x3 / x6、Calls、Flags を更新し、`GpuZapQuery` 全体を保存・flush してから次へ進む。SMC を出す前の初期スナップショットと、最後のスナップショットも保存する。終了の breadcrumb は `0xFFFF`。
+- INTERRUPTED は x0=1、返された x6 と元の引数で再開し、合計1024回でその行を終える。EBUSY は30 ms待って元の std / fast call を最大20回再試行する（初回込み21回）。上限でも次の行を実行する。それ以外の戻り値は、負の値や WAITQ_SLEEP を含め、そのまま記録して次の行へ進む。x1 の値に成功／失敗の判定を追加しない。
+- SMC の raw な負の戻り値は問い合わせの観測結果であり、probe 自体の失敗にはしない。保存・flush・SMC 発行の失敗では、それ以降の SMC を出さず停止する。再試行上限やこれらの失敗は診断 Status に最初の NTSTATUS を保存する。GpuProbeStatus は全行が通常に記録できたら0、問い合わせの上限／保存／発行の失敗なら9。Count と行ごとの Flags も合わせて読む。
+
+診断 `GpuZapQuery` は REG_BINARY、**776バイト**。§9.21.26 の ABI そのまま。
+
+```text
+{ Count (ULONG), Status (ULONG, NTSTATUS bits), Row[12] }
+Row (64 bytes):
+{ Function, Arg, X0, X1, X2, X3, X6 (all ULONGLONG), Calls, Flags (ULONG) }
+```
+
+- Count は「少なくとも1回の SMC が返った行の数」。再開中でもその行を含めるので、Calls / Flags と併読する。全12行から結果を得たときに12。
+- Function / Arg は元の問い合わせ、X0..X6 はその行の最後の raw な戻り値。再開中の X0=1 や EBUSY の中間結果も逐次保存する。未実行の raw な値は `0xFFFFFFFFFFFFFFFF`、Calls / Flags の初期値は0。
+- Flags は bit0=INTERRUPTED あり、bit1=EBUSY あり、bit2=上限で終了。Status=0 は保存・発行・再試行上限の問題なしという意味で、全 PAS が対応しているという意味ではない。上限に到達した行の後も実行するため、Count=12 と Status 非0 は両立する。
+
+ホスト用 peer と試験ケースに、12行の関数 ID / 引数 / ゼロのレジスタ、1 SMC ごとの保存、fast call、負／正の予期しない戻り値からの続行、INTERRUPTED の x6 引き継ぎ、EBUSY の再送、両方の上限から次の行への続行、breadcrumb / 保存の失敗による停止、ZapOnce が残った状態での問い合わせを追加した。テスト、ビルド、配置、実機実行は行っていない。
+
+#### 9.21.28 v69 の結果（Z-1b、2026-11-13）
+
+v69（20.0.2.69、oem127）。ビルド修正はなかった。再起動はせず（Z-1 と同じ 17:44 の起動のまま）、EpiGpuProbe=0x40000000 を実行した。結果は Step 0xFFFF、GpuZapQuery は 776 B で、Count 12、Status 0。phone は落ちていない。すべての行で Calls は 1、Flags は 0（INTERRUPTED も EBUSY もなし）だった。
+
+| # | 問い合わせ | x0 | x1 |
+|---|---|---|---|
+| 0 | IS_CALL_AVAIL(0x02000601)、std | 0 | **1** |
+| 1 | 同、fast | 0 | **1** |
+| 2 | IS_CALL_AVAIL(PIL IS_SUPPORTED) | 0 | **1** |
+| 3 | IS_CALL_AVAIL(PIL INIT_IMAGE) | 0 | **1** |
+| 4 | IS_CALL_AVAIL(PIL MEM_SETUP) | 0 | **1** |
+| 5 | IS_CALL_AVAIL(PIL AUTH_AND_RESET) | 0 | **1** |
+| 6〜11 | IS_SUPPORTED(1 / 18 / 6 / 4 / 9 / 13) | 0 | **0（全部）** |
+
+x2、x3、x6 はすべて 0 だった。
+
+解釈：
+- 直接 SMC を出す経路は正しく、std call でも fast call でも monitor に届いている。PIL の4つのサービスも存在すると答えている。
+- それでも IS_SUPPORTED は、**phone で実際に動いている ADSP・CDSP・WPSS・MPSS を含め、すべての PAS ID に 0 を返す。**
+
+したがって、§9.21.26 の表の4行目（PAS 13 だけが非対応なのではなく、HLOS からの問い合わせにはすべて非対応と答える方針）に当たる。Windows の qcPILC が IS_SUPPORTED を呼ばずに INIT から始めること、そしてその経路で GFXSUC の読み込みが成功していることと矛盾しない。**この TZ では IS_SUPPORTED の答えは判断材料にならない。**
+
+次の選択肢（Z-1c）は、IS_SUPPORTED の結果を「記録するだけで止めない」ようにして、INIT_IMAGE を1回だけ試すことである。INIT は TZ の PAS 13 の状態を変えるので、失敗した後の再試行は再起動後とし、ZapOnce と metadata の保持規則は Z-1 のまま使う。Linux の upstream は PAS 13 の zap 領域に 0x8B71A000 を使い、Windows は 0x8B110000 を使う。どちらを MEM_SETUP に渡すかは Z-1 のまま 0x8B110000 とする（0x8B71A000 は qcPILC の DHMS 範囲の中にある）。
+
+#### 9.21.29 Z-1c の実装（実機未実行）
+
+- bit29 / `EpiGpuProbe=0x3FFFFE80` の意味を Z-1c に置き換えた。IS_SUPPORTED（Call[0]）は、再開・再試行を終えて **x0=0 なら x1 に関係なく続行**する。raw x1 は変更せず記録する。負のエラー、未完了の正の戻り、INTERRUPTED / EBUSY の上限など、x0=0 に到達しなかった場合は従来どおり停止する。
+- `GmuZ1PasSucceeded` も Call[0] は Completed=1 / x0=0 だけを要求する。Call[1..3]（INIT / MEM_SETUP / AUTH）は Completed=1 / x0=0 / x1=0 のまま。IS_SUPPORTED の x1 を無視したことで、他の PAS の判定は緩めない。
+- `EPI_ZAP_TRACE` の **offset 156 の旧 padding 4バイト**を `ULONG SupportX1Ignored` とした。ローダー開始時は0、IS_SUPPORTED が x0=0 で完了して x1 を使わずに続行するときに1。元から x1=1 だった場合も、同じ判定規則を適用した印として1になる。次段階の前に trace とともに保存・flush する。旧 Z-1 の記録や PAS 未到達の snapshot は、この位置が `0xFFFFFFFF`。
+- `GpuGmuZ1Pas` は **592バイトのまま**。MetadataPa は offset 160、Call 配列は offset 208 のままで、後続の全フィールドは動かさない。`GpuGmuZ1` も1368バイトのまま（Pas の開始は offset 768、印の位置は全体の offset 924）。サイズと主要 offset は static_assert で確認する。Z-1b の問い合わせと776バイトの診断には変更しない。
+- ZapOnce、INIT 成功後の Consumed、未完了時の metadata 保持、MEM_SETUP の `0x8B110000 / 0x1000`、コピー直前 `0x1403` の breadcrumb / flush、PAS 成功後だけ SET_SECURE_MODE を送る規則は変更していない。
+
+追加したホスト試験ケースは、IS_SUPPORTED の x1=0 / 2 / `0xFFFFFFFFFFFFFFFF` で INIT〜AUTH まで進み、印と raw x1 を保持すること、GmuZ1PasSucceeded の Call[0] と Call[1..3] の条件の違い、x0 の負のエラー・未完了・再試行上限で INIT を送らないこと、x1=0 で INIT 成功後に AUTH が失敗したときも Consumed と再実行防止を維持すること、実行全体が WPTR=73 まで進むこと。テスト、ビルド、配置、版番号変更、実機実行は行っていない。
+
+実行は GX を使うため、次の試験も必ず端末を再起動してから行う。INIT が成功した後に AUTH などで失敗した場合も、TZ に PAS 13 の状態が残るため、同じ起動中には再試行せず、次は再起動後とする。
+
+#### 9.21.30 v70 の結果（Z-1c、2026-11-13）：zap 成功、最初の画素
+
+v70（20.0.2.70、oem128）。ビルド修正はなかった。phone を 19:32 に再起動したあと、EpiGpuProbe=0x3FFFFE80 を実行した。**GpuGmuStatus 0、NtStatus 0**。KeepCx 0、DisableStatus 0、FaultStatus 0 で、phone は落ちていない。
+
+**PAS（GpuGmuZ1Pas、592 B）：** Step 0x142E（AUTH の成功を保存したところ）、SupportX1Ignored 1、Status 0。
+
+| Call | x0 | x1 | Calls / Interrupted / Busy / Completed |
+|---|---|---|---|
+| IS_SUPPORTED | 0 | 0（無視） | 1 / 0 / 0 / 1 |
+| INIT_IMAGE（metadata PA 0x2_7FF96000） | 0 | 0 | **6 / 5** / 0 / 1 |
+| MEM_SETUP（0x8B110000、0x1000） | 0 | 0 | 1 / 0 / 0 / 1 |
+| AUTH_AND_RESET | 0 | 0 | 1 / 0 / 0 / 1 |
+
+- INIT_IMAGE は INTERRUPTED（x0=1）を5回返し、6回目で完了した。session ID（x6）は 0 のままだった。この再開の処理が必要だったことが実機で確かめられた。
+- 0x8B110000 への書き込みの読み返しは 016DC009 880B01EE B8090071 A8000071 で、ELF の先頭4語と一致した。InitSucceeded 1、Consumed 1、MetadataKept 0（すべて完了したので metadata は解放した）。
+
+**描画（GpuGmuZ1、1368 B）：** SET_SECURE_MODE 0 のあと、G-5 の IB2 をもう一度実行した。
+
+- Reason 0、Status 0、**Checks 0x1F**（PAS 成功、CP idle、CAFE000B、画素、sentinel）。
+- WPTR、RPTR、shadow はすべて 73。data[13]=0xCAFE000B。
+- **PixelMatches 256 / 256、値は 0x78563412**、PixelFirstBad なし、SentinelMatches 16 / 16。
+- magic レジスタは 04100000 / DEAFBEAD / 1 / 0x81 のまま、global fault は前後とも 0。
+
+**結論：** G-5 と G-5b で画素が出なかった原因は secure mode だった。zap を PAS で読み込み、`CP_SET_SECURE_MODE 0` を送ると、CP_BLIT による 16×16 RGBA8 の塗りつぶしが私たちの context bank を通ってメモリに書かれた。これは Epinephrine で GPU が初めて描いた画素である。この TZ の IS_SUPPORTED は、どの PAS ID にも 0 を返すので判断材料にならない（§9.21.28）。
+
+#### 9.21.31 S-1 の提案：compute シェーダ1回で1語を書く（文章仕様、未実装）
+
+##### 方針
+
+最初のシェーダは、グラフィックス用のパイプライン（VS/FS、VFD、VPC、RAS、RB）を使わない compute にする。1 workgroup・1 invocation が、即値で作った 64 ビットのアドレスに `stg`（global store）で1語を書く。
+
+この形だと、定数、IBO、texture、sampler、private memory がどれも要らない。必要なのは、シェーダの命令を読み込むことと、CS の設定と、dispatch だけである。
+
+手本にしたのは Mesa の computerator（`src/freedreno/computerator/a6xx.cc` の `cs_program_emit` と `a6xx_emit_grid`）。turnip の `r3d_common` も参考にした（instrlen 1、constlen 4 の最小構成）。
+
+**位置づけ：** Z-1c（PAS → SET_SECURE_MODE 0）が成功した後にだけ実行する。magic レジスタは G-5b で設定済みのものを使う。
+
+##### probe bit
+
+- **bit31（0x80000000）** を使い、bit29 を前提にする。実行値は **0xBFFFFE80** で、bit30（Z-1b、単独専用）は含めない。
+- bit31 を使うと EpiGpuProbe の bit は残らない。次の段階からは、別の値（たとえば EpiGpuProbe2）を使う方式に移る必要がある。
+- 実行条件：Z-1c の Checks が 0x1F で、Reason 0、WPTR 73、data[13]=0xCAFE000B であること。満たさなければ Reason 8 として送らない。
+
+##### メモリ（すべて既存の ring 領域 0x70010000〜0x70017FFF。新しい map は作らない）
+
+| IOVA | 大きさ | 内容 |
+|---|---|---|
+| 0x70016300 | 53 dw | IB4（下の表） |
+| 0x70016800 | 32 dw（128 B） | シェーダ（16命令。instrlen=1 は16命令＝128 B が単位） |
+| 0x70017038 | 1 dw | data[14]。投入前に 0xFFFFFFFF、期待値 0xCAFE000C |
+| 0x70017C00 | 16 dw | 出力。投入前に CPU が 0xFFFFFFFF で埋める。期待値は [0]=0xC0DE5EED、[1..15]=0xFFFFFFFF |
+
+##### シェーダ（a6xx ir3。各命令は64ビットで、下位 dword が先）
+
+| # | 命令 | 下位 dword | 上位 dword |
+|---|---|---|---|
+| 0 | `mov.u32u32 r0.x, 0x70017C00` | 0x70017C00 | 0x204CC000 |
+| 1 | `mov.u32u32 r0.y, 0` | 0x00000000 | 0x204CC001 |
+| 2 | `mov.u32u32 r1.x, 0xC0DE5EED` | 0xC0DE5EED | 0x204CC004 |
+| 3 | `(rpt5)nop` | 0x00000000 | 0x00000500 |
+| 4 | `stg.u32 g[r0.x], r1.x, 1` | 0x01800008 | 0xC0C60100 |
+| 5 | `end` | 0x00000000 | 0x03000000 |
+| 6〜15 | `nop`（128 B まで埋める） | 0 | 0 |
+
+符号化の根拠は Mesa `src/freedreno/isa/ir3-cat1.xml`（mov-immed）、`ir3-cat6.xml`（stg）、`ir3/tests/disasm.c` である。
+
+- **mov-immed：** 下位32ビットが即値。bit32..39 が DST（レジスタ番号×4＋成分）、bit46..48 が DST_TYPE、bit50..52 が SRC_TYPE（u32=3）、bit53..54 が `10`、bit61..63 が `001`。試験の `mov.s16s16 hr1.y, -1` = `20510005_0000ffff` と、`mov.f32f32 r0.x, c8.x` = `20244000_00000020` で確かめた。
+- **stg：** bit1..8 が SRC3（値のレジスタ）、bit23 が 1、bit24..26 が SIZE、bit32..39 が OFF_LO、bit40 が 1、bit41..48 が SRC1（アドレスの組の先頭）、bit49..51 が TYPE、bit54..58 が `00011`、bit61..63 が `110`。試験の `stg.s32 g[r0.z], r8.y, 3` = `c0ca0500_03800042` から TYPE を 5→3 に変え、レジスタを r0.x / r1.x に置き換えた。
+- **アドレス：** `g[r0.x]` は r0.x（下位）と r0.y（上位）の組を 64 ビットのアドレスとして使う（computerator の `stg_ldg_offset.asm` と同じ）。
+- **nop：** mov から stg までの間の待ちは computerator の例と同じく `(rpt5)nop` とする（`(rpt2)nop` = `00000200_00000000` から類推）。
+
+##### IB4（0x70016300、53 dw）
+
+packet の header は G-5 と同じ規則で作り、机上試験で照合する。pkt4 で書くレジスタは、すべて新しい Mesa の a6xx.xml でオフセットを確認した。
+
+| 順 | packet | レジスタ / opcode | 値 | 意味 |
+|---|---|---|---|---|
+| 1 | pkt4 ×1 | SP_MODE_CONTROL 0xAB00 | 0x5 | CONSTANT_DEMOTION、ISAMMODE_GL |
+| 2 | pkt4 ×1 | SP_FLOAT_CNTL 0xAE04 | 0 | |
+| 3 | pkt4 ×1 | HLSQ_INVALIDATE_CMD 0xBB08 | 0xBF | VS..CS の state と GFX_IBO（computerator と同じ） |
+| 4 | pkt4 ×1 | HLSQ_CS_CNTL 0xB987 | 0x101 | constlen 4（vec4、shr2 で 1）、ENABLED |
+| 5 | pkt4 ×2 | SP_CS_CONFIG 0xA9BB、SP_CS_INSTRLEN 0xA9BC | 0x100、1 | ENABLED のみ（NIBO / NTEX / NSAMP は 0） |
+| 6 | pkt4 ×1 | SP_CS_CTRL_REG0 0xA9B0 | 0x80000100 | MERGEDREGS、FULLREGFOOTPRINT 2（r0..r1）、HALF 0、THREAD64、BRANCHSTACK 0 |
+| 7 | pkt4 ×1 | SP_CS_UNKNOWN_A9B1 | 0x41 | SHARED_SIZE 1、UNK6 |
+| 8 | pkt4 ×1 | HLSQ_CS_UNKNOWN_B9D0 | 0x41 | gen4 は has_lpac なので必要 |
+| 9 | pkt4 ×2 | HLSQ_CS_CNTL_0 0xB997、_1 0xB998 | 0xFCFCFCFC、0xFC | sysval は使わない（すべて r63.x）、THREAD64 |
+| 10 | pkt4 ×2 | SP_CS_CNTL_0 0xA9C2、_1 0xA9C3 | 0xFCFCFCFC、0xFC | gen4（LPAC）用に同じ値を入れる |
+| 11 | pkt4 ×3 | SP_CS_OBJ_FIRST_EXEC_OFFSET 0xA9B3、SP_CS_OBJ_START 0xA9B4/5 | 0、0x70016800、0 | |
+| 12 | pkt4 ×1 | SP_CS_IBO_COUNT 0xAA00 | 0 | |
+| 13 | pkt7 0x34 ×3 | CP_LOAD_STATE6_FRAG | 0x00760000、0x70016800、0 | ST6_SHADER、SS6_INDIRECT、SB6_CS_SHADER、NUM_UNIT 1 |
+| 14 | pkt7 0x65 ×1 | CP_SET_MARKER | 8 | RM6_COMPUTE |
+| 15 | pkt4 ×7 | HLSQ_CS_NDRANGE_0..6 0xB990 | 3、1、0、1、0、1、0 | KERNELDIM 3、localsize 1×1×1、globalsize 1×1×1、offset 0 |
+| 16 | pkt4 ×3 | HLSQ_CS_KERNEL_GROUP_X/Y/Z 0xB999 | 1、1、1 | |
+| 17 | pkt7 0x33 ×4 | CP_EXEC_CS | 0、1、1、1 | 1×1×1 workgroup |
+| 18 | pkt7 0x26 ×0 | CP_WAIT_FOR_IDLE | | |
+
+合計は 2+2+2+2+3+2+2+2+3+3+4+2+4+2+8+4+5+1 = **53 dw**。
+
+##### ring（WPTR 73 → 82）
+
+```
+CP_INDIRECT_BUFFER（G-5b と同じ header）, 0x70016300, 0, 53
+CP_EVENT_WRITE（0x70460004）, 4 (CACHE_FLUSH_TS), 0x70017038, 0, 0xCAFE000C
+```
+
+CACHE_FLUSH_TS は UCHE も flush するので、stg の書き込みはこの後でメモリに出ている。その後に CPU が非キャッシュの map で読む。
+
+##### 投入前の CPU 処理
+
+1. IB4 とシェーダを書き、出力 16 dw と data[14] を 0xFFFFFFFF にする。
+2. barrier を置いてから IB4 とシェーダを読み返し、trace に記録する。
+3. G-5b と同じく MaskBefore と前段の状態を確かめる。具体的には ring[0..72] の内容と、WPTR・RPTR・shadow がすべて 73 であること。
+
+##### 待ちと判定
+
+fence（CAFE000C）と idle の待ちは、G-5 と同じ関数と時間上限を使う（WPTR 82、エラー bit も同じ）。
+
+Checks の各 bit：
+- 1：Z-1c が成功している
+- 2：CP が idle で、WPTR・RPTR・shadow が 82、エラーの割り込みがなく、RBBM が busy でない
+- 4：data[14] が 0xCAFE000C
+- 8：出力[0] が 0xC0DE5EED
+- 16：出力[1..15] がすべて 0xFFFFFFFF
+
+期待値は 0x1F。
+
+##### 記録（EpiDiag `GpuGmuS1`、REG_BINARY）
+
+- 前段の要約：Z-1c の Checks と Reason
+- IB4（53 dw）とシェーダ（32 dw）の読み返し
+- 出力 16 dw と data[14] の投入前後の値
+- G-5 と同じ CP / RBBM の診断値：CpHwFault、CpInterrupt、CpProtect、CpStatus1、IbBase と Remaining、RBBM_STATUS、INT_STATUS、CX busy
+- global fault と context bank の fault（FSR / FAR / FSYNR）
+- ring 領域の走査：0xC0DE5EED の個数と最初の位置。除外する範囲は、既存のものに加えて 0x6300〜0x63FF、0x6800〜0x687F、0x7C00〜0x7C3F
+
+breadcrumb は 0x1700 番台とする。G-5b と同じく、各段階の直前に guard を置く。
+
+##### 結果の読み方
+
+| 観測 | 判断 |
+|---|---|
+| Checks 0x1F | compute シェーダが動いた。次はグラフィックスのシェーダ（VS/FS で四角形を1枚） |
+| CP が EXEC_CS で止まる（RPTR が 82 に届かず、IbRemaining が残る） | SP/HLSQ の設定が足りない。CP_STATUS と RBBM_STATUS の busy の bit から、どのブロックかを絞る |
+| idle になるが出力が 0xFFFFFFFF のまま | シェーダが動いていない、あるいは stg の書き込みがどこにも届いていない。走査で別の場所に値がないかを見る。fault があれば FAR を見る |
+| 出力が別の場所に出る | アドレスの組（r0.y）か OFF の符号化の誤り |
+| context bank の fault（FAR が 0x70016800 付近） | シェーダの命令を読む経路（instruction fetch の属性、XN）の問題。epi_smmu の leaf は実行可能として作っている |
+
+#### 9.21.32 S-1 の実装（実機未実行）
+
+- bit31（`EPI_GMU_PROBE_S1=0x80000000`）を追加した。実行値は `0xBFFFFE80`。bit29 とその全前提を要求し、ワンショット解除にも含める。bit30 を含めると従来の単独問い合わせの検査で status=6 となる。既存モードの意味は変更しない。
+- 同じ OOB の中で Z-1c の後に実行する。Z-1c の Cp.Status が成功、Reason=0、Checks=`0x1F`、WPTR=73、データ[13]=`0xCAFE000B` のときだけ S-1 を呼ぶ。それ以外は Cp.Reason=8 として未投入。S-1 の入口でも hardware RPTR / WPTR / shadow=73、ring[0..72]、既存の3個の IB、データ[13]、MASK=0 を再確認する。前提確認を準備より先に行い、不整合があれば IB・出力を変更しない。
+- IB4 は ring+0x6300 に53 dword、シェーダは ring+0x6800 に32 dword（16命令、128バイト）。§9.21.31 の6命令を下位 dword 先で配置し、残り10命令は0の nop。出力16語とデータ[14] を `0xFFFFFFFF` にし、メモリバリアのあと IB・シェーダ・追加 ring パケットを読み返して記録する。IB / シェーダの読み返しが準備した値と違えば投入しない。
+- IB の18パケットは仕様の順序と値を使う。pkt4 / pkt7 の header は parity を含めて静的に照合した。ring[73..81] には IB 呼び出しと IRQ なしの CACHE_FLUSH_TS を置き、WPTR=82 に進める。GPU メモリ確保、SMMU のマッピング／属性、SQE の再起動は追加しない。CPU が読む MMIO は既存の先頭・CP の2ページだけで、SP / HLSQ の設定は CP の IB が行う。
+- fence / idle は既存の待ちを使う（最大2 msの fence 再送、最大1秒の idle）。MASK は投入・再送前にも0を確認し、書かない。Checks は仕様の5ビットで全成功=`0x1F`。global fault は読み取りと記録のみ。失敗時も安全な範囲で診断し、最初の Reason を保持して既存の OOB 解除、slumber、reset、後片付けへ進む。安全に片付いた S-1 の失敗は GMU status=15、片付け失敗は8 / KeepCx。
+- ring 走査は `0xC0DE5EED` の個数と最初のバイト位置を記録する。除外はバイトの半開区間 `[0,0x148)`、`[0x6000,0x6240)`、`[0x6300,0x6400)`、`[0x6800,0x6880)`、`[0x7000,0x7040)`、`[0x7400,0x7840)`、`[0x7C00,0x7C40)`。対象は7566 dword。シェーダ内の即値や正しい出力を範囲外の書き込みとして数えない。走査の結果自体は成功条件には追加しない。
+
+`GpuGmuS1` は REG_BINARY、**756バイト（ULONG 189個）**。既存 ABI は変更しない。
+
+```text
+{ Cp (140-byte GpuGmuG2 layout), ZChecks, ZReason,
+  Packet[9], Ib[53], Shader[32], OutputBefore[16], OutputAfter[16], Data14Before, Data14After,
+  CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+  GlobalStatus[2], GlobalBefore[4], GlobalAfter[4],
+  MaskBefore, MaskAtSubmit, MaskAfter, ScanCount, ScanFirst, ScanDwords, Checks, Prepared }
+```
+
+- ZChecks / ZReason は前段 Z-1c の要約。Checks の bit0 は前段の成功、bit1 は idle・RPTR / WPTR / shadow=82・エラーなし、bit2 はデータ[14]、bit3 は出力[0]、bit4 は出力[1..15]。前段が通った時点で bit0 を立てるので、S-1 が map や前提確認で止まった場合もその事実が残る。
+- Cp は既存と同じ context bank の FaultStatus / FSR / FAR / FSYNR と CP 状態を持つ。SQE の前後と Cp.Packet は未使用、SqeWritten=0。Global の順は sGFSR / sGFSYNR0 / 1 / 2。未記録は `0xFFFFFFFF`、未実行の NTSTATUS は `STATUS_NOT_FOUND`、Checks / Prepared の初期値は0。ScanFirst は ring 内バイト位置で、一致なしは `0xFFFFFFFF`。
+- OutputBefore と Data14Before は CPU が準備した目印、OutputAfter と Data14After が待ち終えた後の値。シェーダの機械語と実機での動作はまだ未検証で、ホスト peer は ISA を実行せず、制御の流れと記録を検査するための応答だけを模擬する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1700 / 0x1701 | 既存2ページの map / 前段の状態と MASK |
+| 0x1702 | 元の global fault |
+| 0x1703 | IB・シェーダ・出力・追加 ring の準備と読み返し |
+| 0x1704 | MASK 再確認、WPTR=82 |
+| 0x1705 / 0x1706 | fence / idle 待ち |
+| 0x1710〜0x171B | RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0、IB1_BASE下位／上位、IB1_REM_SIZE、MASK |
+| 0x1720 | 後の global fault |
+
+ホスト試験ケースに、準備内容と出力、各成功条件の不成立、走査の境界、fence 再送・上限、idle の各条件、エラー割り込みと hang、breadcrumb / map / GX / 前提 / MASK の失敗、最初の Reason の保持、Z-1c が失敗した場合の未投入、従来モードで未実行となること、KeepCx 時のシェーダ・出力保持を追加した。テスト、ビルド、配置、実機実行、版番号変更は行っていない。GX を使う試験なので、実行前には従来どおり端末の再起動と実行確認を行う。
+
+#### 9.21.33 v71 の結果（S-1、2026-11-13）：最初のシェーダが動いた
+
+v71（20.0.2.71、oem129）。ビルド修正はなかった。phone を 19:58 に再起動したあと、EpiGpuProbe=0xBFFFFE80 を実行した。**GpuGmuStatus 0、NtStatus 0**。KeepCx 0、DisableStatus 0、FaultStatus 0 で、phone は落ちていない。前段の Z-1c は今回も PAS が成功している（Step 0x142E、Status 0）。
+
+**GpuGmuS1（756 B）：**
+- Cp：Attempted 1、Reason 0、Status 0。WPTR は 0x49 → 0x52（73 → 82）、RPTR と shadow も 82。RBBM_STATUS 1、INT_STATUS 0、CP_HW_FAULT 0。
+- ZChecks 0x1F、ZReason 0。
+- Packet、IB4（53 dw）、シェーダ（32 dw）の読み返しは、すべて書いた値と一致した。
+- **出力[0] = 0xC0DE5EED、出力[1..15] = 0xFFFFFFFF**、data[14] = 0xCAFE000C。
+- CP_INTERRUPT、CP_PROTECT、CP_STATUS_1 は 0。IB1_BASE は 0x70016300、IB1_REM_SIZE は 0。
+- global fault は前後とも 0、MASK は 0 / 0 / 0。
+- 走査では 7566 dw の中に 0xC0DE5EED は 0 個だった（決めた場所以外には書いていない）。
+- **Checks 0x1F**、Prepared 1。
+
+**結論：** 手で符号化した ir3 のシェーダ（mov ×3、`(rpt5)nop`、`stg.u32`、`end`）を、SP が私たちの context bank を通して読み込んで実行した。`stg` が 64 ビットのアドレス 0x70017C00 に1語を書き、それが CACHE_FLUSH_TS でメモリに出た。これは Epinephrine で初めて動いたシェーダである。CS の設定（§9.21.31 の IB4）は、gen4 の LPAC 用レジスタを含めて足りていた。命令の符号化、instrlen=1、constlen 4 の最小構成も正しかった。
+
+次の候補は、グラフィックスのシェーダで四角形を1枚描くこと（VS/FS、VFD、VPC、RAS、RB、sysmem の描画）。probe の bit がなくなったので、EpiGpuProbe2 などの新しい方式も同時に決める必要がある。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

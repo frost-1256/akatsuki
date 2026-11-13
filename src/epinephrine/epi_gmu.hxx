@@ -25,6 +25,8 @@
 #define EPI_GMU_PROBE_G4        0x4000000UL // modifier: requires 0x3FFFE80 (0x7FFFE80 total), one indirect buffer
 #define EPI_GMU_PROBE_G5        0x8000000UL // modifier: requires 0x7FFFE80 (0xFFFFE80 total), 16x16 RGBA8 solid CP_BLIT
 #define EPI_GMU_PROBE_G5B       0x10000000UL // modifier: requires G5 (0x1FFFFE80 total), magic registers then repeat CP_BLIT
+#define EPI_GMU_PROBE_Z1        0x20000000UL // Z-1c: requires G5b (0x3FFFFE80 total), direct PAS zap; IS_SUPPORTED x1 is advisory
+#define EPI_GMU_PROBE_S1        0x80000000UL // requires Z-1c (0xBFFFFE80 total); one compute invocation/global store
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -246,6 +248,33 @@
 // 1308 prepare, 1309 publish, 130A fence, 130B idle, 1310..131C G5-style GX diagnostics,
 // 1320..1323 magic readback, 1324 global readback. CPU-only ring scan follows without further MMIO.
 
+// GpuGmuZ1: 1368 bytes {Gpu (764-byte GpuGmuG5b layout), Reserved=0,
+// Pas (592-byte EPI_ZAP_TRACE in epi_zap.hxx), Data12Before, Data12After}.
+// Gpu.Data12Before/After refer to data[13] in Z-1; outer Data12 fields retain data[12].
+// Gpu.Packet[0..11] is ring[61..72], [12]=FFFFFFFF. Gpu.Draw.Checks is the five Z-1 bits (require 1F):
+// PAS raw results all successful, idle/RPTR/WPTR/shadow 73, data[13]=CAFE000B, pixels, sentinel.
+// Gpu.Draw.Cp.Reason adds 16=PAS/firmware/claim failure (Pas.Status and Call[] explain it).
+// G5b Checks=B / Reason13 / IO_DEVICE_ERROR may precede Z-1; retain its trace and use Z-1's result.
+// Gpu.Draw.Packet is unused; Gpu.Draw.Ib[36] is the reused G5 IB. Scan now excludes ring[0..72].
+// GpuGmuZ1Pas is independently persisted/flushed before each PAS checkpoint, including 1403 before target stores.
+// Breadcrumbs 1500..1507 initial GX/magic/CCU/global snapshots, 1508 prepare (after PAS), 1509 submit,
+// 150A fence, 150B idle; 1510..151C GX diagnostics and 1520..1524 magic/global diagnostics.
+
+// GpuGmuS1: 756 bytes {Cp (140-byte GpuGmuG2 layout), ZChecks, ZReason, Packet[9], Ib[53], Shader[32],
+// OutputBefore[16], OutputAfter[16], Data14Before, Data14After, CpInterrupt, CpProtect, CpStatus1,
+// IbBaseLow, IbBaseHigh, IbRemaining, GlobalStatus[2], GlobalBefore[4], GlobalAfter[4],
+// MaskBefore, MaskAtSubmit, MaskAfter, ScanCount, ScanFirst, ScanDwords, Checks, Prepared}.
+// Unrecorded DWORDs=FFFFFFFF; Prepared/Checks start at 0, Checks bit0 is set once Z-1c's prerequisite passes.
+// Checks bits: 1 Z-1c succeeded, 2 idle/RPTR/WPTR/shadow 82/no errors, 4 data[14]=CAFE000C,
+// 8 output[0]=C0DE5EED, 16 output[1..15]=FFFFFFFF. Require 1F; parent failure is Cp.Reason=8, no submission.
+// Packet=ring[73..81], IB=ring+6300, shader=ring+6800 (low DWORD first), output=ring+7C00.
+// ScanFirst is a ring byte offset; ScanDwords=7566, excluding [0,148), [6000,6240), [6300,6400),
+// [6800,6880), [7000,7040), [7400,7840), [7C00,7C40) (all offsets hex). Search value C0DE5EED.
+// Global order is sGFSR/sGFSYNR0/1/2, read only; GlobalStatus is diagnostic only. Cp.Packet/SQE fields unused.
+// Breadcrumbs 1700 map, 1701 previous state/MASK, 1702 global originals, 1703 prepare/readback,
+// 1704 publish, 1705 fence, 1706 idle, 1710..171B RPTR/WPTR/HW_FAULT/CP_INT/PROTECT/STATUS_1/
+// RBBM/INT0/IB1_BASE_LO/IB1_BASE_HI/IB1_REM_SIZE/MASK, 1720 global readback. Reasons match G-5.
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off
@@ -270,6 +299,8 @@
 // G4: requires successful G3c; one IB and a return-to-ring event under the same OOB (probe 0x7FFFE80).
 // G5: requires successful G4; CP_BLIT solid fill under the same OOB (probe 0xFFFFE80).
 // G5b: requires G5 completed without transport/access errors; magic registers and repeat fill (probe 0x1FFFFE80).
+// Z1: requires G5b Checks=B and blank pixels; direct PAS zap then SET_SECURE_MODE and repeat fill (0x3FFFFE80).
+// S1: requires successful Z-1c; one compute invocation/global store under the same OOB (0xBFFFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -278,4 +309,5 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
-                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE);
+                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
+                     BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE);

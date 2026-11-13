@@ -13,6 +13,7 @@
 // bus hangs the last step survives the forced reboot.
 
 #include "BDD.hxx"
+#include "epi_zap.hxx"
 #include "epi_hw.hxx"
 #include "epi_gmu.hxx"
 extern "C" {
@@ -495,6 +496,8 @@ typedef struct _EPI_GMU_FW
     ULONG ExpectedVer;      // DTCM word at EPI_GMU_FW_VER_DTCM_OFF after the load, if a block covers it
     PUCHAR Sqe;
     ULONG SqeLen;
+    PUCHAR Zap;
+    ULONG ZapLen;
 } EPI_GMU_FW;
 
 typedef struct _EPI_GMU_BLK { ULONG Addr; ULONG Size; ULONG Type; ULONG Value; } EPI_GMU_BLK;
@@ -615,6 +618,37 @@ static NTSTATUS EpiSqeFwRead(HANDLE Params,EPI_GMU_FW* Fw)
     }
     ZwClose(file);
     if (!NT_SUCCESS(st) && Fw->Sqe!=NULL) { ExFreePoolWithTag(Fw->Sqe,'gpEE'); Fw->Sqe=NULL; }
+    return st;
+}
+static NTSTATUS EpiZapFwRead(HANDLE Params,EPI_GMU_FW* Fw)
+{
+    UNICODE_STRING path; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb;
+    FILE_STANDARD_INFORMATION info={}; HANDLE file=NULL;
+    NTSTATUS st=EpiSetDword(Params,L"EpiGpuProbeStep",0x430);
+    if (NT_SUCCESS(st)) { st=ZwFlushKey(Params); }
+    if (!NT_SUCCESS(st)) { return st; }
+    RtlInitUnicodeString(&path,L"\\DosDevices\\C:\\Epinephrine\\fw\\a660_zap.elf");
+    InitializeObjectAttributes(&oa,&path,OBJ_CASE_INSENSITIVE|OBJ_KERNEL_HANDLE,NULL,NULL);
+    st=ZwCreateFile(&file,GENERIC_READ|SYNCHRONIZE,&oa,&iosb,NULL,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ,
+                    FILE_OPEN,FILE_SYNCHRONOUS_IO_NONALERT|FILE_NON_DIRECTORY_FILE,NULL,0);
+    if (!NT_SUCCESS(st)) { return st; }
+    st=ZwQueryInformationFile(file,&iosb,&info,sizeof(info),FileStandardInformation);
+    if (NT_SUCCESS(st) && info.EndOfFile.QuadPart!=EPI_ZAP_FILE_SIZE) { st=STATUS_INVALID_PARAMETER; }
+    if (NT_SUCCESS(st))
+    {
+        Fw->Zap=static_cast<PUCHAR>(ExAllocatePool2(POOL_FLAG_PAGED,EPI_ZAP_FILE_SIZE,'gpEE'));
+        if (Fw->Zap==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; }
+        else
+        {
+            LARGE_INTEGER pos; pos.QuadPart=0;
+            st=ZwReadFile(file,NULL,NULL,NULL,&iosb,Fw->Zap,EPI_ZAP_FILE_SIZE,&pos,NULL);
+            if (NT_SUCCESS(st) && iosb.Information!=EPI_ZAP_FILE_SIZE) { st=STATUS_IO_DEVICE_ERROR; }
+            if (NT_SUCCESS(st) && !EpiZapValidate(Fw->Zap,EPI_ZAP_FILE_SIZE)) { st=STATUS_INVALID_PARAMETER; }
+            if (NT_SUCCESS(st)) { Fw->ZapLen=EPI_ZAP_FILE_SIZE; }
+        }
+    }
+    ZwClose(file);
+    if (!NT_SUCCESS(st) && Fw->Zap!=NULL) { ExFreePoolWithTag(Fw->Zap,'gpEE'); Fw->Zap=NULL; }
     return st;
 }
 // Inside the CX window (GMU branches on). GmuA maps the CM3 page (dword 0x1F800 at offset 0).
@@ -798,7 +832,9 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
                                                (Flags & EPI_GMU_PROBE_G3C) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_G4) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_G5) ? TRUE : FALSE,
-                                               (Flags & EPI_GMU_PROBE_G5B) ? TRUE : FALSE);
+                                               (Flags & EPI_GMU_PROBE_G5B) ? TRUE : FALSE,
+                                               (Flags & EPI_GMU_PROBE_Z1) ? TRUE : FALSE,Fw->Zap,Fw->ZapLen,
+                                               (Flags & EPI_GMU_PROBE_S1) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -885,7 +921,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 
     // GpuProbeStatus: 0 done, 1 not enabled, 2 GPU_CC not in _CRS, 3 no memory, 4 map failed,
     //                 5 GCC_GPU_CFG_AHB_CLK off (GPU_CC not read), 6 incompatible probe flags,
-    //                 7 RSCC/HFI modifier one-shot persistence failed (no hardware access), 8 SQE source load failed
+    //                 7 one-shot persistence failed (no hardware access), 8 firmware source load failed,
+    //                 9 Z-1b query persistence/transport/retry limit failure (raw SCM replies are diagnostic only)
     ULONG status = 0;
     ULONG n = 0;
     PULONG pairs = NULL;
@@ -926,8 +963,20 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit26 = requires bit25 and its prerequisites (0x7FFFE80), one indirect buffer and return-to-ring event.
     // bit27 = requires bit26 and its prerequisites (0xFFFFE80), 16x16 RGBA8 solid fill without shaders.
     // bit28 = requires bit27 (0x1FFFFE80), magic registers and repeat fill; permits G5 Checks=17.
+    // bit29 = requires bit28 (0x3FFFFE80), direct SMC/PAS zap test then SET_SECURE_MODE and repeat fill.
+    // bit30 = standalone read-only SCM query; no GPU/GMU/SMMU access or firmware loading.
+    // bit31 = requires bit29 (0xBFFFFE80, without bit30), one compute invocation/global store after Z-1c succeeds.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
     if (flags == 0) { status = 1; goto done; }
+    if (flags & EPI_ZAP_PROBE_QUERY)
+    {
+        const NTSTATUS cleared=EpiSetDword(hParams,L"EpiGpuProbe",0);
+        if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status=7; goto done; }
+        if (flags!=EPI_ZAP_PROBE_QUERY) { status=6; goto done; }
+        EPI_ZAP_QUERY_TRACE query;
+        status=NT_SUCCESS(EpiZapQuery(hParams,hDiag,&query)) ? 0UL : 9UL;
+        goto done;
+    }
     if (flags & EPI_RSCC_PROBE_WRITE)
     {
         EpiSetDword(hDiag, L"GpuRsccWStatus", 7);
@@ -945,7 +994,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
                       EPI_GMU_PROBE_SECVID | EPI_GMU_PROBE_ADDR_MODE | EPI_GMU_PROBE_HWCG | EPI_GMU_PROBE_GX_CFG |
                       EPI_GMU_PROBE_STAGE_E | EPI_GMU_PROBE_STAGE_F | EPI_GMU_PROBE_G1 | EPI_GMU_PROBE_G2 |
                       EPI_GMU_PROBE_G3 | EPI_GMU_PROBE_G3B | EPI_GMU_PROBE_G3C | EPI_GMU_PROBE_G4 | EPI_GMU_PROBE_G5 |
-                      EPI_GMU_PROBE_G5B))
+                      EPI_GMU_PROBE_G5B | EPI_GMU_PROBE_Z1 | EPI_GMU_PROBE_S1))
     {
         const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
         if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
@@ -972,7 +1021,9 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             ((flags & EPI_GMU_PROBE_G3C) && !(flags & EPI_GMU_PROBE_G3B)) ||
             ((flags & EPI_GMU_PROBE_G4) && !(flags & EPI_GMU_PROBE_G3C)) ||
             ((flags & EPI_GMU_PROBE_G5) && !(flags & EPI_GMU_PROBE_G4)) ||
-            ((flags & EPI_GMU_PROBE_G5B) && !(flags & EPI_GMU_PROBE_G5)))
+            ((flags & EPI_GMU_PROBE_G5B) && !(flags & EPI_GMU_PROBE_G5)) ||
+            ((flags & EPI_GMU_PROBE_Z1) && !(flags & EPI_GMU_PROBE_G5B)) ||
+            ((flags & EPI_GMU_PROBE_S1) && !(flags & EPI_GMU_PROBE_Z1)))
         { status = 6; goto done; }
     }
     else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }
@@ -1002,6 +1053,13 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         EpiSetDword(hDiag,L"GpuSqeFwStatus",static_cast<ULONG>(sqeStatus));
         EpiSetDword(hDiag,L"GpuSqeFwLen",fw.SqeLen);
         if (!NT_SUCCESS(sqeStatus)) { status=8; goto done; }
+    }
+    if (flags & EPI_GMU_PROBE_Z1)
+    {
+        const NTSTATUS zapStatus=EpiZapFwRead(hParams,&fw);
+        EpiSetDword(hDiag,L"GpuZapFwStatus",static_cast<ULONG>(zapStatus));
+        EpiSetDword(hDiag,L"GpuZapFwLen",fw.ZapLen);
+        if (!NT_SUCCESS(zapStatus)) { status=8; goto done; }
     }
     {
         PHYSICAL_ADDRESS pa;
@@ -1064,6 +1122,7 @@ done:
     if (fwStatus != 0xFFFFFFFF) { EpiSetDword(hDiag, L"GpuFwStatus", fwStatus); }
     if (fw.Data != NULL) { ExFreePoolWithTag(fw.Data, 'gpEE'); }
     if (fw.Sqe != NULL) { ExFreePoolWithTag(fw.Sqe, 'gpEE'); }
+    if (fw.Zap != NULL) { ExFreePoolWithTag(fw.Zap, 'gpEE'); }
     if (cxText != NULL && cxText[0] != L'\0')
     {
         size_t cch = 0;

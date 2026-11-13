@@ -85,6 +85,12 @@ static std::vector<ULONG> g5Writes;
 static bool allowG5bWrites=false, g5bCompletes=true, g5bFill=true, g5bEvent=true, g5bFenceForever=false, g5bBadRptr=false;
 static ULONG g5bFenceDrops=0, g5bErrorBits=0, g5bBadSentinel=0xFFFFFFFF;
 static std::vector<ULONG> g5bWrites;
+static bool allowZ1Writes=false, z1Completes=true, z1Fill=true, z1Event=true, z1Authorized=false;
+static ULONG z1Reserved[0x1000/4]={};
+static std::vector<ULONG> z1Writes;
+static bool allowS1Writes=false,s1Completes=true,s1Store=true,s1Event=true,s1FenceForever=false,s1BadRptr=false;
+static ULONG s1FenceDrops=0,s1ErrorBits=0,s1BadGuard=0xFFFFFFFF,s1Scatter=0xFFFFFFFF;
+static std::vector<ULONG> s1Writes;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -123,7 +129,8 @@ inline void GmuSeedGxRegs() {
 }
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
-inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
+inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
+    if(a.QuadPart==0x8B110000) { assert(allowZ1Writes && size==0x1000 && protection==(PAGE_READWRITE|PAGE_NOCACHE)); return z1Reserved; }
     if(a.QuadPart==0x03D01000) return hwcgIsdbPage;
     if(a.QuadPart==0x03D6A000) return hwcgSpPage;
     for(ULONG i=0;i<RTL_NUMBER_OF(addrPageOffsets);++i) if(a.QuadPart==0x03D00000+addrPageOffsets[i]) {
@@ -149,6 +156,45 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v==82) {
+        assert(allowG2Writes && allowS1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70BF8003,0x70016300,0,53,0x70460004,4,0x70017038,0,0xCAFE000C};
+        const ULONG shader[32]={0x70017C00,0x204CC000,0,0x204CC001,0xC0DE5EED,0x204CC004,
+                              0,0x500,0x01800008,0xC0C60100,0,0x03000000};
+        assert(std::memcmp(g2Ring+73,packet,sizeof(packet))==0 && std::memcmp(g2Ring+0x6800/4,shader,sizeof(shader))==0);
+        // Check key protocol fields without pretending to execute the shader ISA on the host.
+        assert(g2Ring[0x6300/4+0]==0x40AB0001 && g2Ring[0x6300/4+29]==0x70348003);
+        assert(g2Ring[0x6300/4+47]==0x70B30004 && g2Ring[0x6300/4+52]==0x70268000);
+        g2Writes.push_back({0x807,v}); s1Writes.push_back(v);
+        if(s1FenceForever || s1FenceDrops) {
+            if(s1FenceDrops) --s1FenceDrops;
+            gPages[2][0x313]=1; return;
+        }
+        gPages[2][0x313]=0;
+        *GmuCfgReg(0x928)=0x70016300; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=53;
+        if(s1Completes) {
+            if(s1Store) g2Ring[0x7C00/4]=0xC0DE5EED;
+            if(s1BadGuard<16) g2Ring[0x7C00/4+s1BadGuard]=0;
+            if(s1Scatter<0x8000) g2Ring[s1Scatter/4]=0xC0DE5EED;
+            if(s1Event) g2Ring[0x7038/4]=0xCAFE000C;
+            *g2Shadow=82; *GmuCfgReg(0x806)=s1BadRptr ? 81 : 82; *GmuCfgReg(0x92A)=0;
+        }
+        gPages[8][0x210]=g2RbbmBusy ? 2 : 1; gPages[8][0x201]=s1ErrorBits|(g2Hang ? (1UL<<23) : 0);
+        gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0; *p=v; return;
+    }
+    if(p==GmuCfgReg(0x807) && v==73) {
+        assert(allowG2Writes && allowZ1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70E60001,0,0x70268000,0x70BF8003,0x70016100,0,36,0x70460004,4,0x70017034,0,0xCAFE000B};
+        assert(std::memcmp(g2Ring+61,packet,sizeof(packet))==0);
+        g2Writes.push_back({0x807,v}); z1Writes.push_back(v); gPages[2][0x313]=0;
+        if(z1Completes) {
+            if(z1Fill) for(ULONG i=0;i<256;++i) g2Ring[0x7400/4+i]=0x78563412;
+            if(z1Event) g2Ring[0x7034/4]=0xCAFE000B;
+            *g2Shadow=73; *GmuCfgReg(0x806)=73; *GmuCfgReg(0x928)=0x70016100; *GmuCfgReg(0x92A)=0;
+        }
+        gPages[8][0x210]=g2RbbmBusy ? 2 : 1; gPages[8][0x201]=g2Hang ? (1UL<<23) : 0;
+        gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0; *p=v; return;
+    }
     if(p==GmuCfgReg(0x37)) {
         assert(allowG3cWrites && v==(1UL<<20) && !g3cWrites.empty());
         g3cClearWrites.push_back(v);
@@ -363,7 +409,15 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
     diagnostics[name]=v; return 0;
 }
-inline NTSTATUS EpiSetValue(HANDLE,const wchar_t*,ULONG,const void*,ULONG) { return 0; }
+static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
+static ULONG failZapQuerySave=0xFFFFFFFF;
+inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuZapQuery")==0 && value && size) {
+        if(zapQuerySnapshots.size()==failZapQuerySave) {failZapQuerySave=0xFFFFFFFF; return STATUS_IO_DEVICE_ERROR;}
+        const UCHAR* p=static_cast<const UCHAR*>(value); zapQuerySnapshots.emplace_back(p,p+size);
+    }
+    return 0;
+}
 inline void* GmuAlloc(SIZE_T n,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,int) {
     if(FailAllocation()) return nullptr;
     void* p=_aligned_malloc(n,4096); if(p) {allocations[p]=nextPa; nextPa+=(n+4095)&~4095ULL;} return p;

@@ -59,6 +59,9 @@
     <ConfigurationType>Driver</ConfigurationType>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" Condition="'$(Platform)'=='ARM64'">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\marmasm.props" />
+  </ImportGroup>
   <PropertyGroup>
     <OutDir>$(IntDir)</OutDir>
   </PropertyGroup>
@@ -187,7 +190,7 @@
        and for display drivers dxgkrnl reads the first field as the WDDM version: builds made after 21:00
        got 21.x and AddDevice failed with STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182). Keep it at 20.x. -->
   <PropertyGroup>
-    <EpiDriverVersion Condition="'$(EpiDriverVersion)'==''">20.0.2.67</EpiDriverVersion>
+    <EpiDriverVersion Condition="'$(EpiDriverVersion)'==''">20.0.2.71</EpiDriverVersion>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Inf>
@@ -212,6 +215,7 @@
     <ClCompile Include="..\epi_gpu.cxx" />
     <ClCompile Include="..\epi_smmu.cxx" />
     <ClCompile Include="..\epi_gmu.cxx" />
+    <ClCompile Include="..\epi_zap.cxx" />
     <ResourceCompile Include="..\sampledisplay.rc" />
   </ItemGroup>
   <ItemGroup>
@@ -227,4 +231,13 @@
     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemGroup Condition="'$(Platform)'=='ARM64'">
+    <MARMASM Include="..\epi_smc.asm">
+      <PreprocessWithCl>true</PreprocessWithCl>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </MARMASM>
+  </ItemGroup>
+  <ImportGroup Label="ExtensionTargets" Condition="'$(Platform)'=='ARM64'">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\marmasm.targets" />
+  </ImportGroup>
 </Project>
