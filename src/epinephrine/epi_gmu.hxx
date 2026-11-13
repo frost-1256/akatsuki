@@ -33,9 +33,10 @@
 #define EPI_GMU_PROBE2_A1      0x8UL // requires R1/D1/V1; Probe2=15, 241-frame rotating square
 #define EPI_GMU_PROBE2_T1      0x10UL // requires A1; Probe2=31, texture prefetch quad
 #define EPI_GMU_PROBE2_W1      0x20UL // requires T1; Probe2=63, opt-in 16-KB ring/wrap test
+#define EPI_GMU_PROBE2_M1      0x40UL // requires W1; Probe2=127, GMEM tile clear/load/store
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -418,6 +419,31 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // Breadcrumbs: 1D00/01 map/prior, 1D02 global, 1D08 backup, 1D03 prepare, 1D40..1D4A every 64 pubs,
 // 1D10..1D1B diagnostics, 1D20 global, 1D30 save/flush + 2-second hold, 1D31 restore, 1D32 verify.
 
+// GpuGmuM1: 600 bytes (150 DWORDs), ULONG/NTSTATUS in this exact order:
+// Cp (140-byte G2), WChecks, WReason, CcuBefore, CcuAfter, RbCntlLive,
+// TileData[12], FlushData[2], Data42, TilesDone, WaitUs, ElapsedMs,
+// RingBad, RingFirst, RingValue, RingExpected, OutsideRingBad, OutsideRingFirst, OutsideRingOld, OutsideRingNew,
+// SqGood[2], SqBad, SqFirst, SqValue, SqExpected, ClearGood, ClearBad, ClearFirst, ClearValue,
+// BoxGood, BoxBad, BoxFirst, BoxValue, BoxOld, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew,
+// TileBad[12], Sample[24], CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, ScanCount, ScanFirst, ScanDwords,
+// RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus.
+// Tile order: A then B, each (3,0),(4,0),(5,0),(3,1),(4,1),(5,1). TilesDone is the contiguous valid TS prefix.
+// SqGood parity 0/1 must be 12800 each; ClearGood=22016 (A), BoxGood=19968 (B), OutsideChanged=0.
+// TileBad counts all pixel mismatches within each selected tile, using x+8 for pass B.
+// Samples: T1's ten points, then (404,2),(668,125), each even then odd; coordinates are (column,view row).
+// Checks: 1 W1 + preflight, 2 all tile/flush/final TS + idle/endpoints3272/CCU10000000/no IRQ errors,
+// 4 final ring + entire outside-ring match, 8 exact square, 16 clear/load background + outside, 32 restored band.
+// RingFirst is a DWORD index, OutsideRingFirst/ScanFirst are allocation byte offsets; pixel Firsts are band byte offsets.
+// ScanDwords=1182. Scan excludes W1 ranges plus [5B80,5EC0),[7078,70B4),[7840,7B40).
+// Unread values/absent offsets FFFFFFFF; unexecuted status NOT_FOUND. TilesDone/HoldMs/Checks/Prepared start at 0.
+// Breadcrumbs: 1E00 map, 01 prior, 02 global, 08 backup, 03 prepare, 04 publish/bounded wait,
+// 10..1B CP diagnostics, 20 global, 1C CcuAfter; 30 save/flush + 5-second hold, 31 restore, 32 verify.
+// Reasons: 8 parent, 12 prior/resources, 15 MASK, 13 preparation/result/restore, 16 100-ms wait, 18 RPTR>=4096.
+// 10 remains 2-ms AHB timeout; 14 IRQ error, 11 hang, 5 map/pool, 6 breadcrumb/save/flush/hold.
+// No further WPTR publications or GX diagnostic reads after Reason18. Band restore/free still runs.
+
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -454,7 +480,8 @@ ULONG EpiGmuStackMinimum();
 // V1: Probe2=7 after successful D1 restore; integer-checked varying triangle under the same OOB.
 // A1: Probe2=15 after V1 restore; 241 sequential frames, no ring wrap, final 2-second hold and restore.
 // T1: Probe2=31 after A1 restore; nearest texture prefetch quad, exact pixels, 5-second hold and restore.
-// W1: Probe2=63 only; G1 RB_CNTL=20B from startup, then 1000 packets / 650 pubs with a 4096-DWORD ring.
+// M1: Probe2=127 only; after W1 restore, GMEM clear/load/draw/store, WPTR3095->3272; requires W1.
+// W1: Probe2=63 or127; G1 RB_CNTL=20B from startup, then 1000 packets / 650 pubs with a 4096-DWORD ring.
 // Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -466,4 +493,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE);

@@ -2,6 +2,7 @@
 #pragma once
 #include "nt_shim.hxx"
 #include <cwchar>
+#include <algorithm>
 #include <vector>
 #include <string>
 using UCHAR=unsigned char;
@@ -203,9 +204,86 @@ inline void W1PeerComplete(ULONG pub,ULONG target,ULONG last) {
     g2Ring[0x7074/4]=0xB1000000|(pub==w1WrongPub ? 0xFFFF : last);
     *g2Shadow=target; *GmuCfgReg(0x806)=target; *GmuCfgReg(0x92A)=0; w1Cursor=target;
     if(pub==649) {
+        *GmuCfgReg(0x8E07)=0x10000000; // final T-1 sysmem state
         if(w1DamageRing<4096) g2Ring[w1DamageRing]^=1;
         if(w1DamageOutside>=0x4000 && w1DamageOutside<0x8000) g2Ring[w1DamageOutside/4]^=1;
     }
+}
+// M-1 protocol peer: interprets the submitted IB/event order and a single software tile.
+// This validates command transport and diagnostics, not GMEM hardware semantics.
+static bool allowM1Writes=false,m1Active=false,m1Pending=false,m1Completes=true,m1SaveFails=false;
+static bool m1NoClear=false,m1NoLoad=false,m1NoStore=false,m1FenceForever=false,m1BadSize=false,m1ShadowOnly=false;
+static ULONG m1DelayUs=0,m1StopTile=0xFFFFFFFF,m1ErrorBits=0,m1FenceDrops=0,m1WrongTile=0xFFFFFFFF;
+static ULONG m1DamageRing=0xFFFFFFFF,m1DamageOutside=0xFFFFFFFF,m1DamagePixel=0xFFFFFFFF;
+static ULONGLONG m1Due=0;
+static std::vector<ULONG> m1Writes,m1Tiles,m1TileMemory(128*64);
+// Command-stream registers outside the pages modelled by GmuCfgReg (GRAS/RB/VFD/SP_TP) live in m1Regs.
+static std::map<ULONG,ULONG> m1Regs;
+inline ULONG& M1Reg(ULONG reg) {
+    const ULONG page=reg*4&~0xFFFUL;
+    for(ULONG i=0;i<RTL_NUMBER_OF(addrPageOffsets);++i) if(page==addrPageOffsets[i]) return *GmuCfgReg(reg);
+    return m1Regs[reg];
+}
+inline void M1Blit(ULONG info) {
+    const ULONG off=M1Reg(0x8890),ox=off&0xFFFF,oy=off>>16;
+    const ULONG tl=M1Reg(0x88D1),br=M1Reg(0x88D2);
+    const ULONG base=M1Reg(0x88D8),pitch=(M1Reg(0x88DA))*64;
+    if(info==0xF2) {if(!m1NoClear) std::fill(m1TileMemory.begin(),m1TileMemory.end(),M1Reg(0x88DF)); return;}
+    if(info==3 && m1NoLoad) return;
+    if(info==0 && m1NoStore) return;
+    assert((info==0 || info==3) && pitch==8640 && M1Reg(0x88D7)==0x1800);
+    for(ULONG y=0;y<64;++y) for(ULONG x=0;x<128;++x) {
+        const ULONG px=ox+x,py=oy+y;
+        if(px<(tl&0xFFFF) || px>(br&0xFFFF) || py<(tl>>16) || py>(br>>16)) continue;
+        const ULONG byte=base-0x71000000+py*pitch+px*4; assert(byte<0x120000);
+        if(info==3) m1TileMemory[y*128+x]=d1Band[byte/4];
+        else d1Band[byte/4]=m1TileMemory[y*128+x];
+    }
+}
+inline bool M1Execute(ULONG begin,ULONG count,ULONG depth=0) {
+    assert(depth<3 && begin+count<=0x8000/4);
+    for(ULONG p=begin;p<begin+count;) {
+        const ULONG h=g2Ring[p++],kind=h>>28;
+        if(kind==4) {
+            const ULONG reg=(h>>8)&0x3FFFF,n=h&0x7F; assert(p+n<=begin+count);
+            for(ULONG j=0;j<n;++j) M1Reg(reg+j)=g2Ring[p++];
+        } else {
+            assert(kind==7); const ULONG op=(h>>16)&0x7F,n=h&0x3FFF; assert(p+n<=begin+count);
+            if(op==0x3F) {assert(n==3 && g2Ring[p+1]==0); if(!M1Execute((g2Ring[p]-0x70010000)/4,g2Ring[p+2],depth+1)) return false;}
+            else if(op==0x46) {
+                const ULONG event=g2Ring[p];
+                if(event==30) {assert(n==1); M1Blit(M1Reg(0x88E3));}
+                else if(n==4) {
+                    const ULONG dest=(g2Ring[p+1]-0x70010000)/4; assert(dest<0x8000/4 && g2Ring[p+2]==0);
+                    const ULONG value=g2Ring[p+3]; g2Ring[dest]=value;
+                    if(event==26) {
+                        const ULONG tile=value&0xFF; assert(tile==m1Tiles.size()); m1Tiles.push_back(tile);
+                        if(tile==m1WrongTile) g2Ring[dest]^=1;
+                        if(tile==m1StopTile) return false;
+                    }
+                }
+            } else if(op==0x38) {
+                assert(n==3 && g2Ring[p]==0x84 && g2Ring[p+1]==1 && g2Ring[p+2]==6);
+                const ULONG off=M1Reg(0x8890),ox=off&0xFFFF,oy=off>>16;
+                const ULONG shift=M1Reg(0xA010)==0x700169C0 ? 8 : 0;
+                for(ULONG y=0;y<64;++y) for(ULONG x=0;x<128;++x) {
+                    const ULONG px=ox+x,py=oy+y;
+                    if(px>=460+shift && px<620+shift && py>=24 && py<104)
+                        m1TileMemory[y*128+x]=g2Ring[0x6C00/4+((py-24)/10)*16+(px-460-shift)/20];
+                }
+            }
+            p+=n;
+        }
+    }
+    return true;
+}
+inline void M1PeerComplete() {
+    m1Pending=false;
+    const bool done=M1Execute(3095,177);
+    *g2Shadow=done ? 3272 : 3095; *GmuCfgReg(0x806)=*g2Shadow; *GmuCfgReg(0x92A)=done ? 0 : 23;
+    if(m1DamageRing<4096) g2Ring[m1DamageRing]^=1;
+    if(m1DamageOutside>=0x4000 && m1DamageOutside<0x8000) g2Ring[m1DamageOutside/4]^=1;
+    if(m1DamagePixel<d1Band.size()) d1Band[m1DamagePixel]^=1;
 }
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
@@ -255,7 +333,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes || allowW1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes || allowW1Writes || allowM1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
         ++d1Maps; d1Restoring=false; return d1Band.data();
     }
@@ -277,6 +355,7 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(D1BandPointer(p)) return *p;
     if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
     if(t1Pending && testInterruptTime>=t1Due) T1PeerComplete();
+    if(m1Pending && testInterruptTime>=m1Due) M1PeerComplete();
     if(w1Pending && testInterruptTime>=w1Due) W1PeerComplete(w1PendingPub,w1PendingTarget,w1PendingLast);
     if(g3cPolling && g3cPending) {
         if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
@@ -294,6 +373,19 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && allowM1Writes && m1Active) {
+        assert(v==3272 && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
+        m1Writes.push_back(v); g2Writes.push_back({0x807,v});
+        if(m1BadSize) {*p=v; *g2Shadow=4096; *GmuCfgReg(0x806)=m1ShadowOnly ? 3095 : 4096; gPages[2][0x313]=m1FenceForever ? 1 : 0; return;}
+        if(m1FenceForever || m1FenceDrops) {if(m1FenceDrops) --m1FenceDrops; gPages[2][0x313]=1; return;}
+        gPages[2][0x313]=0; *p=v; *GmuCfgReg(0x928)=0x70015B80; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=45;
+        gPages[8][0x210]=1; gPages[8][0x201]=m1ErrorBits; gPages[2][0x30C]=0;
+        if(m1Completes) {
+            if(m1DelayUs) {m1Pending=true; m1Due=testInterruptTime+m1DelayUs*10;}
+            else M1PeerComplete();
+        }
+        return;
+    }
     if(p==GmuCfgReg(0x807) && allowW1Writes && w1Active) {
         assert(*GmuCfgReg(0x802)==0x20B && v<4096 && *GmuCfgReg(0x38)==0);
         w1Writes.push_back(v); g2Writes.push_back({0x807,v});
@@ -692,10 +784,11 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
+        if(v==0x1E03 && allowM1Writes) m1Active=true;
         if(v==0x1D03 && allowW1Writes) w1Active=true;
         if(v>=0x1D40 && v<=0x1D4A) w1Progress.push_back(v);
         if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
-        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31 || v==0x1E31) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -707,6 +800,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuM1")==0 && value && size && m1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuW1")==0 && value && size && w1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuT1")==0 && value && size && t1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuA1")==0 && value && size && a1SaveFails) return STATUS_IO_DEVICE_ERROR;

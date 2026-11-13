@@ -4922,6 +4922,378 @@ RingFirst は ring 内の DWORD 番号0..4095、OutsideRingFirst は割り当て
 
 **次：** 2（GMEM / tile rendering）の仕様を書く。
 
+#### 9.21.53 M-1 の提案：GMEM（tile 描画）で T-1 の正方形を描き、clear・load・store を確かめる（文章仕様）
+
+いままでの描画は、すべて sysmem に直接描いていた（`BUFFERS_IN_SYSMEM`、`RM6_BYPASS`、RB_CCU_CNTL 0x10000000）。M-1 では、Adreno 本来の描き方である GMEM（GPU 内蔵の 512 KB のメモリ）を使う tile 描画を初めて行う。
+
+- 画面を 128×64 画素の tile（bin）に分け、tile ごとに GMEM の上で描く。
+- 描いた結果は BLIT event で sysmem に書き戻す（store、resolve）。
+- 描く前の GMEM は、パス A では clear（単色で塗る）、パス B では load（sysmem から読み込む、unresolve）で用意する。
+- 描く内容は T-1 の textured quad（IB9 の state と draw）をそのまま使う。shader、texture、頂点は T-1 のものを、書き直さずに使う。
+- hardware binning（VSC、visibility stream）は使わない。CP_SET_VISIBILITY_OVERRIDE 1 で、どの tile でもすべての draw を実行する（Turnip の `use_hw_binning() == false` の経路）。
+
+**前提の事実（Mesa / Linux の写しで確かめた値）：**
+- GMEM は 512 KB（`a6xx_catalog.c` の chip id 0x06030500、`.gmem = SZ_512K`）。
+- CCU（`freedreno_devices.py` の a6xx_base と A635）：num_ccu 2、`sysmem_per_ccu_color_cache_size` 64 KB、`gmem_ccu_color_cache_fraction` QUARTER（2）、`has_gmem_fast_clear` 真、`concurrent_resolve` 偽。
+  - Turnip（`tu_device.cc`）の `ccu_offset_gmem` は `gmem_size − (num_ccu × 64 KB) / 4` で、**0x78000**。
+  - GMEM 描画中の RB_CCU_CNTL は、COLOR_OFFSET 0x78000（bit23..31 に 0x78）と COLOR_CACHE_SIZE QUARTER（bit21..22 に 2）で **0x3C400000**。DEPTH_OFFSET 0、GMEM_FAST_CLEAR_DISABLE 0、CONCURRENT_RESOLVE 0。
+  - sysmem に戻すときは、いままでの **0x10000000**。
+  - GMEM のうち 0..0x78000 を tile に使ってよい。tile 1 枚（128×64×4 B = 32 KB）は GMEM の 0 番地に置く。
+- 揃え：`tile_align_w / h` は 32 / 16、`gmem_align_w / h` は 16 / 4。
+  - BLIT event による store は 16×4 単位でしか書けない。
+  - Turnip は blit scissor を外側に揃え（`tu6_emit_blit_scissor(align=true)`）、揃わない場合は別の遅い経路（`tu_attachment_store_unaligned`）を使う。
+- bin の大きさ：GRAS_BIN_CONTROL / RB_BIN_CONTROL の BINW は 32 画素単位（bit0..5）、BINH は 16 画素単位（bit8..14）。
+  - 128×64 なら 0x404。
+  - RENDER_MODE 0（RENDERING_PASS）、BUFFERS_LOCATION 0（BUFFERS_IN_GMEM）。
+- CP_SET_MARKER（Linux `adreno_pm4.xml` の新しい名前）：
+  - RM6_DIRECT_RENDER 1（旧 RM6_BYPASS）、RM6_BIN_RENDER_START 4、RM6_BIN_RESOLVE 6、RM6_BIN_RENDER_END 7。
+  - USES_GMEM は **bit4**。bit8 の MARKER_MODE は立てない。
+  - Turnip の順序は `tu6_emit_tile_select` → draw → `tu6_emit_tile_store` → WFI → `RM6_BIN_RENDER_END`。M-1 では 0x14 → 描画 → 0x16 → store → WFI → 7 になる。
+- event：
+  - BLIT（CCU_RESOLVE）は 30（0x1E）で、seqno なし（1 dw）。
+  - Turnip の `FD_CCU_CLEAN_BLIT_CACHE` は、A6XX では PC_CCU_RESOLVE_TS（26、0x1A）。「BLIT が使う小さな cache を flush する」TS event である。
+- RB_BLIT_INFO の TYPE：STORE 0、STORE_AND_CLEAR 1、CLEAR 2、LOAD 3。clear は CLEAR_MASK 0xF（bit4..7）も立てて 0xF2。
+- RB_BLIT_DST_INFO：TILE6_LINEAR、MSAA_ONE、WZYX、FMT6_8_8_8_8_UNORM（0x30 を bit7 から）で **0x1800**。
+  - RB_BLIT_DST は 64 B 境界が必要。BASEA 0x71008A00 / BASEB 0x71009AC0 は条件を満たす（MRT と同じアドレス）。
+  - RB_BLIT_DST_PITCH は MRT と同じ 8640 B（raw 135 = 0x87）。
+- 書き戻し先のアドレス：Turnip は RB_BLIT_DST に image の先頭を入れ、tile の位置は hardware が window offset から足す。M-1 も同じく、パスごとに MRT と同じ BASE を入れる。
+- clear 色：`pack_blit_event_clear_value` は R8G8B8A8 の場合、DW0 にメモリ上の 1 画素と同じ形の値を入れる。
+  - M-1 の clear 色は **0xFF2E5A8C**。
+  - 下位 byte が texel の 0x40 / 0xC0 と違い、白とも黒とも違う。
+
+**パスと tile：**
+- 画素の配置はいままでどおり。パス A は偶数行、パス B は奇数行に描く。パス B の座標は画面より 8 画素右にずれる（BASEB = 奇数行の先頭 − 32 B）。
+- パスごとの blit scissor（パス座標、16×4 に外側へ揃える）。どちらも箱（列 412..667）より少し広い。
+  - パス A：x 400..671、y 0..127。画面では偶数行の列 400..671。
+  - パス B：x 416..687、y 0..127。画面では奇数行の列 408..679。
+- tile の格子はパス座標の 0 から始まる。tx 3..5（x 384..767）、ty 0..1（y 0..127）の 6 枚を使う。
+  - どちらのパスも同じ 6 枚を使う。
+  - 正方形（パス A の x 460..619、パス B の x 468..627、y 24..103）は、tile の境目で 4 つに分かれる。
+  - 正方形の画素数（パリティ、tx、ty）：A の (3,0) / (3,1) が 2080、(4,0) / (4,1) が 4320。B の (3,0) / (3,1) が 1760、(4,0) / (4,1) が 4640。tx 5 には正方形がない。
+- tile の順は ty を外側、tx を内側にする：(3,0)、(4,0)、(5,0)、(3,1)、(4,1)、(5,1)。tile k（0..11）のうち、0..5 がパス A、6..11 がパス B。
+
+**期待する画面**（W-1 の復元の後、band が退避値と同じ状態から始める）：
+- パス A（偶数行）：
+  - 正方形の 12800 画素は T-1 の texel。
+  - blit scissor の中で正方形の外（列 400..671、22016 画素）は clear 色 0xFF2E5A8C。箱の外の列 400..411 と 668..671 も含む。
+  - それ以外は退避値のまま。
+- パス B（奇数行）：
+  - 正方形の 12800 画素は T-1 の texel。
+  - それ以外（箱の残り 19968 画素、列 408..411 / 668..679、ほかすべて）は退避値のまま。load してから store するので、変わらないはずである。
+- この組み合わせで、次の失敗を見分けられる。
+  - GMEM を経由せずに sysmem に直接描いた場合：パス A では store が clear 色で上書きするので、正方形が消える。
+  - load が効かない場合：パス B の残りが、GMEM に残ったパス A の内容（clear 色と正方形の断片）になる。
+  - clear が効かない場合：パス A の残りが clear 色にならない。
+  - window offset が違う場合：正方形の位置がずれる。
+  - blit scissor の揃えが違う場合：scissor の外が変わる。
+
+**配置**（どれも ring の外。R0 = 0x70010000）：
+
+| 名前 | IOVA | 大きさ | 中身 |
+|---|---|---|---|
+| IB10S | 0x70015B80 | 45 dw | 設定（CCU を GMEM へ、bin、blit の共通レジスタ） |
+| IB10PA | 0x70015C40 | 21 dw | パス A の state（screen scissor、VB C、MRT / blit の宛先 BASEA、blit scissor） |
+| IB10PB | 0x70015CC0 | 21 dw | パス B の state（VB D、BASEB） |
+| IB10TA | 0x70015D40 | 23 dw | パス A の tile 本体（clear → draw → store） |
+| IB10TB | 0x70015DC0 | 23 dw | パス B の tile 本体（load → draw → store） |
+| IB10E | 0x70015E40 | 30 dw | 後始末（CCU を sysmem へ、bin / window を sysmem の値へ戻す） |
+| SEL0..11 | 0x70017840 + 0x40×k | 16 dw ずつ | tile k の選択（marker 0x14、window scissor、window offset） |
+| data[30..41] | 0x70017078 + 4k | 12 dw | tile k の後の PC_CCU_RESOLVE_TS：0xB2000000｜k |
+| data[42] | 0x700170A8 | 1 dw | ring の CACHE_FLUSH_TS：0xCAFE001A |
+| data[43] / [44] | 0x700170AC / B0 | 2 dw | IB10S の PC_CCU_FLUSH_COLOR_TS / DEPTH_TS：0xB2000100 / 0xB2000101 |
+
+- 使う範囲は 0x5B80..0x5EB8、0x7078..0x70B4、0x7840..0x7B40。どれも W-1 の走査で除外していなかった（0 であることを確かめた）範囲にある。
+- IB9、FS4、VB C / D、texture などの T-1 の内容は、読み直すだけで書き換えない。
+
+**IB10S**（0x70015B80）：
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x700170AC、0、0xB2000100 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[43] |
+| 2 | 5 | pkt7 0x46 ×4 | 0x70460004 | 0x1C、0x700170B0、0、0xB2000101 | CP_EVENT_WRITE PC_CCU_FLUSH_DEPTH_TS -> data[44] |
+| 3 | 10 | pkt7 0x46 ×1 | 0x70460001 | 0x19 | CP_EVENT_WRITE PC_CCU_INVALIDATE_COLOR |
+| 4 | 12 | pkt7 0x46 ×1 | 0x70460001 | 0x18 | CP_EVENT_WRITE PC_CCU_INVALIDATE_DEPTH |
+| 5 | 14 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 6 | 15 | pkt4 0x8E07 ×1 | 0x408E0701 | 0x3C400000 | RB_CCU_CNTL (GMEM: COLOR_OFFSET 0x78000, COLOR_CACHE_SIZE QUARTER) |
+| 7 | 17 | pkt7 0x1D ×1 | 0x709D0001 | 0 | CP_SKIP_IB2_ENABLE_GLOBAL |
+| 8 | 19 | pkt4 0x8800 ×2 | 0x48880002 | 0x200404、0x10 | RB_BIN_CONTROL (128x64, GMEM), RB_RENDER_CNTL (CCUSINGLECACHELINESIZE 2) |
+| 9 | 22 | pkt4 0x80A1 ×1 | 0x4880A101 | 0x200404 | GRAS_BIN_CONTROL |
+| 10 | 24 | pkt4 0x88D3 ×1 | 0x4088D301 | 0x404 | RB_BIN_CONTROL2 |
+| 11 | 26 | pkt4 0xA007 ×1 | 0x40A00701 | 0 | VFD_MODE_CNTL (RENDERING_PASS) |
+| 12 | 28 | pkt4 0x88D0 ×1 | 0x4088D001 | 0 | RB_UNKNOWN_88D0 |
+| 13 | 30 | pkt4 0x88D5 ×2 | 0x4088D502 | 0、0 | RB_BLIT_GMEM_MSAA_CNTL (1 sample), RB_BLIT_BASE_GMEM 0 |
+| 14 | 33 | pkt4 0x88DB ×4 | 0x4888DB04 | 0、0、0、0 | RB_BLIT_DST_ARRAY_PITCH, RB_BLIT_FLAG_DST lo/hi, RB_BLIT_FLAG_DST_PITCH |
+| 15 | 38 | pkt4 0x88DF ×4 | 0x4088DF04 | 0xFF2E5A8C、0、0、0 | RB_BLIT_CLEAR_COLOR_DW0..3 |
+| 16 | 43 | pkt4 0x8827 ×1 | 0x48882701 | 0 | RB_MRT[0].BASE_GMEM |
+
+**IB10PA**（0x70015C40）：
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x19C、0x7F029B | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 2 | 3 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70016900、0、0xC0、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 3 | 8 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71008A00、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 4 | 13 | pkt4 0x88D1 ×2 | 0x4888D102 | 0x190、0x7F029F | RB_BLIT_SCISSOR_TL/BR |
+| 5 | 16 | pkt4 0x88D7 ×4 | 0x4888D704 | 0x1800、0x71008A00、0、0x87 | RB_BLIT_DST_INFO, RB_BLIT_DST lo/hi, RB_BLIT_DST_PITCH |
+
+**IB10PB**（0x70015CC0）：IB10PA と同じ形で、値だけが違う。
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x1A4、0x7F02A3 | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 2 | 3 | pkt4 0xA010 ×4 | 0x40A01004 | 0x700169C0、0、0xC0、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 3 | 8 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71009AC0、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 4 | 13 | pkt4 0x88D1 ×2 | 0x4888D102 | 0x1A0、0x7F02AF | RB_BLIT_SCISSOR_TL/BR |
+| 5 | 16 | pkt4 0x88D7 ×4 | 0x4888D704 | 0x1800、0x71009AC0、0、0x87 | RB_BLIT_DST_INFO, RB_BLIT_DST lo/hi, RB_BLIT_DST_PITCH |
+
+**IB10TA**（0x70015D40）：
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x64 ×1 | 0x70640001 | 1 | CP_SET_VISIBILITY_OVERRIDE |
+| 2 | 2 | pkt7 0x63 ×1 | 0x70E30001 | 0 | CP_SET_MODE |
+| 3 | 4 | pkt4 0x88E3 ×1 | 0x4088E301 | 0xF2 | RB_BLIT_INFO (CLEAR, mask 0xF) |
+| 4 | 6 | pkt7 0x46 ×1 | 0x70460001 | 0x1E | CP_EVENT_WRITE BLIT (CLEAR, mask 0xF) |
+| 5 | 8 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 6 | 9 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、6 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 6 vertices) |
+| 7 | 13 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 8 | 14 | pkt7 0x65 ×1 | 0x70E50001 | 0x16 | CP_SET_MARKER RM6_BIN_RESOLVE | USES_GMEM |
+| 9 | 16 | pkt4 0x88E3 ×1 | 0x4088E301 | 0 | RB_BLIT_INFO (STORE) |
+| 10 | 18 | pkt7 0x46 ×1 | 0x70460001 | 0x1E | CP_EVENT_WRITE BLIT (STORE) |
+| 11 | 20 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 12 | 21 | pkt7 0x65 ×1 | 0x70E50001 | 7 | CP_SET_MARKER RM6_BIN_RENDER_END |
+
+**IB10TB**（0x70015DC0）：IB10TA と同じで、#3 / #4 だけが LOAD（RB_BLIT_INFO 3）になる。
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x64 ×1 | 0x70640001 | 1 | CP_SET_VISIBILITY_OVERRIDE |
+| 2 | 2 | pkt7 0x63 ×1 | 0x70E30001 | 0 | CP_SET_MODE |
+| 3 | 4 | pkt4 0x88E3 ×1 | 0x4088E301 | 3 | RB_BLIT_INFO (LOAD) |
+| 4 | 6 | pkt7 0x46 ×1 | 0x70460001 | 0x1E | CP_EVENT_WRITE BLIT (LOAD) |
+| 5 | 8 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 6 | 9 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、6 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 6 vertices) |
+| 7 | 13 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 8 | 14 | pkt7 0x65 ×1 | 0x70E50001 | 0x16 | CP_SET_MARKER RM6_BIN_RESOLVE | USES_GMEM |
+| 9 | 16 | pkt4 0x88E3 ×1 | 0x4088E301 | 0 | RB_BLIT_INFO (STORE) |
+| 10 | 18 | pkt7 0x46 ×1 | 0x70460001 | 0x1E | CP_EVENT_WRITE BLIT (STORE) |
+| 11 | 20 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 12 | 21 | pkt7 0x65 ×1 | 0x70E50001 | 7 | CP_SET_MARKER RM6_BIN_RENDER_END |
+
+**IB10E**（0x70015E40）：最後のレジスタの値は、W-1 の後（T-1 のパス B の後）と同じに戻す。
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x46 ×1 | 0x70460001 | 0x19 | CP_EVENT_WRITE PC_CCU_INVALIDATE_COLOR |
+| 2 | 2 | pkt7 0x46 ×1 | 0x70460001 | 0x18 | CP_EVENT_WRITE PC_CCU_INVALIDATE_DEPTH |
+| 3 | 4 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 4 | 5 | pkt4 0x8E07 ×1 | 0x408E0701 | 0x10000000 | RB_CCU_CNTL (back to sysmem) |
+| 5 | 7 | pkt4 0x8800 ×2 | 0x48880002 | 0xC00000、0 | RB_BIN_CONTROL (BUFFERS_IN_SYSMEM), RB_RENDER_CNTL 0 |
+| 6 | 10 | pkt4 0x80A1 ×1 | 0x4880A101 | 0xC00000 | GRAS_BIN_CONTROL |
+| 7 | 12 | pkt4 0x88D3 ×2 | 0x4088D302 | 0、0 | RB_BIN_CONTROL2, RB_WINDOW_OFFSET2 |
+| 8 | 15 | pkt4 0x8890 ×1 | 0x48889001 | 0 | RB_WINDOW_OFFSET |
+| 9 | 17 | pkt4 0xB4D1 ×1 | 0x48B4D101 | 0 | SP_WINDOW_OFFSET |
+| 10 | 19 | pkt4 0xB307 ×1 | 0x48B30701 | 0 | SP_TP_WINDOW_OFFSET |
+| 11 | 21 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x1A4、0x7F02A3 | GRAS_SC_WINDOW_SCISSOR_TL/BR (T-1 pass B value) |
+| 12 | 24 | pkt4 0x840A ×2 | 0x48840A02 | 0x1A4、0x7F02A3 | GRAS_2D_RESOLVE_CNTL_1/2 (T-1 pass B value) |
+| 13 | 27 | pkt7 0x65 ×1 | 0x70E50001 | 1 | CP_SET_MARKER RM6_DIRECT_RENDER |
+| 14 | 29 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+**SEL k**（0x70017840 + 0x40×k）：tile (tx, ty) の左上を (x1, y1) = (128·tx, 64·ty)、右下を (x1+127, y1+63) とする。下は SEL0（tile (3,0)、左上 (384, 0)）。
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x65 ×1 | 0x70E50001 | 0x14 | CP_SET_MARKER RM6_BIN_RENDER_START | USES_GMEM |
+| 2 | 2 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x180、0x3F01FF | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 3 | 5 | pkt4 0x840A ×2 | 0x48840A02 | 0x180、0x3F01FF | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 4 | 8 | pkt4 0x8890 ×1 | 0x48889001 | 0x180 | RB_WINDOW_OFFSET |
+| 5 | 10 | pkt4 0x88D4 ×1 | 0x4888D401 | 0x180 | RB_WINDOW_OFFSET2 |
+| 6 | 12 | pkt4 0xB4D1 ×1 | 0x48B4D101 | 0x180 | SP_WINDOW_OFFSET |
+| 7 | 14 | pkt4 0xB307 ×1 | 0x48B30701 | 0x180 | SP_TP_WINDOW_OFFSET |
+
+- SEL k の tile は `(tx, ty) = [(3,0),(4,0),(5,0),(3,1),(4,1),(5,1)][k mod 6]`。
+- window offset の 4 つ（RB / RB2 / SP / SP_TP）には (x1, y1) を入れる。window scissor と 2D_RESOLVE_CNTL には (x1, y1)..(x1+127, y1+63) を入れる。
+- 値の例：(3,0) は offset 0x180、BR 0x3F01FF。(5,1) は offset 0x400280、BR 0x7F02FF。
+
+**ring packet**（1 回の投入、177 dw、WPTR 3095 → 3272）：
+1. `CP_INDIRECT_BUFFER` で IB10S（45 dw）、IB10PA（21 dw）を呼ぶ。
+2. k = 0..11 について、次を並べる。
+   - k = 6 の前に `CP_INDIRECT_BUFFER` IB10PB（21 dw）。
+   - `CP_INDIRECT_BUFFER` SEL k（16 dw）。
+   - `CP_INDIRECT_BUFFER` IB10TA（k < 6）または IB10TB（k ≥ 6）（23 dw）。
+   - `CP_EVENT_WRITE` PC_CCU_RESOLVE_TS（0x70460004、26、data[30+k]、0、0xB2000000｜k）。
+3. `CP_INDIRECT_BUFFER` IB10E（30 dw）。
+4. `CP_EVENT_WRITE` CACHE_FLUSH_TS（0x70460004、4、0x700170A8、0、0xCAFE001A）。
+- 先頭の 21 dw は `70BF8003 70015B80 0 2D 70BF8003 70015C40 0 15 70BF8003 70017840 0 10 70BF8003 70015D40 0 17 70460004 1A 70017078 0 B2000000`。
+- 3095 + 177 = 3272 < 4096 なので折り返さない。
+
+**Turnip と違えたところ：**
+- GRAS_BIN_CONTROL / RB_BIN_CONTROL：Turnip は LRZ feedback の mask（EARLY_LRZ_LATE_Z）を立てる。M-1 は LRZ を使わないので、mask 0、FORCE_LRZ_WRITE_DIS 1 にした（0x00200404）。
+- tile ごとに PC_CCU_RESOLVE_TS を出して、進み具合を data[30..41] に残す。Turnip はこれを render pass の最後に 1 回だけ出す。
+- 各 BLIT event と draw の後に CP_WAIT_FOR_IDLE を置く。Turnip は flush の追跡で省くが、M-1 は順序を確実にするほうを選ぶ。
+- 描画の state（IB9 の S の部分）は、T-1 / W-1 で入ったまま使う。IB9 は呼ばない。パスごとの部分は IB10PA / PB が書く。
+- RB_RENDER_CNTL は、GMEM 中は Turnip と同じ 0x10 にする。終わりに D-1 以来の 0 へ戻す。
+
+**手順（W-1 の復元の後、OOB 解除前）：**
+1. 前段：次がすべて成り立つことを確かめる。不成立なら Reason 8 / 12 / 15 で未投入とする。
+   - W-1 の Status が成功、Reason 0、Checks 0x3F。
+   - RPTR / WPTR / shadow 3095、data[29] = 0xB10003E7、`CP_RB_CNTL` 0x20B、MASK 0。
+   - ring が W-1 の最後の規則と一致する。
+   - RB_CCU_CNTL を CPU から読んで 0x10000000（CcuBefore）。
+2. band の map と退避は T-1 と同じ。W-1 の復元の後の band を改めて退避する。
+3. 準備：IB10S / PA / PB / TA / TB / E と SEL0..11 を書く。data[30..44] は 0xFFFFFFFF にする。どれも読み返して照合する。
+4. ring packet を位置 3095..3271 に書き、バリアを置いて読み返し、WPTR = 3272 を書く。
+5. data[42] == 0xCAFE001A かつ RPTR == WPTR == shadow == 3272、RBBM / CX_BUSY が idle になるまで待つ。
+   - 上限は 100 ms（Reason 16）。
+   - 待つ間に RPTR ≥ 4096 を見たら Reason 18。
+6. 判定し、**5 秒保持**してから復元する。
+   - 復元と照合は D-1 と同じ。
+   - 途中で止まった場合も、band を map できていれば必ず復元する。
+- breadcrumb は 0x1E00 番台。保持は 0x1E30、復元は 0x1E31 / 32。
+
+**判定（Checks）：**
+- bit0：前段の条件すべて（W-1 成功、ring の状態、CcuBefore 0x10000000）。
+- bit1：完了の条件すべて。
+  - data[42] = 0xCAFE001A、data[30+k] = 0xB2000000｜k（k = 0..11）、data[43] / [44] = 0xB2000100 / 0xB2000101。
+  - RPTR / WPTR / shadow 3272、idle、IB1 の残り 0、エラー割り込みなし。
+  - RB_CCU_CNTL を CPU から読んで 0x10000000（CcuAfter。IB10E が最後まで走った証拠）。
+- bit2：ring とその外のメモリがすべて期待どおり。
+  - ring の 4096 語が、W-1 の規則の 3095..3271 を M-1 の ring packet で置き換えたものと一致する。
+  - ring の外の 16 KB が、退避値に M-1 で書いた IB と data を足したものと一致する。
+- bit3：正方形が両パリティとも 12800 画素すべて T-1 の texel と完全に一致する。
+- bit4：画面の残りがすべて期待どおり。
+  - パス A の clear の範囲（22016 画素）がすべて 0xFF2E5A8C。
+  - パス B の箱の残り（19968 画素）がすべて退避値。
+  - それ以外の band（パス A の列 400..671 の外、パス B の正方形の外すべて、上下の 8 行）が退避値。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**probe：** `EpiGpuProbe2` の bit6 を M-1 とする。
+- M-1 は bit0..5 を必要とする。実行値は Probe 0xBFFFFE80 + Probe2 **127**。
+- 許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15, 31, 63, 127} だけで、それ以外は status 6。
+- 127 でも、W-1 のために CP_RB_CNTL は 0x20B のまま進む。
+
+**診断 `GpuGmuM1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`WChecks`、`WReason`、`CcuBefore`、`CcuAfter`、`RbCntlLive`。
+- `TileData[12]`（data[30..41]）、`FlushData[2]`（data[43..44]）、`Data42`、`TilesDone`（data[30+k] が先頭から何枚続けて正しいか）。
+- 時間：`WaitUs`、`ElapsedMs`。
+- ring：`RingBad`、`RingFirst`、`RingValue`、`RingExpected`、`OutsideRingBad`、`OutsideRingFirst`、`OutsideRingOld`、`OutsideRingNew`。
+- 画素：
+  - `SqGood[2]`、`SqBad`、`SqFirst`、`SqValue`、`SqExpected`。
+  - `ClearGood`、`ClearBad`、`ClearFirst`、`ClearValue`。
+  - `BoxGood`（パス B の箱の残り）、`BoxBad`、`BoxFirst`、`BoxValue`、`BoxOld`。
+  - `OutsideChanged`、`OutsideFirst`、`OutsideOld`、`OutsideNew`。
+  - `TileBad[12]`：画素の不一致を (パリティ, tx, ty) ごとに数える。
+  - `Sample[24]`：T-1 の 10 点に、パス A の clear 範囲の 2 点（列 404 と 668 付近）を足した 12 点 × 2 パリティ。
+- レジスタと状態：`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`。
+- `ScanCount / ScanFirst / ScanDwords`：W-1 と同じ走査。除外に `[0x5B80, 0x5EC0)`、`[0x7078, 0x70B4)`、`[0x7840, 0x7B40)` を加える。
+- 後始末：`RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+
+**危険と対策：**
+- **GMEM や CCU の設定が違って GPU が止まる場合：**
+  - 100 ms の上限で止め、data[30..41] でどの tile まで進んだかを見る。
+  - band の復元と GX の後始末は通常どおり行う。
+  - RB_CCU_CNTL が 0x3C400000 のまま残ると、後の sysmem 描画が壊れる。CcuAfter を記録し、次の実行の前の再起動で必ず初期化されることに頼る（GX-on の前は毎回再起動する決まり）。
+- **clear 色の packing が違う場合：** パス A の clear 範囲が別の値になる。ClearValue でわかり、Checks の bit4 だけが落ちる。
+- **store が 16×4 より大きい単位で書く場合：** OutsideChanged でわかる。blit scissor は band の中に収まっているので、band の外は壊れない。
+- **時間：** 1 回の投入で 12 tile、全体で数 ms の見込み。保持を足して約 5 秒。
+
+**生成器：** scratchpad の `tools/m1ib.py`。次を出力する。
+- IB と SEL と ring packet。
+- tile の格子。
+- 期待する画素数（正方形 12800、clear 22016、箱の残り 19968、tile ごとの正方形の画素数）。
+- CP_PROTECT の確認（43 レジスタ、該当なし）。
+
+**この後：** 1（回る textured quad）に進む。sysmem で描くか GMEM で描くかは、M-1 の結果を見て決める。
+
+#### 9.21.54 M-1 の実装
+
+Probe2 bit6 を実装した。許す値は `{0,1,3,7,15,31,63,127}`。M-1 は `Probe=0xBFFFFE80, Probe2=127` で、W-1 の復元が成功したあと、同じ OOB の解除前に実行する。従来の 0..63 の処理は変えず、127 も G-1 から RB_CNTL=0x20B を使う。起動 API では M-1 指定時に W-1 を必須にした。
+
+前段の Status / Reason / Checks と、RPTR / WPTR / shadow=3095、data[29]=0xB10003E7、RB_CNTL=0x20B、MASK=0、CCU=0x10000000 を確かめる。ring 4096 語、T-1 の IB9 / shader / VB / descriptor / sampler / texture、および今回使う空き領域も照合する。条件を満たさなければ投入しない。
+
+コマンド表は `epi_gmu_m1_table.inc` の読み取り専用定数にした。6 個の IB と 12 個の SEL は合計 355 dw、ring packet は 177 dw。T-1 の shader / texture は書き換えない。data[30..44] を FFFFFFFF にして、IB と ring を読み返したあと、WPTR を 3095 から 3272 へ進める。AHB fenced write の再送は同じ WPTR に限り、2 ms / 200 回を上限とする。再送の前にも RPTR、shadow、MASK、エラー割り込みを確認する。
+
+完了は最終 TS、RPTR / WPTR / shadow、RBBM / CX_BUSY の idle、IB remaining=0 を最大 100 ms 待つ。native RPTR または shadow が 4096 以上なら Reason 18 とし、以後の WPTR 投入と GX 診断読み取りを止める。tile の TS は停止後にも shared RAM から読み、先頭から連続して完了した数を TilesDone に残す。CCU は切替前後とも CPU から読むだけで、失敗時に CPU から戻す書き込みは加えていない。
+
+画面の帯と ring 外 16 KB を 0x124000 バイトの非ページプールに退避する。trace は既存の GMU_BOOT_TRACES プールに収め、値返しの一時コピーを作らない。画素は浮動小数を使わず判定し、偶数行の clear 22016 画素、両パリティの正方形各 12800 画素、奇数行の箱の残り 19968 画素と、それ以外の帯を別々に調べる。転送・診断が通れば判定値が違っても 5 秒表示する。転送・診断で失敗した場合は保持を飛ばす。退避が成功していれば、breadcrumb や GX 確認の失敗でも帯の復元・照合・解放を必ず行う。既存の slumber / reset / rpmh_stop / idle 確認 / KeepCx の扱いは維持する。
+
+**GpuGmuM1（REG_BINARY、600 B / 150 dw）**：ULONG または NTSTATUS を次の順で置く。Cp は既存 G-2 形式 140 B。
+
+```
+Cp,
+WChecks, WReason, CcuBefore, CcuAfter, RbCntlLive,
+TileData[12], FlushData[2], Data42, TilesDone, WaitUs, ElapsedMs,
+RingBad, RingFirst, RingValue, RingExpected,
+OutsideRingBad, OutsideRingFirst, OutsideRingOld, OutsideRingNew,
+SqGood[2], SqBad, SqFirst, SqValue, SqExpected,
+ClearGood, ClearBad, ClearFirst, ClearValue,
+BoxGood, BoxBad, BoxFirst, BoxValue, BoxOld,
+OutsideChanged, OutsideFirst, OutsideOld, OutsideNew,
+TileBad[12], Sample[24],
+CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter,
+ScanCount, ScanFirst, ScanDwords,
+RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared,
+BackupStatus, HoldStatus, RestoreStatus
+```
+
+TileData / TileBad の順は A → B、それぞれ `(3,0),(4,0),(5,0),(3,1),(4,1),(5,1)`。TileBad は、パス B の x+8 を含めて該当 tile 内の画素不一致を数える。Sample は T-1 の 10 点に `(404,2),(668,125)` を足し、各点の偶数行・奇数行の順に並べる。座標は `(画面列, view 行)`。RingFirst は DWORD index、OutsideRingFirst / ScanFirst は allocation 先頭からのバイト数、画素の First と RestoreFirst は帯の先頭からのバイト数。未読値・未検出位置は FFFFFFFF、未実行 status は NOT_FOUND。TilesDone / HoldMs / Checks / Prepared は初期値 0。
+
+Checks の bit0..5 は §9.21.53 のとおり。bit2 は ring 全 4096 語と ring 外全 16 KB を調べ、今回の IB / SEL / data だけを新しい期待値にする。走査の除外に `[5B80,5EC0)`, `[7078,70B4)`, `[7840,7B40)` を加え、ScanDwords は 1182。Global fault は従来と同じ読み取り専用 API で前後に記録する。診断は保持前に保存・flush し、cleanup と keep の両方で最終値を保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1E00 / 01 | map、前段と CCU の確認 |
+| 0x1E02 / 08 | global fault、帯と ring 外の退避 |
+| 0x1E03 / 04 | IB・SEL・data・ring の準備、WPTR 投入と上限付き待機 |
+| 0x1E10..1B | CP / RBBM / MASK の診断 |
+| 0x1E20 / 1C | global fault、CcuAfter |
+| 0x1E30 | 診断保存・flush と 5 秒保持 |
+| 0x1E31 / 32 | 帯の復元、復元照合 |
+
+Reason は 8=前段失敗、12=前提・メモリ不一致、15=MASK 非ゼロ、13=準備・結果・復元不一致、16=100 ms timeout、18=RPTR / shadow が 4096 以上。10=2 ms AHB timeout、14=エラー割り込み、11=hang、5=map / pool、6=breadcrumb / 診断保存 / flush / hold の失敗も従来どおり。後続の診断失敗で先行する失敗理由を上書きしない。最終 GpuGmuStatus は CP 段の失敗なら 15、既存 teardown の安全確認が通らなければ 8 / KeepCx を優先する。
+
+机上試験用 shim に、IB の呼び出しとレジスタ・BLIT / draw / TS の順を読むソフトウェア tile の応答モデルを追加した。成功、clear / load / store の欠落、途中 tile での停止、TS 不一致、ring / resource / 画素の破損、AHB 再送、RPTR 範囲外、割り込み、保存・map・pool・復元の失敗を試験ケースに追加した。このモデルは実機の GMEM / CCU の動作を保証しない。
+
+静的照合で、文書の 7 つの表（6 IB と SEL0）の値、全 packet の境界・parity、43 レジスタの CP_PROTECT 範囲外、355 / 177 dw、WPTR 3272、ABI 600 B、画素数と走査語数を確認した。ホスト試験、ビルド、署名、配置、実機実行、版番号の変更、commit は行っていない。
+
+#### 9.21.55 M-1 の実機結果（v79、成功）
+
+DriverVer 20.0.2.79 で、Probe 0xBFFFFE80 + Probe2 **127** を指定して実行した（再起動直後、v34-akat）。GpuProbeStatus 0、GpuGmuStatus 0、breadcrumb は最後に 0xFFFF、デバイスは正常。stack は 0x11F60 / 0x11428 で、余裕はこれまでと同じ。
+
+**判定：** Checks **0x3F**、Reason 0。前段の W-1 も WChecks 0x3F。
+
+| 項目 | 結果 |
+|---|---|
+| RB_CCU_CNTL | 前 0x10000000、後 0x10000000（GMEM 用の 0x3C400000 から sysmem に戻った） |
+| CP_RB_CNTL | 0x20B（W-1 のまま） |
+| tile ごとの TS | data[30..41] = B2000000..B200000B、TilesDone 12 |
+| setup の flush TS | data[43] / [44] = B2000100 / B2000101 |
+| ring の CACHE_FLUSH_TS | data[42] = CAFE001A |
+| RPTR / WPTR / shadow | すべて 3272（0xCC8）。WPTR の書き込み 1 回、待ちの poll 1 回 |
+| 時間 | WaitUs 0、ElapsedMs 0（1 tick 未満で完了） |
+| ring と ring の外 | RingBad 0、OutsideRingBad 0 |
+| 走査 | ScanCount 0（1182 語） |
+| 正方形 | SqGood 12800 / 12800（両パリティ）。標本は T-1 と同じ texel |
+| clear | ClearGood 22016。標本は偶数行が FF2E5A8C、奇数行が 0（退避値） |
+| 箱の残り | BoxGood 19968、OutsideChanged 0、TileBad はすべて 0 |
+| IB / 割り込み | IbBaseLow 0x70015E40（IB10E の終わり）、IbRemaining 0。エラー割り込み、protect、fault はなし |
+| SMMU | Fsr 0x400 / Fsynr 0xF001B は T-1 以前からの古い値で、M-1 では増えていない |
+| 後始末 | HoldMs 5000、RestoreMismatch 0、Backup / Hold / Restore の status はすべて 0 |
+
+**わかったこと：**
+- GMEM への clear（RB_BLIT_INFO 0xF2）、GMEM での描画、sysmem への store（0）、sysmem からの load（3）が、12 tile・2 pass のすべてで期待どおりに働いた。pass B の結果は、pass A の store の後の load から作られているので、load と store の往復も確かめられた。
+- blit scissor（x400..671 と x416..687）の外は 1 画素も変わらなかった。clear の偶数行と奇数行の違いは、仕様どおりの band のパリティによるものである。
+- RB_CCU_CNTL の GMEM 用の値（ccu_offset_gmem 0x78000、QUARTER）と、bin 128×64 の設定は正しかった。
+- 最後のレジスタ状態は sysmem 用に戻っており、後の段階は W-1 と同じ sysmem の前提で続けられる。
+
+**後の段階の前提（M-1 の後）：**
+- ring は W-1 の規則のままで、dword 3095..3271 だけが M-1 の packet（177 語）に置き換わっている。WPTR / RPTR / shadow は 3272。
+- data[30..44] は上の値。RB_CCU_CNTL 0x10000000、RB_RENDER_CNTL 0、bin の設定は sysmem 用の値。
+
+**この後：** 1（回る textured quad）の仕様を書く。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
