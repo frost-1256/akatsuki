@@ -78,6 +78,10 @@ static bool allowG4Writes=false, g4Completes=true, g4Scratch=true, g4Mem=true, g
 static bool g4Scratch2Damage=false;
 static ULONG g4FenceDrops=0, g4ErrorBits=0, g4Damage=0, g4BadGuards=0;
 static std::vector<ULONG> g4Writes;
+static bool allowG5Writes=false, g5Completes=true, g5Flush=true, g5Event=true, g5Fill=true, g5FenceForever=false;
+static bool g5BadRptr=false;
+static ULONG g5FenceDrops=0, g5ErrorBits=0, g5Color=0x78563412, g5BadPixel=0xFFFFFFFF, g5BadSentinel=0xFFFFFFFF;
+static std::vector<ULONG> g5Writes;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -154,34 +158,43 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         assert(allowG2Writes); const ULONG reg=p==GmuCfgReg(0x808) ? 0x808 : 0x807;
         g2Writes.push_back({reg,v});
         assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20) || (allowG3bWrites && v==25) ||
-                                  (allowG3cWrites && v==30) || (allowG4Writes && v==39)));
+                                  (allowG3cWrites && v==30) || (allowG4Writes && v==39) || (allowG5Writes && v==48)));
         if(reg==0x807) {
             const ULONG packet[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
             assert(g2Ring && g2Shadow && std::memcmp(g2Ring,packet,sizeof(packet))==0);
-            if(v==20 || v==25 || v==30 || v==39) {
+            if(v==20 || v==25 || v==30 || v==39 || v==48) {
                 const ULONG extra[]={0x48088501,0xCAFE0001,0x703D8003,0x70017000,0,0xCAFE0002,
                                      0x703E8003,0x00040885,0x70017008,0,0x70268000};
                 assert(std::memcmp(g2Ring+9,extra,sizeof(extra))==0);
                 if(v==20) g3Writes.push_back(v);
             }
-            if(v==25 || v==30 || v==39) {
+            if(v==25 || v==30 || v==39 || v==48) {
                 const ULONG event[]={0x70460004,4,0x70017010,0,0xCAFE0003};
                 assert(std::memcmp(g2Ring+20,event,sizeof(event))==0);
                 if(v==25) g3bWrites.push_back(v);
             }
-            if(v==30 || v==39) {
+            if(v==30 || v==39 || v==48) {
                 const ULONG irqEvent[]={0x70460004,0x80000004,0x70017018,0,0xCAFE0004};
                 assert(std::memcmp(g2Ring+25,irqEvent,sizeof(irqEvent))==0 && *GmuCfgReg(0x38)==0);
                 if(v==30) g3cWrites.push_back(v);
             }
-            if(v==39) {
+            if(v==39 || v==48) {
                 const ULONG ib[]={0x48088601,0xCAFE0005,0x703D8003,0x70017020,0,0xCAFE0006};
                 const ULONG call[]={0x70BF8003,0x70016000,0,6,0x70460004,4,0x70017024,0,0xCAFE0007};
                 assert(std::memcmp(g2Ring+0x6000/4,ib,sizeof(ib))==0 && std::memcmp(g2Ring+30,call,sizeof(call))==0);
-                g4Writes.push_back(v);
+                if(v==39) g4Writes.push_back(v);
             }
-            ULONG& drops=v==39 ? g4FenceDrops : (v==30 ? g3cFenceDrops : (v==25 ? g3bFenceDrops : (v==20 ? g3FenceDrops : g2FenceDrops)));
-            if((v==39 ? g4FenceForever : (v==30 ? g3cFenceForever : (v==25 ? g3bFenceForever : (v==20 ? g3FenceForever : g2FenceForever)))) || drops!=0) {
+            if(v==48) {
+                const ULONG ib[]={0x70460001,25,0x70460001,24,0x70268000,0x408E0701,0x10000000,
+                    0x488C0101,0,0x408C0001,0x10F03080,0x48840001,0x10F03080,0x48ACC001,0xF180,
+                    0x408C1704,0x30,0x70017400,0,1,0x488C2C04,0x12,0x34,0x56,0x78,
+                    0x48840502,0,0xF000F,0x702C0001,3,0x70460004,29,0x70017028,0,0xCAFE0008,0x70268000};
+                const ULONG call[]={0x70BF8003,0x70016100,0,36,0x70460004,4,0x7001702C,0,0xCAFE0009};
+                assert(std::memcmp(g2Ring+0x6100/4,ib,sizeof(ib))==0 && std::memcmp(g2Ring+39,call,sizeof(call))==0);
+                g5Writes.push_back(v);
+            }
+            ULONG& drops=v==48 ? g5FenceDrops : (v==39 ? g4FenceDrops : (v==30 ? g3cFenceDrops : (v==25 ? g3bFenceDrops : (v==20 ? g3FenceDrops : g2FenceDrops))));
+            if((v==48 ? g5FenceForever : (v==39 ? g4FenceForever : (v==30 ? g3cFenceForever : (v==25 ? g3bFenceForever : (v==20 ? g3FenceForever : g2FenceForever))))) || drops!=0) {
                 if(drops!=0) --drops;
                 gPages[2][0x313]=1; return;
             }
@@ -224,16 +237,29 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
                     *g2Shadow=39; *GmuCfgReg(0x806)=39; *GmuCfgReg(0x92A)=0;
                 }
             }
+            if(v==48) {
+                *GmuCfgReg(0x928)=0x70016100; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=36;
+                if(g5Completes) {
+                    *GmuCfgReg(0x8E07)=0x10000000;
+                    if(g5Fill) for(ULONG i=0;i<256;++i) g2Ring[0x7400/4+i]=g5Color;
+                    if(g5BadPixel<256) g2Ring[0x7400/4+g5BadPixel]=0;
+                    if(g5BadSentinel<16) g2Ring[0x7800/4+g5BadSentinel]=0;
+                    if(g5Flush) g2Ring[0x7028/4]=0xCAFE0008;
+                    if(g5Event) g2Ring[0x702C/4]=0xCAFE0009;
+                    *g2Shadow=48; *GmuCfgReg(0x806)=g5BadRptr ? 47 : 48; *GmuCfgReg(0x92A)=0;
+                }
+            }
             gPages[8][0x210]=g2RbbmBusy ? 2 : 1;
-            const ULONG other=(v==30 || v==39) ? gPages[8][0x201] : 0;
+            const ULONG other=(v==30 || v==39 || v==48) ? gPages[8][0x201] : 0;
             gPages[8][0x201]=other | (g2Hang ? (1UL<<23) : 0) |
-                            (v==39 ? g4ErrorBits : (v==30 ? g3cErrorBits : (v==25 ? g3bErrorBits : (v==20 ? g3ErrorBits : 0))));
+                            (v==48 ? g5ErrorBits : (v==39 ? g4ErrorBits : (v==30 ? g3cErrorBits : (v==25 ? g3bErrorBits : (v==20 ? g3ErrorBits : 0)))));
             if(v==30 && g3cCompletes && g3cShowStatus && g3cStatusDelay==0) gPages[8][0x201]|=1UL<<20;
             gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0;
         }
     }
     assert(p!=GmuCfgReg(0x885)); // scratch must be written by the packet peer, never by the CPU driver
     assert(p!=GmuCfgReg(0x886)); // G-4 scratch[3] is also written only by CP
+    assert(p!=GmuCfgReg(0x8E07)); // G-5 CCU configuration is written only by the IB, never by the CPU
     for(ULONG i=0;i<7;++i) if(p==GmuCfgReg(g1Dwords[i])) {
         assert(allowG1Writes); g1Writes.push_back({g1Dwords[i],v});
         if(g1Dwords[i]==failG1Dword) return;

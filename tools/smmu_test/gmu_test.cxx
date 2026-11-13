@@ -71,6 +71,8 @@ static std::vector<UCHAR> SqeImage() {
     return sqe;
 }
 static void Reset() {
+    allowG5Writes=false; g5Completes=true; g5Flush=true; g5Event=true; g5Fill=true; g5FenceForever=false; g5BadRptr=false;
+    g5FenceDrops=0; g5ErrorBits=0; g5Color=0x78563412; g5BadPixel=0xFFFFFFFF; g5BadSentinel=0xFFFFFFFF; g5Writes.clear();
     allowG4Writes=false; g4Completes=true; g4Scratch=true; g4Mem=true; g4Event=true; g4FenceForever=false;
     g4Scratch2Damage=false; g4FenceDrops=0; g4ErrorBits=0; g4Damage=0; g4BadGuards=0; g4Writes.clear();
     allowG3cWrites=false; g3cCompletes=true; g3cEvent=true; g3cBadGuard=false; g3cFenceForever=false;
@@ -111,13 +113,14 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
     allowG4Writes=g4;
+    allowG5Writes=g5;
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -912,6 +915,112 @@ int main(int argc,char** argv) {
                 assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INVALID_DEVICE_STATE);
                 assert(g4.Cp.Reason==(bad>=6 ? 15UL : 12UL) && g4.Cp.WptrWrites==(bad==8 ? 1UL : 0UL));
             }
+            const auto seedG5=[&]() {
+                seedG4(); allowG5Writes=true; g5Writes.clear(); g5Completes=true; g5Flush=true;
+                g5Event=true; g5Fill=true; g5FenceForever=false; g5BadRptr=false;
+                g5FenceDrops=0; g5ErrorBits=0; g5Color=0x78563412; g5BadPixel=0xFFFFFFFF; g5BadSentinel=0xFFFFFFFF;
+                std::memcpy(cpRing.data()+0x6000/4,ibPacket,sizeof(ibPacket));
+                std::memcpy(cpRing.data()+30,callPacket,sizeof(callPacket));
+                cpShadow[0]=39; *GmuCfgReg(0x806)=39; *GmuCfgReg(0x807)=39;
+                *GmuCfgReg(0x886)=0xCAFE0005; *GmuCfgReg(0x8E07)=0x12345678;
+                cpRing[0x7020/4]=0xCAFE0006; cpRing[0x7024/4]=0xCAFE0007;
+                cpRing[0x7028/4]=0xFFFFFFFF; cpRing[0x702C/4]=0xFFFFFFFF;
+            };
+            seedG5(); GMU_G5_TRACE g5=GmuG5Trace();
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==0);
+            assert(g5.Cp.Reason==0 && g5.Prepared==1 && g5.Checks==0x1F && g5.Cp.SqeWritten==0);
+            assert(g5.CcuBefore==0x12345678 && g5.CcuAfter==0x10000000);
+            assert(g5.Cp.ShadowBefore==39 && g5.Cp.ShadowAfter==48 && g5.Cp.Rptr==48 && g5.Cp.WptrAfter==48);
+            assert(g5.Cp.WptrWrites==1 && g2Writes.size()==1 && g5Writes.size()==1 && g2Writes[0].second==48);
+            assert(g5.IbBaseLow==0x70016100 && g5.IbBaseHigh==0 && g5.IbRemaining==0);
+            assert(g5.CpInterrupt==0x123 && g5.CpProtect==0x456 && g5.CpStatus1==0x789 && g5.Cp.Fsr==0x400);
+            assert(g5.PixelMatches==256 && g5.PixelFirstBad==0xFFFFFFFF && g5.PixelBadValue==0xFFFFFFFF);
+            assert(g5.SentinelMatches==16 && g5.DataAfter[10]==0xCAFE0008 && g5.DataAfter[11]==0xCAFE0009);
+            for(ULONG i=0;i<4;++i) assert(g5.Pixels[i]==0x78563412);
+            for(ULONG i=0;i<16;++i) assert(g5.Sentinel[i]==0xFFFFFFFF);
+            for(ULONG i=0;i<10;++i) assert(g5.DataAfter[i]==g5.DataBefore[i]);
+            assert(g5.MaskBefore==0 && g5.MaskAtSubmit==0 && g5.MaskAfter==0 && testMaps.size()==originalMaps);
+            assert(std::memcmp(cpRing.data()+30,callPacket,sizeof(callPacket))==0);
+            assert(std::memcmp(cpRing.data()+0x6000/4,ibPacket,sizeof(ibPacket))==0);
+            assert(std::memcmp(g5.Ib,cpRing.data()+0x6100/4,sizeof(g5.Ib))==0 && cpRing[0x6190/4]==0);
+            assert(std::memcmp(g5.Packet,cpRing.data()+39,sizeof(g5.Packet))==0 && cpRing[48]==0 && cpRing[0x7840/4]==0);
+            // Each Checks bit can fail independently, including a hardware RPTR different from the shadow.
+            for(ULONG bad=0;bad<5;++bad) {
+                seedG5(); g5=GmuG5Trace();
+                if(bad==0) g5BadRptr=true;
+                if(bad==1) g5Flush=false;
+                if(bad==2) g5Event=false;
+                if(bad==3) g5Fill=false;
+                if(bad==4) g5BadSentinel=0;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
+                assert(g5.Cp.Reason==13 && g5.Checks==(0x1FUL&~(1UL<<bad)));
+            }
+            const ULONG pixelIndices[]={0,15,16,255};
+            for(ULONG index:pixelIndices) {
+                seedG5(); g5=GmuG5Trace(); g5BadPixel=index;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
+                assert(g5.PixelMatches==255 && g5.PixelFirstBad==index && g5.PixelBadValue==0);
+            }
+            seedG5(); g5=GmuG5Trace(); g5Color=0x12345678;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
+            assert(g5.PixelMatches==0 && g5.PixelFirstBad==0 && g5.PixelBadValue==0x12345678 && g5.Pixels[3]==0x12345678);
+            for(ULONG index=0;index<16;++index) {
+                seedG5(); g5=GmuG5Trace(); g5BadSentinel=index;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
+                assert(g5.SentinelMatches==15 && g5.Sentinel[index]==0 && g5.Checks==0xF);
+            }
+            seedG5(); g5=GmuG5Trace(); g5FenceDrops=3;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==0 && g5.Cp.WptrWrites==4);
+            seedG5(); g5=GmuG5Trace(); g5FenceForever=true;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_TIMEOUT);
+            assert(g5.Cp.Reason==10 && g5.Cp.WptrWrites==201 && g5.PixelMatches==0 && g5.SentinelMatches==16);
+            for(ULONG predicate=0;predicate<3;++predicate) {
+                seedG5(); g5=GmuG5Trace();
+                if(predicate==0) g5Completes=false;
+                if(predicate==1) g2RbbmBusy=true;
+                if(predicate==2) g2GmuBusy=true;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_TIMEOUT && g5.Cp.Reason==9);
+                if(predicate==0) assert(g5.IbBaseLow==0x70016100 && g5.IbRemaining==36);
+            }
+            for(ULONG bit:errorBits) {
+                seedG5(); g5=GmuG5Trace(); g5ErrorBits=bit;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==14);
+            }
+            seedG5(); g5=GmuG5Trace(); g2Hang=true;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==11);
+            for(ULONG step=0x1200;step<=0x1206;++step) {
+                seedG5(); g5=GmuG5Trace(); failGmuStep=step;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==6);
+                assert(g5.Cp.Attempted==(step<=0x1204 ? 0UL : 1UL));
+            }
+            for(ULONG step=0x1210;step<=0x121C;++step) {
+                seedG5(); g5=GmuG5Trace(); failGmuStep=step;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==6);
+            }
+            seedG5(); g5=GmuG5Trace(); g5Completes=false; failGmuStep=0x1210;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_TIMEOUT && g5.Cp.Reason==9);
+            seedG5(); g5=GmuG5Trace(); dropGxAtStep=0x1210;
+            assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INVALID_DEVICE_STATE);
+            assert(g5.Cp.Reason==GX_REG_HM_OFF && g5.CcuAfter==0xFFFFFFFF && g5.IbRemaining==0xFFFFFFFF);
+            for(ULONG mapIndex:{0UL,3UL}) {
+                seedG5(); g5=GmuG5Trace(); failAddrMap=mapIndex;
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INSUFFICIENT_RESOURCES && g5Writes.empty());
+            }
+            for(ULONG bad=0;bad<9;++bad) {
+                seedG5(); g5=GmuG5Trace();
+                if(bad==0) cpShadow[0]=30;
+                if(bad==1) *GmuCfgReg(0x807)=30;
+                if(bad==2) cpRing[0x7024/4]=0;
+                if(bad==3) cpRing[30]=0;
+                if(bad==4) cpRing[0x6000/4]=0;
+                if(bad==5) probe.Regions[1].Mapped=false;
+                if(bad==6) *GmuCfgReg(0x38)=1;
+                if(bad==7) g3cMaskChangeStep=0x1204;
+                if(bad==8) {g3cMaskChangeStep=0x1205; g5FenceDrops=1;}
+                assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INVALID_DEVICE_STATE);
+                assert(g5.Cp.Reason==(bad>=6 ? 15UL : 12UL) && g5.Cp.WptrWrites==(bad==8 ? 1UL : 0UL));
+            }
+            allowG5Writes=false;
             allowG4Writes=false;
             allowG3cWrites=false; g3cPolling=false; g3cPending=false; g3cMaskChangeStep=0xFFFFFFFF; *GmuCfgReg(0x38)=0;
             allowG3bWrites=false; allowG3Writes=false; allowG2Writes=false; g2Ring=nullptr; g2Shadow=nullptr; probe.Count=0; probe.Smmu=nullptr;
@@ -1084,6 +1193,29 @@ int main(int argc,char** argv) {
         ClearQuarantine();
         Reset(); smmuDisableFails=true;
         assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
+    // Full G-5 uses the original GPU allocations, follows G-4, and retains pixels on unsafe teardown.
+    {
+        const auto sqe=SqeImage();
+        Reset(); assert(RunG2(f,sqe,&keep,true,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(testMaps.size()==11 && g5Writes.size()==1 && g2Writes.size()==7 && g2Writes[6].second==48);
+        Reset(); assert(RunG2(f,sqe,&keep,true,true,true,true)==0 && g5Writes.empty());
+        Reset(); g4Event=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_CP && g5Writes.empty() && !keep && allocations.empty());
+        Reset(); g5Fill=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g5Completes=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu->Smmu->enabled);
+        GMU_REGION* retained=GmuFind(g_KeptGmu,GmuG1Iova[1],GmuG1Size[1]);
+        assert(retained && retained->Va && static_cast<ULONG*>(retained->Va)[0x7400/4]==0x78563412);
+        assert(std::memcmp(static_cast<UCHAR*>(retained->Va)+0x6100,GmuG5Ib,sizeof(GmuG5Ib))==0);
+        ClearQuarantine();
+        Reset(); smmuDisableFails=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
         ClearQuarantine(); Reset();
     }

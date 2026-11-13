@@ -23,6 +23,7 @@
 #define EPI_GMU_PROBE_G3B       0x1000000UL // modifier: requires 0xFFFE80 (0x1FFFE80 total), CACHE_FLUSH_TS without IRQ
 #define EPI_GMU_PROBE_G3C       0x2000000UL // modifier: requires 0x1FFFE80 (0x3FFFE80 total), IRQ source probe with MASK=0
 #define EPI_GMU_PROBE_G4        0x4000000UL // modifier: requires 0x3FFFE80 (0x7FFFE80 total), one indirect buffer
+#define EPI_GMU_PROBE_G5        0x8000000UL // modifier: requires 0x7FFFE80 (0xFFFFE80 total), 16x16 RGBA8 solid CP_BLIT
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -216,6 +217,20 @@
 // 1104 fence, 1105 idle, 1110..111D scratch[3]/scratch[2]/RPTR/WPTR/HW_FAULT/CP_INT/
 // PROTECT/STATUS_1/RBBM/INT0/IB1_BASE_LO/IB1_BASE_HI/IB1_REM_SIZE/MASK.
 
+// GpuGmuG5: 564 bytes {Cp (140-byte GpuGmuG2 layout), CcuBefore, CcuAfter,
+// DataBefore[12], DataAfter[12], Packet[9], Ib[36], CpInterrupt, CpProtect, CpStatus1,
+// IbBaseLow, IbBaseHigh, IbRemaining, Checks, Prepared, MaskBefore, MaskAtSubmit, MaskAfter,
+// PixelMatches, PixelFirstBad, PixelBadValue, Pixels[4], Sentinel[16], SentinelMatches}.
+// Pixels samples indices 0/15/16/255. Unrecorded fields and no first mismatch are FFFFFFFF.
+// Prepared/Checks start at 0; match counts become 0..256 / 0..16 after prepared memory is sampled.
+// IB=ring+6100, pixels=ring+7400 (256 DWORDs), sentinel=ring+7800 (16 DWORDs); WPTR 39->48.
+// Checks bit0=RPTR/WPTR/shadow 48 and idle/no error bits1/9/23/24, bit1=data[10]==CAFE0008,
+// bit2=data[11]==CAFE0009, bit3=all pixels 78563412, bit4=all sentinel FFFFFFFF. Require 1F.
+// CcuBefore/After read GPU dword 8E07; the speculative 10000000 value is written only by the IB.
+// Reasons match G-4. Breadcrumbs 1200 map, 1201 previous state/MASK, 1202 original CCU,
+// 1203 prepare, 1204 publish, 1205 fence, 1206 idle, 1210..121C CCU/RPTR/WPTR/HW_FAULT/
+// CP_INT/PROTECT/STATUS_1/RBBM/INT0/IB1_BASE_LO/IB1_BASE_HI/IB1_REM_SIZE/MASK.
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off
@@ -238,6 +253,7 @@
 // G3b: requires G3 and its prerequisites; appends CACHE_FLUSH_TS under the same OOB lease (probe 0x1FFFE80).
 // G3c: requires G3b and its prerequisites; IRQ source observation under MASK=0 (probe 0x3FFFE80).
 // G4: requires successful G3c; one IB and a return-to-ring event under the same OOB (probe 0x7FFFE80).
+// G5: requires successful G4; CP_BLIT solid fill under the same OOB (probe 0xFFFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -246,4 +262,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
-                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE);
+                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE);

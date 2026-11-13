@@ -2807,6 +2807,135 @@ shim とホスト試験ケースを追加した。IB の内容と ring の呼び
   2. `BLIT_OP_COPY`（SP_PS_2D_SRC_* を使うコピー）。
   3. その後でコンピュート（ir3 のシェーダを手で組む）に進む。
 
+#### 9.21.18 G-5 の実装（実機未実行）
+
+- bit27（`EPI_GMU_PROBE_G5=0x8000000`、合計 `0xFFFFE80`）を追加した。G-4 と全前提を要求し、ワンショット解除にも含める。G-4 成功後、同じ OOB の中で実行する。以前のモードと診断 ABI は変更しない。
+- 前提として WPTR / shadow=39、ring[0..38]、G-4 の IB、データ[0..11] が前段の結果と一致することを確認する。MASK=0 を求め、投入直前と fence 再送前にも再確認する。MASK には書かない。
+- RB_CCU_CNTL（GPU dword 0x8E07、物理 0x03D2381C）を **CPU から先に読む**。既存のレジスタページ 0x03D23000 を一時的に map し、元の値を CcuBefore に記録する。推測値 `0x10000000` は仕様の IB にだけ含め、CPU から直接は書かない。終了時に CcuAfter も読む。両者の一致は成功条件にしない。
+- IB は ring+0x6100 に36 dword、ring[39..47] は IB の呼び出しと IRQ なしの CACHE_FLUSH_TS。内容は §9.21.17 の表どおり。CPU は画素256個（ring+0x7400）と番兵16個（ring+0x7800）をすべて `0xFFFFFFFF` にする。準備後にメモリバリアを入れ、WPTR=48 を書く。追加の GPU メモリ確保や SMMU の変更はない。
+- 待ちは既存の fence 待ち（最大2 ms、同じ WPTR を再送）と idle 待ち（最大1秒）を使う。エラー割り込みと hang は停止する。各段階で breadcrumb を保存・flush し、OOB ACK / GX GDSCR / HM を確認する。最初の Reason を保持し、OOB 解除、slumber、reset と既存の後片付けへ進む。安全に片付いた CP 試験の失敗は GMU status=15、片付け失敗は status=8 / KeepCx。KeepCx 時は画素・番兵・IB を含む既存メモリを保持する。
+
+`GpuGmuG5` は REG_BINARY、564バイト（ULONG 141個）。
+
+```text
+{ Cp (既存 GpuGmuG2 と同じ140バイト), CcuBefore, CcuAfter,
+  DataBefore[12], DataAfter[12], Packet[9], Ib[36],
+  CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+  Checks, Prepared, MaskBefore, MaskAtSubmit, MaskAfter,
+  PixelMatches, PixelFirstBad, PixelBadValue, Pixels[4], Sentinel[16], SentinelMatches }
+```
+
+- PixelMatches は0..256、PixelFirstBad / PixelBadValue は最初の不一致の番号／値。Pixels は画素[0]、[15]、[16]、[255]。Sentinel は番兵16個の実測値、SentinelMatches は `0xFFFFFFFF` の個数（0..16）。未記録、および不一致がなかった番号／値は `0xFFFFFFFF`。Prepared / Checks の初期値は0、一致数は準備済みのメモリを記録した時点で数える。
+- Checks は §9.21.17 の5ビット（全成功=`0x1F`）。bit0 は hardware RPTR / WPTR / shadow がすべて48、INT0 の bit1 / 9 / 23 / 24 が0、RBBM / CX が idle。bit1 / 2 はデータ[10] / [11]、bit3 は全画素一致、bit4 は全番兵不変。画素の並びが予想と違う場合も、値を変換せず記録する。
+- Reason / NtStatus は G-4 と同じ。前段失敗で未実行は Reason=8、旧状態／メモリの不整合は12、結果不一致は13、MASK 非0は15。Cp.SqeWritten=0、SQE は再起動しない。Cp の SQE 前後と Packet[9] は未使用。追加の Packet[9] / Ib[36] が今回のコマンド。DataBefore は前段の結果を保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1200 | 前提確認、レジスタの3ページを map |
+| 0x1201 | MASK、旧コマンド・IB・データ、WPTR / shadow |
+| 0x1202 | 元の RB_CCU_CNTL を CPU から読む |
+| 0x1203 | 画素、番兵、IB、追加 ring パケットの準備 |
+| 0x1204 | MASK 再確認、WPTR=48 |
+| 0x1205 / 0x1206 | fence 待ち / idle 待ち |
+| 0x1210〜0x1218 | CCU、RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0 |
+| 0x1219〜0x121C | IB1_BASE 下位、上位、IB1_REM_SIZE、MASK |
+
+shim とホスト試験ケースを追加した。仕様の IB / ring パケット、正常な塗りつぶし、5つの Checks の個別不成立、チャンネル順の違い、最初の不一致と指定画素、16個すべての番兵、fence 再送と時間切れ、idle の時間切れ、エラー割り込み、breadcrumb / map / GX の失敗、MASK の変化、前段失敗、最初の Reason と KeepCx 時のメモリ保持を対象とする。shim は CPU による RB_CCU_CNTL への書き込みを禁止する。テスト、ビルド、配置、実機実行はまだ行っていない。
+
+#### 9.21.19 v66 実機結果（2026-11-13、0xFFFFE80、G-5）
+
+- 実行条件：版 20.0.2.66（oem124）。端末を 13:33 に再起動してから実行した。
+- **結果：CP はすべてのパケットを処理したが、画素は 1 つも書かれなかった。Checks は 0x17（bit3 だけが不成立）。**
+  - EpiGpuProbeStep は 0xFFFF。
+  - GpuGmuStatus は 15（EPI_GMU_E_CP）、NtStatus は 0xC0000185（Reason 13＝結果の不一致）。
+  - KeepCx、DisableStatus、FaultStatus は 0。後片付けは正常に終わり、デバイスは Started のまま。
+- `GpuGmuG5`（564 B）：
+  | 項目 | 値 |
+  |---|---|
+  | shadow／WPTR／RPTR | 39 → **48**／48／48 |
+  | Polls | 0 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT／CP_INT／PROTECT／STATUS_1 | 0x1／0／0／0／0／0 |
+  | CX_BUSY | 0x71000000（bit23 は 0） |
+  | RB_CCU_CNTL：前 → 後 | **0 → 0x10000000**（IB の PKT4 は届いた） |
+  | データ[10]／[11] | **0xCAFE0008**／**0xCAFE0009** |
+  | `CP_IB1_BASE`／`CP_IB1_REM_SIZE` | 0x70016100／0（IB を最後まで処理した） |
+  | MASK：前／投入時／後 | 0／0／0 |
+  | 画素の一致数 | **0**（最初の不一致は画素[0]、値は 0xFFFFFFFF） |
+  | 画素[0]／[15]／[16]／[255] | すべて 0xFFFFFFFF（CPU が書いた値のまま） |
+  | 番兵 | 16 個とも 0xFFFFFFFF（変化なし） |
+  | Packet と IB | 仕様と一致 |
+  - FSR は 0x400 で、私たちの context bank にフォルトはない。
+- わかったこと：
+  - CP 自身の書き込み（PKT4 による RB_CCU_CNTL、CCU_FLUSH_COLOR_TS と CACHE_FLUSH_TS のタイムスタンプ）はすべて届いた。
+  - `CP_BLIT` も CP の処理としては終わり、GPU は idle になった。ハングもエラー割り込みもない。
+  - しかし 2D エンジン（RB）の書き込みは、見ている 1 KB にも番兵にも現れなかった。
+  - RB_CCU_CNTL の値は、新しい Mesa（AOSP のミラー、§9.21.20）で確かめた値と一致した。CCU のオフセットは原因ではない。
+
+#### 9.21.20 画素が書かれない原因の候補と G-5b の提案（文章仕様、未実装）
+
+**新しい Mesa で確かめたこと**（AOSP `platform/external/mesa3d` main：`freedreno_devices.py`、`tu_device.cc`、`tu_cmd_buffer.cc`、`tu_clear_blit.cc`、`a6xx.xml`）
+- a635（chip_id 0x06030500、「Adreno 7c+ Gen 3」系）は `[a6xx_base, a6xx_gen4]`、`num_ccu = 2`。
+- `ccu_offset_bypass` ＝ depth の CCU キャッシュ（2 × 64 KB）の後ろ ＝ **0x20000**。`has_gmem_fast_clear` は真、`concurrent_resolve` は偽。したがって RB_CCU_CNTL ＝ **0x10000000** で正しい（§9.21.17 の [U] は解消）。
+- a635 の magic_regs：
+  | レジスタ | 値 |
+  |---|---|
+  | RB_DBG_ECO_CNTL（0x8E04） | 0x04100000（blit 用も同じ値） |
+  | RB_UNKNOWN_8E01 | 0 |
+  | UCHE_UNKNOWN_0E12 | **0x00000001** |
+  | UCHE_CLIENT_PF（0xE19） | 0x00000084（今の G-1 表では 0x81） |
+  | PC_MODE_CNTL | 0x1F |
+  | PC_POWER_CNTL | 1 |
+  | SP_CHICKEN_BITS | 0x00001400 |
+  | SP_DBG_ECO_CNTL | 0x00000006 |
+  | TPL1_DBG_ECO_CNTL | 0x05008000 |
+  | VPC_DBG_ECO_CNTL | 0x02000000 |
+  | GRAS_DBG_ECO_CNTL、HLSQ_DBG_ECO_CNTL | 0 |
+- turnip はコマンドバッファの始めに必ず `tu6_init_static_regs` でこれらを書く。`vkCmdClearColorImage` の r2d は、その状態を前提にしている。
+- 新しい `r2d_run` は、`RB_DBG_ECO_CNTL_blit` が通常の値と違う GPU でだけ、CP_BLIT の前後で RB_DBG_ECO_CNTL を書き換える。a635 は同じ値なので、追加の手順はない。
+- `r2d_setup_common` の中身は、古い版と同じだった（A7XX 用の TPL1_2D_SRC_CNTL を除く）。
+
+**候補**
+1. **secure mode** [I]。いちばん疑わしい。
+   - CP はリセット直後の secure mode のままである。zap も `CP_SET_SECURE_MODE 0` も送っていない（0xF400 にも触れていない）。
+   - Adreno の content protection では、secure mode の間、描画系（RB／CCU など）のメモリアクセスは secure の印を付けて出ると考えられる [I]。その場合、書き込みは TZ が持つ secure の context bank に行くか、捨てられる。私たちの CB（FSR 0x400）にフォルトが出ないこととも合う。
+   - これまでの G-3〜G-4 で動いたのは、すべて CP 自身のアクセスだった。これとも矛盾しない。
+2. **初期化の不足** [I]：上の magic_regs、とくに RB_DBG_ECO_CNTL と UCHE_UNKNOWN_0E12。
+3. **別の場所に書いた**：番兵が変わっていないので、近くではない。可能性は低いが、念のため広く調べる。
+
+**G-5b の提案（bit28、0x1FFFFE80）**
+- 目的：候補 2 と 3 を一度に確かめる。どちらでもなければ、候補 1（secure mode）が残る。
+- 前提：G-5 まで（データ[10]／[11] と、G-5 の ring と IB を含む）。G-5 の Checks は 0x17 でもよい。画素がまだ全部 0xFFFFFFFF であることを確かめてから進む。
+- CPU が先に読んで記録する（読むだけ）：
+  - 0x8E04、0x8E01、0xE12、0xE19。
+  - SMMU の GR0 の sGFSR（0x48）、sGFSYNR0（0x50）、sGFSYNR1（0x54）、sGFSYNR2（0x58）。上の候補 1 で secure 以外の未知の SID が出ていれば、ここに出る可能性がある。書き込みはしない。
+- IB3：IOVA 0x70016200、14 dword。
+  | # | 中身 | dword |
+  |---|---|---|
+  | 1 | `EVENT_WRITE` CACHE_INVALIDATE：0x70460001、49 | 2 |
+  | 2 | `WAIT_FOR_IDLE`：0x70268000 | 1 |
+  | 3 | RB_DBG_ECO_CNTL：0x408E0401、0x04100000 | 2 |
+  | 4 | RB_UNKNOWN_8E01：0x408E0101、0 | 2 |
+  | 5 | UCHE_UNKNOWN_0E12：0x400E1201、0x00000001 | 2 |
+  | 6 | `WAIT_FOR_IDLE`：0x70268000 | 1 |
+  | 7 | `INDIRECT_BUFFER`（G-5 の IB2 をもう一度呼ぶ）：0x70BF8003、0x70016100、0、36 | 4 |
+  - IB の中から IB を呼ぶ（IB2 になる）のを避けたい場合は、#7 を ring に置いてもよい。下の ring の案はそうしている。その場合、IB3 は #1〜#6 の 10 dword になる。
+  - 0x8E04、0x8E01 は CP_PROTECT の対象外（0x861 は 0x8E00 だけ）。0xE12 も対象外（0x85D は 0xE03..0xE0F）。
+- ring（dword 48..）：
+  - `INDIRECT_BUFFER`：0x70BF8003、0x70016200、0、10（IB3 の #1〜#6）。
+  - `INDIRECT_BUFFER`：0x70BF8003、0x70016100、0、36（G-5 の IB2 そのまま）。
+  - `EVENT_WRITE` CACHE_FLUSH_TS：0x70460004、4、0x70017030（データ[12]）、0、0xCAFE000A。
+  - 合計 13 dword で、WPTR は 61。データ[10] は IB2 の CCU flush でもう一度 0xCAFE0008 になる（変化しない）。
+- 終わった後に記録する：
+  - G-5 と同じ項目（画素、番兵、データ[10..12]、レジスタ）。
+  - 0x8E04、0x8E01、0xE12 の後の値（届いたかどうか）。
+  - SMMU の sGFSR／sGFSYNR0..2 の後の値。
+  - **広い走査**：ring の領域 32 KB のうち、ring の dword 0..60、IB（0x6000..0x623F）、データ（0x7000..0x703F）、画素と番兵（0x7400..0x783F）を除いた範囲で、0x78563412、0x12345678、0x00000012 のどれかに一致する dword の数と、最初の位置。
+- 成功の条件（Checks）：bit0＝RPTR／WPTR／shadow 61 でエラーなし、bit1＝データ[12] ＝ 0xCAFE000A、bit2＝画素 256 個がすべて 0x78563412、bit3＝番兵が不変。0x1F ではなく 0xF が全成功。
+- 読み方 [I]：
+  - 画素が書かれた：候補 2（初期化の不足）だった。どのレジスタが効いたかは、後で 1 つずつ外して調べる。
+  - 広い走査で見つかった：候補 3。アドレスや pitch の解釈を直す。
+  - どちらもない：候補 1（secure mode）がいちばん有力になる。そこから先は zap shader の読み込み（SCM／PAS 経由）が必要になる。これは qcscm などの扱いを含む大きな判断なので、ユーザーと相談して決める。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
