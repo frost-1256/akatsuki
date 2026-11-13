@@ -21,6 +21,7 @@
 #define EPI_GMU_PROBE_G2        0x400000UL // modifier: requires 0x3FFE80 (0x7FFE80 total), SQE start / ME_INIT / idle wait
 #define EPI_GMU_PROBE_G3        0x800000UL // modifier: requires 0x7FFE80 (0xFFFE80 total), scratch / MEM_WRITE / REG_TO_MEM
 #define EPI_GMU_PROBE_G3B       0x1000000UL // modifier: requires 0xFFFE80 (0x1FFFE80 total), CACHE_FLUSH_TS without IRQ
+#define EPI_GMU_PROBE_G3C       0x2000000UL // modifier: requires 0x1FFFE80 (0x3FFFE80 total), IRQ source probe with MASK=0
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -189,6 +190,18 @@
 // Checks bits0..3: data[0..3] unchanged; bit4: data[4]==CAFE0003; bit5: data[5]==FFFFFFFF. Require 0x3F.
 // Packet is ring[20..24], CP_EVENT_WRITE CACHE_FLUSH_TS with IRQ bit clear. Result lives at ring+0x7010.
 // Reason/status meanings and Prepared match G-3. Breadcrumbs F00..F05 and F10..F18 match G-3's phases.
+// GpuGmuG3c: 304 bytes {Cp (140-byte GpuGmuG2 layout), ScratchBefore, ScratchAfter,
+// DataBefore[8], DataAfter[8], Packet[5], CpInterrupt, CpProtect, CpStatus1, Checks, Prepared,
+// MaskBefore, MaskAtSubmit, MaskAfter, StatusBefore, UnmaskedBefore, IrqPolls,
+// StatusFirst, UnmaskedFirst, StatusLast, UnmaskedLast, ClearAttempted, StatusAfterClear, UnmaskedAfterClear}.
+// WPTR=30 after 25. DataBefore[0..5] is G-3b output; [6..7] are CPU-written FFFFFFFF sentinels.
+// Checks bits0..5: data[0..5] unchanged; bit6: data[6]==CAFE0004; bit7: data[7]==FFFFFFFF. Require FF.
+// Cp.Reason adds 15=MASK nonzero. MASK is only read, including immediately before submission/retries.
+// IRQ bit20 is diagnostic only. First fields count 10-us waits (0..100); FFFFFFFF means never observed.
+// ClearAttempted precedes the only CLEAR write (1<<20), attempted after publication if GX is still safe.
+// Breadcrumbs 1000 map, 1001..1003 original MASK/STATUS/UNMASKED, 1004 previous state,
+// 1005 prepare, 1006 submit, 1007 fence, 1008 idle, 1009 IRQ poll, 100A clear,
+// 100B..100D post-clear STATUS/UNMASKED/MASK, 1010..1018 GX diagnostics. No mask/ISR changes.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -210,6 +223,7 @@
 // G2: requires G1 and its prerequisites; starts SQE/ME_INIT under OOB, before the existing slumber (probe 0x7FFE80).
 // G3: requires G2 and its prerequisites; appends the 11-DWORD probe under the same OOB lease (probe 0xFFFE80).
 // G3b: requires G3 and its prerequisites; appends CACHE_FLUSH_TS under the same OOB lease (probe 0x1FFFE80).
+// G3c: requires G3b and its prerequisites; IRQ source observation under MASK=0 (probe 0x3FFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -218,4 +232,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
-                     BOOLEAN G3b = FALSE);
+                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE);

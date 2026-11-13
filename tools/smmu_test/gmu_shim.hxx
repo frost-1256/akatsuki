@@ -69,6 +69,11 @@ static std::vector<ULONG> g3Writes;
 static bool allowG3bWrites=false, g3bCompletes=true, g3bEvent=true, g3bBadGuard=false, g3bFenceForever=false;
 static ULONG g3bFenceDrops=0, g3bErrorBits=0, g3bDamage=0;
 static std::vector<ULONG> g3bWrites;
+static bool allowG3cWrites=false, g3cCompletes=true, g3cEvent=true, g3cBadGuard=false, g3cFenceForever=false;
+static bool g3cShowStatus=true, g3cShowUnmasked=true, g3cIgnoreClear=false, g3cPending=false, g3cPolling=false;
+static ULONG g3cFenceDrops=0, g3cErrorBits=0, g3cDamage=0, g3cStatusDelay=0, g3cUnmaskedDelay=0, g3cSample=0;
+static ULONG g3cMaskChangeStep=0xFFFFFFFF;
+static std::vector<ULONG> g3cWrites, g3cClearWrites;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -121,27 +126,51 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
     for(ULONG i=0;i<RTL_NUMBER_OF(bases);++i) if(static_cast<ULONGLONG>(a.QuadPart)==bases[i]) return gPages[i];
     assert(false); return nullptr;
 }
+inline ULONG GmuMmioRead(volatile ULONG* p) {
+    if(g3cPolling && g3cPending) {
+        if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
+        if(p==GmuCfgReg(0x201) && g3cShowStatus && g3cSample>=g3cStatusDelay) *p|=1UL<<20;
+    }
+    const ULONG value=READ_REGISTER_ULONG(p);
+    if(g3cPolling && p==GmuCfgReg(0x201)) ++g3cSample;
+    return value;
+}
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
+    assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x37)) {
+        assert(allowG3cWrites && v==(1UL<<20) && !g3cWrites.empty());
+        g3cClearWrites.push_back(v);
+        if(!g3cIgnoreClear) {
+            *GmuCfgReg(0x201)&=~(1UL<<20); gPages[2][0x315]&=~(1UL<<20); g3cPending=false;
+        }
+        *p=v; return;
+    }
     if(p==GmuCfgReg(0x808) || p==GmuCfgReg(0x807)) {
         assert(allowG2Writes); const ULONG reg=p==GmuCfgReg(0x808) ? 0x808 : 0x807;
         g2Writes.push_back({reg,v});
-        assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20) || (allowG3bWrites && v==25)));
+        assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20) || (allowG3bWrites && v==25) || (allowG3cWrites && v==30)));
         if(reg==0x807) {
             const ULONG packet[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
             assert(g2Ring && g2Shadow && std::memcmp(g2Ring,packet,sizeof(packet))==0);
-            if(v==20 || v==25) {
+            if(v==20 || v==25 || v==30) {
                 const ULONG extra[]={0x48088501,0xCAFE0001,0x703D8003,0x70017000,0,0xCAFE0002,
                                      0x703E8003,0x00040885,0x70017008,0,0x70268000};
                 assert(std::memcmp(g2Ring+9,extra,sizeof(extra))==0);
                 if(v==20) g3Writes.push_back(v);
             }
-            if(v==25) {
+            if(v==25 || v==30) {
                 const ULONG event[]={0x70460004,4,0x70017010,0,0xCAFE0003};
-                assert(std::memcmp(g2Ring+20,event,sizeof(event))==0); g3bWrites.push_back(v);
+                assert(std::memcmp(g2Ring+20,event,sizeof(event))==0);
+                if(v==25) g3bWrites.push_back(v);
             }
-            ULONG& drops=v==25 ? g3bFenceDrops : (v==20 ? g3FenceDrops : g2FenceDrops);
-            if((v==25 ? g3bFenceForever : (v==20 ? g3FenceForever : g2FenceForever)) || drops!=0) {
+            if(v==30) {
+                const ULONG irqEvent[]={0x70460004,0x80000004,0x70017018,0,0xCAFE0004};
+                assert(std::memcmp(g2Ring+25,irqEvent,sizeof(irqEvent))==0 && *GmuCfgReg(0x38)==0);
+                g3cWrites.push_back(v);
+            }
+            ULONG& drops=v==30 ? g3cFenceDrops : (v==25 ? g3bFenceDrops : (v==20 ? g3FenceDrops : g2FenceDrops));
+            if((v==30 ? g3cFenceForever : (v==25 ? g3bFenceForever : (v==20 ? g3FenceForever : g2FenceForever))) || drops!=0) {
                 if(drops!=0) --drops;
                 gPages[2][0x313]=1; return;
             }
@@ -163,8 +192,19 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
                 for(ULONG i=0;i<4;++i) if(g3bDamage&(1UL<<i)) data[i]^=1;
                 *g2Shadow=25; *GmuCfgReg(0x806)=25;
             }
+            if(v==30 && g3cCompletes) {
+                ULONG* data=g2Ring+0x7000/4;
+                if(g3cEvent) data[6]=0xCAFE0004;
+                if(g3cBadGuard) data[7]=0;
+                for(ULONG i=0;i<6;++i) if(g3cDamage&(1UL<<i)) data[i]^=1;
+                *g2Shadow=30; *GmuCfgReg(0x806)=30; g3cPending=true;
+                if(g3cShowUnmasked && g3cUnmaskedDelay==0) gPages[2][0x315]|=1UL<<20;
+            }
             gPages[8][0x210]=g2RbbmBusy ? 2 : 1;
-            gPages[8][0x201]=(g2Hang ? (1UL<<23) : 0) | (v==25 ? g3bErrorBits : (v==20 ? g3ErrorBits : 0));
+            const ULONG other=v==30 ? gPages[8][0x201] : 0;
+            gPages[8][0x201]=other | (g2Hang ? (1UL<<23) : 0) |
+                            (v==30 ? g3cErrorBits : (v==25 ? g3bErrorBits : (v==20 ? g3ErrorBits : 0)));
+            if(v==30 && g3cCompletes && g3cShowStatus && g3cStatusDelay==0) gPages[8][0x201]|=1UL<<20;
             gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0;
         }
     }
@@ -241,6 +281,11 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
+    if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
+        if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
+        if(v==0x1009) { g3cPolling=true; g3cSample=0; }
+        if(v==0x100A) g3cPolling=false;
+    }
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==dropGxAtStep) gPages[1][0xD0]=0xC0;
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
     diagnostics[name]=v; return 0;
@@ -253,6 +298,7 @@ inline void* GmuAlloc(SIZE_T n,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRES
 inline void GmuFree(void* p,SIZE_T,int) { assert(allocations.erase(p)==1); _aligned_free(p); }
 #define MmMapIoSpaceEx GmuMap
 #define WRITE_REGISTER_ULONG GmuMmioWrite
+#define READ_REGISTER_ULONG GmuMmioRead
 #define EpiSetDword GmuDword
 #define MmAllocateContiguousMemorySpecifyCache GmuAlloc
 #define MmFreeContiguousMemorySpecifyCache GmuFree

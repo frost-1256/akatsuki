@@ -71,6 +71,10 @@ static std::vector<UCHAR> SqeImage() {
     return sqe;
 }
 static void Reset() {
+    allowG3cWrites=false; g3cCompletes=true; g3cEvent=true; g3cBadGuard=false; g3cFenceForever=false;
+    g3cShowStatus=true; g3cShowUnmasked=true; g3cIgnoreClear=false; g3cPending=false; g3cPolling=false;
+    g3cFenceDrops=0; g3cErrorBits=0; g3cDamage=0; g3cStatusDelay=0; g3cUnmaskedDelay=0; g3cSample=0;
+    g3cMaskChangeStep=0xFFFFFFFF; g3cWrites.clear(); g3cClearWrites.clear();
     allowG3bWrites=false; g3bCompletes=true; g3bEvent=true; g3bBadGuard=false; g3bFenceForever=false;
     g3bFenceDrops=0; g3bErrorBits=0; g3bDamage=0; g3bWrites.clear();
     allowG3Writes=false; g3Completes=true; g3Scratch=true; g3Mem=true; g3Reg=true;
@@ -105,11 +109,12 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
+    allowG3cWrites=g3c;
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -698,6 +703,121 @@ int main(int argc,char** argv) {
                 if(bad==4) probe.Regions[1].Mapped=false;
                 assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_INVALID_DEVICE_STATE && g3bWrites.empty());
             }
+            // G-3c publishes an IRQ event with MASK held at zero. The shim rejects any MASK write.
+            const auto seedG3c=[&]() {
+                seedG3b(); allowG3cWrites=true; g3cWrites.clear(); g3cClearWrites.clear();
+                g3cCompletes=true; g3cEvent=true; g3cBadGuard=false; g3cFenceForever=false;
+                g3cShowStatus=true; g3cShowUnmasked=true; g3cIgnoreClear=false; g3cPending=false; g3cPolling=false;
+                g3cFenceDrops=0; g3cErrorBits=0; g3cDamage=0; g3cStatusDelay=0; g3cUnmaskedDelay=0;
+                g3cSample=0; g3cMaskChangeStep=0xFFFFFFFF; *GmuCfgReg(0x38)=0; gPages[2][0x315]=0;
+                std::memcpy(cpRing.data()+20,eventPacket,sizeof(eventPacket));
+                cpShadow[0]=25; *GmuCfgReg(0x806)=25; *GmuCfgReg(0x807)=25;
+                cpRing[0x7010/4]=0xCAFE0003; cpRing[0x7014/4]=0xFFFFFFFF;
+            };
+            const ULONG irqPacket[]={0x70460004,0x80000004,0x70017018,0,0xCAFE0004};
+            seedG3c(); GMU_G3C_TRACE g3c=GmuG3cTrace();
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
+            assert(g3c.Cp.Reason==0 && g3c.Prepared==1 && g3c.Checks==0xFF && g3c.Cp.SqeWritten==0);
+            assert(g3c.Cp.ShadowBefore==25 && g3c.Cp.ShadowAfter==30 && g3c.Cp.WptrAfter==30);
+            assert(g3c.Cp.WptrWrites==1 && g2Writes.size()==1 && g2Writes[0].second==30);
+            assert(g3c.MaskBefore==0 && g3c.MaskAtSubmit==0 && g3c.MaskAfter==0);
+            assert(g3c.StatusFirst==0 && g3c.UnmaskedFirst==0 && g3c.IrqPolls==0);
+            assert(g3c.ClearAttempted==1 && g3cClearWrites.size()==1 && g3cClearWrites[0]==(1UL<<20));
+            assert(g3c.StatusAfterClear==0 && g3c.UnmaskedAfterClear==0);
+            assert(std::memcmp(cpRing.data(),expectedPacket,sizeof(expectedPacket))==0);
+            assert(std::memcmp(cpRing.data()+9,extraPacket,sizeof(extraPacket))==0);
+            assert(std::memcmp(cpRing.data()+20,eventPacket,sizeof(eventPacket))==0);
+            assert(std::memcmp(cpRing.data()+25,irqPacket,sizeof(irqPacket))==0);
+            assert(std::memcmp(g3c.Packet,irqPacket,sizeof(irqPacket))==0 && cpRing[30]==0);
+            for(ULONG i=0;i<6;++i) assert(g3c.DataBefore[i]==g3c.DataAfter[i]);
+            assert(g3c.DataBefore[6]==0xFFFFFFFF && g3c.DataAfter[6]==0xCAFE0004);
+            assert(g3c.DataAfter[7]==0xFFFFFFFF && cpRing[0x7020/4]==0 && testMaps.size()==originalMaps);
+            assert(g3c.CpInterrupt==0x123 && g3c.CpProtect==0x456 && g3c.CpStatus1==0x789 && g3c.Cp.Fsr==0x400);
+            seedG3c(); g3c=GmuG3cTrace(); *GmuCfgReg(0x38)=1;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
+            assert(g3c.Cp.Reason==15 && g3c.Cp.Attempted==0 && g3c.Prepared==0 && g3c.ClearAttempted==0);
+            assert(g3cWrites.empty() && g3cClearWrites.empty() && cpRing[0x7018/4]==0 && cpRing[25]==0);
+            // Recheck MASK immediately before submission, and before every fenced retry.
+            for(ULONG step=0x1006;step<=0x1007;++step) {
+                seedG3c(); g3c=GmuG3cTrace(); g3cMaskChangeStep=step;
+                if(step==0x1007) g3cFenceDrops=1;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
+                assert(g3c.Cp.Reason==15 && g3c.Cp.WptrWrites==(step==0x1006 ? 0UL : 1UL));
+                assert(g3c.ClearAttempted==(step==0x1006 ? 0UL : 1UL));
+            }
+            // Both, either, or neither interrupt source may appear; data alone determines success.
+            for(ULONG visible=0;visible<4;++visible) {
+                seedG3c(); g3c=GmuG3cTrace(); g3cShowStatus=(visible&1)!=0; g3cShowUnmasked=(visible&2)!=0;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0 && g3c.Checks==0xFF);
+                assert(g3c.StatusFirst==(g3cShowStatus ? 0UL : 0xFFFFFFFF));
+                assert(g3c.UnmaskedFirst==(g3cShowUnmasked ? 0UL : 0xFFFFFFFF));
+                assert(g3c.IrqPolls==(visible==3 ? 0UL : 100UL));
+            }
+            seedG3c(); g3c=GmuG3cTrace(); g3cStatusDelay=7; g3cUnmaskedDelay=3;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
+            assert(g3c.StatusFirst==7 && g3c.UnmaskedFirst==3 && g3c.IrqPolls==7);
+            seedG3c(); g3c=GmuG3cTrace(); g3cIgnoreClear=true;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
+            assert((g3c.StatusAfterClear&(1UL<<20)) && (g3c.UnmaskedAfterClear&(1UL<<20)));
+            seedG3c(); g3c=GmuG3cTrace(); *GmuCfgReg(0x201)=0x10; gPages[2][0x315]=0x80;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
+            assert(g3c.StatusAfterClear==0x10 && g3c.UnmaskedAfterClear==0x80);
+            for(ULONG bad=0;bad<8;++bad) {
+                seedG3c(); g3c=GmuG3cTrace();
+                if(bad<6) g3cDamage=1UL<<bad;
+                if(bad==6) g3cEvent=false;
+                if(bad==7) g3cBadGuard=true;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR);
+                assert(g3c.Cp.Reason==13 && g3c.Checks==(0xFFUL&~(1UL<<bad)) && g3c.ClearAttempted==1);
+            }
+            seedG3c(); g3c=GmuG3cTrace(); g3cFenceDrops=3;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0 && g3c.Cp.WptrWrites==4);
+            seedG3c(); g3c=GmuG3cTrace(); g3cFenceForever=true;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_TIMEOUT);
+            assert(g3c.Cp.Reason==10 && g3c.Cp.WptrWrites==201 && g3c.ClearAttempted==1);
+            for(ULONG predicate=0;predicate<3;++predicate) {
+                seedG3c(); g3c=GmuG3cTrace();
+                if(predicate==0) g3cCompletes=false;
+                if(predicate==1) g2RbbmBusy=true;
+                if(predicate==2) g2GmuBusy=true;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_TIMEOUT);
+                assert(g3c.Cp.Reason==9 && g3c.Cp.Polls==10000 && g3c.ClearAttempted==1);
+            }
+            for(ULONG bit:errorBits) {
+                seedG3c(); g3c=GmuG3cTrace(); g3cErrorBits=bit;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR);
+                assert(g3c.Cp.Reason==14 && (g3c.Cp.IntStatus&bit) && g3c.ClearAttempted==1);
+            }
+            seedG3c(); g3c=GmuG3cTrace(); g2Hang=true;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==11);
+            for(ULONG step=0x1000;step<=0x100D;++step) {
+                seedG3c(); g3c=GmuG3cTrace(); failGmuStep=step;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==6);
+                assert(g3c.Cp.Attempted==(step<=0x1006 ? 0UL : 1UL));
+                assert(g3c.ClearAttempted==(step<=0x1006 ? 0UL : 1UL));
+            }
+            for(ULONG step=0x1010;step<=0x1018;++step) {
+                seedG3c(); g3c=GmuG3cTrace(); failGmuStep=step;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==6);
+            }
+            seedG3c(); g3c=GmuG3cTrace(); g3cCompletes=false; failGmuStep=0x100A;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_TIMEOUT);
+            assert(g3c.Cp.Reason==9 && g3c.ClearAttempted==1); // first failure survives cleanup failure
+            seedG3c(); g3c=GmuG3cTrace(); dropGxAtStep=0x100A;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
+            assert(g3c.Cp.Reason==GX_REG_HM_OFF && g3c.ClearAttempted==0 && g3c.StatusAfterClear==0xFFFFFFFF);
+            seedG3c(); g3c=GmuG3cTrace(); failAddrMap=0;
+            assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INSUFFICIENT_RESOURCES && g3cWrites.empty());
+            for(ULONG bad=0;bad<5;++bad) {
+                seedG3c(); g3c=GmuG3cTrace();
+                if(bad==0) cpShadow[0]=20;
+                if(bad==1) *GmuCfgReg(0x807)=20;
+                if(bad==2) cpRing[0x7010/4]=0;
+                if(bad==3) cpRing[20]=0;
+                if(bad==4) probe.Regions[1].Mapped=false;
+                assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE && g3cWrites.empty());
+            }
+            allowG3cWrites=false; g3cPolling=false; g3cPending=false; g3cMaskChangeStep=0xFFFFFFFF; *GmuCfgReg(0x38)=0;
             allowG3bWrites=false; allowG3Writes=false; allowG2Writes=false; g2Ring=nullptr; g2Shadow=nullptr; probe.Count=0; probe.Smmu=nullptr;
             failGmuStep=0xFFFFFFFF; failAddrMap=0xFFFFFFFF; dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0;
         }
@@ -820,6 +940,31 @@ int main(int argc,char** argv) {
         ClearQuarantine();
         Reset(); smmuDisableFails=true;
         assert(RunG2(f,sqe,&keep,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
+    // Full G-3c: parent success, unchanged resource mappings, and quarantine on unsafe teardown.
+    {
+        const auto sqe=SqeImage();
+        Reset(); assert(RunG2(f,sqe,&keep,true,true,true)==0 && !keep && allocations.empty());
+        assert(testMaps.size()==11 && g3cWrites.size()==1 && g3cClearWrites.size()==1);
+        assert(g2Writes.size()==5 && g2Writes[1].second==9 && g2Writes[2].second==20 &&
+               g2Writes[3].second==25 && g2Writes[4].second==30);
+        Reset(); g3cShowStatus=false; g3cShowUnmasked=false;
+        assert(RunG2(f,sqe,&keep,true,true,true)==0 && !keep && allocations.empty());
+        Reset(); g3cIgnoreClear=true;
+        assert(RunG2(f,sqe,&keep,true,true,true)==0 && !keep && allocations.empty());
+        Reset(); g3cEvent=false;
+        assert(RunG2(f,sqe,&keep,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g3bEvent=false;
+        assert(RunG2(f,sqe,&keep,true,true,true)==EPI_GMU_E_CP && g3cWrites.empty() && g3cClearWrites.empty() && !keep);
+        Reset(); g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu->Smmu->enabled);
+        GMU_REGION* retained=GmuFind(g_KeptGmu,GmuG1Iova[1],GmuG1Size[1]);
+        assert(retained && retained->Va && static_cast<ULONG*>(retained->Va)[0x7018/4]==0xCAFE0004);
+        ClearQuarantine();
+        Reset(); smmuDisableFails=true;
+        assert(RunG2(f,sqe,&keep,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
         ClearQuarantine(); Reset();
     }

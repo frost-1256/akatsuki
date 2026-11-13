@@ -2368,6 +2368,140 @@ shim/ホスト試験に、IRQなしイベントパケットとWPTR=25、先頭20
   - あるいは、IB（`CP_INDIRECT_BUFFER`）を 1 段使う。
   - 描画に進むのは、そのあと。
 
+#### 9.21.10 G-3c の提案：IRQ 付き fence（bit25、0x3FFFE80）
+
+**Linux の流れ [L]**
+- `hw_init` の中で、cp_init より**前**に `RBBM_INT_0_MASK`（0x38）= `A6XX_INT_MASK` を書く。
+  - `A6XX_INT_MASK` には次の 11 ビットが入っている：CP_AHB_ERROR（1）、ATB_ASYNCFIFO_OVERFLOW（6）、CP_HW_ERROR（9）、CP_IB2（13）、CP_IB1（14）、CP_RB（15）、CP_CACHE_FLUSH_TS（20）、ATB_BUS_OVERFLOW（22）、HANG_DETECT（23）、UCHE_OOB_ACCESS（24）、UCHE_TRAP_INTR（25）。
+- `a6xx_irq` の処理：
+  1. keepalive の投票をする。
+  2. `RBBM_INT_0_STATUS`（0x201）を読む。
+  3. 読んだ値をそのまま `RBBM_INT_CLEAR_CMD`（0x37）に書いて、割り込みを消す。
+  4. bit20（CP_CACHE_FLUSH_TS）が立っていれば、`msm_gpu_retire` を呼ぶ。
+- fence は `CP_EVENT_WRITE` に `CACHE_FLUSH_TS | IRQ`（dword 0 の bit31）を付けて送る。
+
+**今回は割り込みのマスクを外さない。理由は次のとおり。**
+- Epinephrine の割り込み資源は 3 本あり、どれもレベル割り込み（`Resources` では f0）。
+- `DxgkDdiInterruptRoutine`（`bdd.cxx`）は INTF1 の割り込みしか自分のものとして受け取らず、それ以外では FALSE を返す。
+- どの vector が GPU の割り込みなのかは、まだ確かめていない [U]。
+- この状態で bit20 のマスクを外すと、GPU の割り込み線が立ったままになる。ISR は FALSE を返し続けるので、割り込みが止まらなくなるおそれがある [I]。
+- そこで今回は、割り込み線を立てずに、割り込みの「元」が立つかどうかだけを確かめる。
+
+**提案（bit25、G-3b の後に同じ OOB の中で行う）**
+1. 準備：
+   - データ[6]〜[7]（IOVA 0x70017018 と 0x7001701C）に、目印の 0xFFFFFFFF を書く。
+   - 次の 3 つの元の値を読んで記録する：
+     - `RBBM_INT_0_MASK`（0x38）
+     - `RBBM_INT_0_STATUS`（0x201）
+     - `GMU_RBBM_INT_UNMASKED_STATUS`（GMU の 0x23B15）
+   - **MASK が 0 でなければ、ここで止める。** 新しい Reason を割り当てる。MASK には書き込まない。
+2. ring の dword 25〜29：
+   | dword | 値 | 意味 |
+   |---|---|---|
+   | 25 | 0x70460004 | `CP_EVENT_WRITE`、本体 4 dword |
+   | 26 | **0x80000004** | CACHE_FLUSH_TS に IRQ（bit31）を付けたもの |
+   | 27、28 | 0x70017018、0 | 書き込み先はデータ[6] |
+   | 29 | 0xCAFE0004 | 書く値 |
+3. WPTR を 25 から **30** に進める。fenced write と待ち方は G-3b と同じで、shadow が 30 になるのを待つ。
+4. 割り込みの元を見る。idle になった後で、最大 1 ms（10 µs × 100 回）の間、次の 2 つを polling する：
+   - `GMU_RBBM_INT_UNMASKED_STATUS`
+   - `RBBM_INT_0_STATUS`
+   - ループの中ではレジストリに書かない。
+5. 後片付け：
+   - `RBBM_INT_CLEAR_CMD`（0x37）に 1<<20 を書く。
+   - その後に `RBBM_INT_0_STATUS` と UNMASKED_STATUS をもう一度読む。
+   - MASK はもう一度読むだけで、書かない。
+6. 成功の判定：
+   - データ[6] = 0xCAFE0004。
+   - データ[7] とデータ[0]〜[5] は変わっていない。
+   - 次の 3 つは判定には使わず、記録だけにする：
+     - UNMASKED_STATUS の bit20 が立ったかどうか
+     - INT_0_STATUS の bit20 が立ったかどうか
+     - CLEAR を書いた後に消えたかどうか
+   - 理由：`GMU_RBBM_INT_UNMASKED_STATUS` の意味は、Linux のソースには定義しかなく、使い方が書かれていない [U]。名前から、マスクをかける前の RBBM 割り込みの状態と推測しているだけである [I]。
+7. 記録するもの：
+   - G-3b と同じ項目
+   - MASK の前と後
+   - STATUS と UNMASKED の前、polling で最初に bit20 が見えた回数、最後の値、CLEAR 後の値
+
+**結果の読み方**
+- UNMASKED の bit20 が立ち、CLEAR の後に消えた場合：割り込みの元は正しく動いている。次は ISR の準備に進める。
+  - 準備 1：GPU の割り込みが 3 本のうちどの vector かを確かめる。
+  - 準備 2：GX が ON のときだけ GPU のレジスタを読む ISR の設計を考える。
+- どちらにも bit20 が出ない場合：EVENT_WRITE の IRQ ビットだけでは不足しているか、MASK が立っていないと STATUS に出ない作りになっている [U]。そのときは、ISR の準備をしてから MASK を外す試験を考える。
+
+#### 9.21.11 G-3c の実装（実機未実行）
+
+- bit25（`EPI_GMU_PROBE_G3C=0x2000000`、合計 `0x3FFFE80`）を追加した。G-3b とその前提が必要で、指定は既存と同じくワンショットで解除する。G-3b が成功した直後、同じ OOB の中でだけ実行する。以前のモードの動作と診断 ABI は変えていない。
+- MASK / STATUS / UNMASKED を先に記録する。MASK が非0なら Reason=15、`STATUS_INVALID_DEVICE_STATE` で停止し、CPU の目印の準備、WPTR、CLEAR のいずれも書かない。投入直前と fenced write の再送直前にも MASK=0 を確認する。MASK は全経路で読むだけで、ISR も変更していない。
+- ring[25..29] に `{0x70460004,0x80000004,0x70017018,0,0xCAFE0004}` を追加する。データ[6..7] の目印を準備し、WPTR=30、従来の fence 待ちと idle 待ちを行う。旧コマンドとデータ[0..5] は書き換えない。
+- idle のあと、10 µs 間隔で最大100回待つ（初回を含む読み取りは最大101回）。STATUS と UNMASKED の bit20 の初出と最後の値を記録する。両方の初出を記録したら早期終了する。ループ内ではレジストリに書かない。bit20 が見えなかったことは失敗にしない。
+- WPTR を一度でも書いた場合は、失敗経路でも GX が安全に触れる状態なら CLEAR に bit20 **だけ**を書く。CLEAR の breadcrumb 保存に失敗しても、この解除は試みる。GX の前提が崩れた場合は書かない。STATUS / UNMASKED / MASK を再記録する。bit20 が消えたかは判定に使わない。
+- 成功にはデータ[0..5] 不変、[6]=`0xCAFE0004`、[7]=`0xFFFFFFFF`（Checks=`0xFF`）を求める。エラー割り込み、hang、GX の前提、breadcrumb、map、fence / idle の時間切れは従来と同様に失敗とし、最初の Reason を保持する。安全に片付いた CP 試験の失敗は GMU status=15、片付けの失敗は従来どおり status=8 / KeepCx となる。OOB 解除、slumber、reset と復元の順番は変えていない。
+
+診断 `GpuGmuG3c` は REG_BINARY、304バイト（ULONG 76個）。未記録は `0xFFFFFFFF`。要求したが前段が失敗した場合は Cp.Reason=8、Cp.Status=`STATUS_INVALID_DEVICE_STATE`。
+
+```text
+{ Cp (既存 GpuGmuG2 と同じ140バイト),
+  ScratchBefore, ScratchAfter, DataBefore[8], DataAfter[8], Packet[5],
+  CpInterrupt, CpProtect, CpStatus1, Checks, Prepared,
+  MaskBefore, MaskAtSubmit, MaskAfter, StatusBefore, UnmaskedBefore, IrqPolls,
+  StatusFirst, UnmaskedFirst, StatusLast, UnmaskedLast,
+  ClearAttempted, StatusAfterClear, UnmaskedAfterClear }
+```
+
+- DataBefore[0..5] は G-3b の出力、[6..7] は CPU が準備した目印。Checks の bit0..5 は旧データ不変、bit6 は新しい値、bit7 は目印不変を表す。
+- MaskAtSubmit は最後の投入／再送前の読み取り値。StatusFirst / UnmaskedFirst は10 µsの待ち回数（0..100）、一度も見えなければ `0xFFFFFFFF`。IrqPolls も待ち回数。
+- Cp の SqeWritten=0。SQE は再起動しないため SqeBefore / SqeAfter と Cp.Packet[9] は未使用。追加の Packet[5] が今回のイベント。ClearAttempted / Prepared の初期値は0。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1000 | 前提確認、既存の2ページを map |
+| 0x1001〜0x1003 | 元の MASK、STATUS、UNMASKED |
+| 0x1004 | G-3b のデータ、WPTR / shadow=25、旧コマンドの確認 |
+| 0x1005 | 目印と追加パケットの準備 |
+| 0x1006 | MASK 再確認、WPTR=30 |
+| 0x1007 / 0x1008 | fence 待ち / idle 待ち |
+| 0x1009 | IRQ の元を観察 |
+| 0x100A | CLEAR bit20（GX が安全なときだけ） |
+| 0x100B〜0x100D | CLEAR 後の STATUS、UNMASKED、MASK |
+| 0x1010〜0x1018 | scratch、RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0 |
+
+shim とホスト試験ケースには、正常完了、MASK 非0／投入・再送前の変更、IRQ の元の片方／両方／不出現／遅延、CLEAR 後の残留、旧データ破壊、fence / idle の時間切れ、エラー割り込み、breadcrumb / map / GX の失敗、最初の Reason の保持、前段の失敗、KeepCx 時のメモリ保持を追加した。shim は MASK への書き込みを禁止し、CLEAR は bit20 だけを受け付ける。テスト、ビルド、配置、実機実行はまだ行っていない。
+
+#### 9.21.12 v64 実機結果（2026-11-13、0x3FFFE80、G-3c）
+
+- 実行条件：版 20.0.2.64（oem122）。端末を 12:45 に再起動してから実行した。
+- **結果：IRQ 付きの fence も書けた（Checks 0xFF）。割り込みの元（bit20）は、マスクを外す前の状態のところにだけ立った。**
+  - EpiGpuProbeStep は 0xFFFF だった。GpuGmuStatus、NtStatus、KeepCx、DisableStatus、CxStatus、FaultStatus はすべて 0。デバイスは Started のまま。
+  - 前段の確認も通っている。G-3 は Checks 0x1F、G-3b は 0x3F。
+- `GpuGmuG3c`（304 B）：
+  | 項目 | 値 |
+  |---|---|
+  | Cp：Attempted／Reason／Status | 1／0／0 |
+  | shadow／WPTR／RPTR | 25 → **30**／30／30 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT／CP_INT／PROTECT／STATUS_1 | 0x1／0／0／0／0／0 |
+  | データ[6]／[7] | **0xCAFE0004**／0xFFFFFFFF |
+  | データ[0..5] | G-3b の後と同じ |
+  | Packet | {0x70460004, 0x80000004, 0x70017018, 0, 0xCAFE0004}（仕様と一致） |
+  | MASK：前／投入時／後 | 0／0／0（一度も書いていない） |
+  | INT_0_STATUS：前／観察中の最後／CLEAR 後 | 0／0／0（StatusFirst は「見えず」） |
+  | UNMASKED_STATUS：前 | **0x00000001**（bit0 RBBM_GPU_IDLE だけ） |
+  | UNMASKED_STATUS：観察中 | 1 回目（idle になった直後）から **0x00100001**（bit20 が立った） |
+  | UNMASKED_STATUS：CLEAR 後 | **0x00000001**（bit20 だけ消えた） |
+  | IrqPolls | 100（2 つとも見えるまで回す作りなので、STATUS 側が出ずに上限まで回った） |
+  - FSR は 0x400 で、フォルトはない。
+- わかったこと：
+  - `GMU_RBBM_INT_UNMASKED_STATUS`（0x23B15）は、マスクをかける前の RBBM 割り込みの状態である [P]。
+    - bit20 は、IRQ ビットを付けた CACHE_FLUSH_TS で立った。
+    - G-3b（IRQ ビットなし）の後でも、前の値は 0x1 だった。つまり IRQ ビットがないときは立たない。
+    - `RBBM_INT_CLEAR_CMD`（0x37）に 1<<20 を書くと消えた。
+  - `RBBM_INT_0_STATUS`（0x201）は、マスクをかけた後の状態である [P]。MASK が 0 のままなので、0 のままだった。マスクが 0 なので、割り込みの線も立っていない [I]。
+  - Linux の `a6xx_irq` の処理（STATUS を読んで、CLEAR_CMD に書く）が前提にしている仕組みを、割り込みの線を立てずに確かめられた。
+- 次に割り込みを本当に使うには、次の準備が必要である [I]：
+  1. GPU の割り込みが、3 本のうちどの vector かを確かめる（DSDT の `GPU0._CRS` の順番と、`Resources` の vector の対応）。
+  2. ISR の設計。GX が OFF のときに GPU のレジスタを読まないこと。どの割り込みかは MessageNumber か、別の手段で見分けること。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
