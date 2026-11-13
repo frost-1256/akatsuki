@@ -34,9 +34,10 @@
 #define EPI_GMU_PROBE2_T1      0x10UL // requires A1; Probe2=31, texture prefetch quad
 #define EPI_GMU_PROBE2_W1      0x20UL // requires T1; Probe2=63, opt-in 16-KB ring/wrap test
 #define EPI_GMU_PROBE2_M1      0x40UL // requires W1; Probe2=127, GMEM tile clear/load/store
+#define EPI_GMU_PROBE2_Q1      0x80UL // requires M1; Probe2=255, rotating textured quad
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -444,6 +445,34 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // No further WPTR publications or GX diagnostic reads after Reason18. Band restore/free still runs.
 
 
+// GpuGmuQ1: 552 bytes (138 DWORDs), ULONG/NTSTATUS in this exact order:
+// Cp (140-byte G2), MChecks, MReason, CcuLive, RbCntlLive, PlaceBad, PlaceFirst,
+// IbBadCount, IbFirstBad, IbBadValue, DescBad,
+// FramesDone, FailFrame, FailData47, FailRptr, FailWptr, MaxRptrSeen, WrapCount, StraddleFrame, StraddleRptr, WptrWrites,
+// FenceMaxUs, FenceTotalUs, ElapsedMs,
+// RingBad, RingFirst, RingValue, RingExpected, OutsideRingBad, OutsideRingFirst, OutsideRingOld, OutsideRingNew,
+// SqGood[2], SqBad, SqFirst, SqValue, SqExpected, TexelBad[2], SqZero, SqPad, SqBg,
+// BgGood[2], BgBad, BgFirst, BgValue, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[20],
+// DataAfter[3], CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, ScanCount, ScanFirst, ScanDwords,
+// RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus.
+// DataAfter=data[45..47]; SqGood/BgGood parity=even,odd. Samples/TexelBad follow T1 (last two sample points are gray).
+// Checks: 1 M1/preflight, 2 all121 fences + one wrap/straddle91 RPTR4/final pointers265/idle/IB0/no IRQ errors,
+// 4 final ring + all outside-ring bytes/TS values, 8 exact square, 16 gray background + unchanged outside, 32 band restore.
+// Require3F. Square12800/background19968 pixels per parity; gray=FF202020, no color tolerance.
+// RingFirst: DWORD index; IbFirstBad: DWORD index in IB11; PlaceFirst/OutsideRingFirst/ScanFirst: allocation byte offset.
+// OutsideRingOld is the expected value after overlaying Q1 writes on the backup. Pixel Firsts/RestoreFirst: band byte offsets.
+// DescBad accumulates descriptor/texture/VB/data-sentinel readback mismatches. WptrWrites mirrors Cp.WptrWrites.
+// FramesDone/MaxRptrSeen/WrapCount/WptrWrites/FenceMaxUs/FenceTotalUs/HoldMs/Checks/Prepared start at zero;
+// all unread values/absent offsets FFFFFFFF, unexecuted statuses NOT_FOUND. RPTR0 is a valid observation.
+// ScanDwords=731: M1 exclusions + [6E00,6E40),[70B4,70C0),[7100,7400),[7C40,8000).
+// Breadcrumbs:1F00/01 map/prior,02 global,08 backup,03 prepare,40..47 each16 frames,
+// 10..1B CP diagnostics,20 global,30 save/flush+2s hold,31 restore,32 verify. Per-frame pause16ms, final frame120 angle0.
+// Reasons:8 parent,12 prior,15 MASK,13 readback/result/restore,16 100ms/frame timeout,18 native/shadow RPTR>=4096,
+// 10 2ms AHB timeout,14 IRQ error,11 hang,5 map/pool,6 breadcrumb/save/flush/hold,17 frame delay failed.
+// Frame VB x/v updates stop at the first failure; no more WPTR writes/GX diagnostics after Reason18.
+// CPU band restore/free remains mandatory after successful backup. SMMU regions and T1 shared resources are unchanged.
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -480,7 +509,8 @@ ULONG EpiGmuStackMinimum();
 // V1: Probe2=7 after successful D1 restore; integer-checked varying triangle under the same OOB.
 // A1: Probe2=15 after V1 restore; 241 sequential frames, no ring wrap, final 2-second hold and restore.
 // T1: Probe2=31 after A1 restore; nearest texture prefetch quad, exact pixels, 5-second hold and restore.
-// M1: Probe2=127 only; after W1 restore, GMEM clear/load/draw/store, WPTR3095->3272; requires W1.
+// Q1: Probe2=255; after M1 restore, 121 rotating texture frames, one ring wrap, WPTR3272->265.
+// M1: Probe2=127 or255; after W1 restore, GMEM clear/load/draw/store, WPTR3095->3272; requires W1.
 // W1: Probe2=63 or127; G1 RB_CNTL=20B from startup, then 1000 packets / 650 pubs with a 4096-DWORD ring.
 // Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
@@ -493,4 +523,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE);
