@@ -3528,6 +3528,338 @@ v71（20.0.2.71、oem129）。ビルド修正はなかった。phone を 19:58 �
 
 次の候補は、グラフィックスのシェーダで四角形を1枚描くこと（VS/FS、VFD、VPC、RAS、RB、sysmem の描画）。probe の bit がなくなったので、EpiGpuProbe2 などの新しい方式も同時に決める必要がある。
 
+#### 9.21.34 R-1 の提案：VS/FS で四角形を1枚描く（文章仕様、未実装）
+
+##### 方針
+
+最初のグラフィックス描画は、16×16 画素の RGBA8 の描画先に、8×8 画素の四角形を1枚描く。sysmem に直接描き（GMEM とビン分割は使わない）、深度、ステンシル、ブレンド、texture、varying、定数は使わない。
+
+- **VS：** ALU 命令を使わない。頂点の位置（vec4 の float）は VFD（頂点 fetch）が r0.xyzw に直接入れ、VS はそれをそのまま位置として出す。シェーダは `nop` と `end` だけ。
+- **FS：** 即値の `mov` 4個で色を r0.xyzw に作り、`end` する。S-1 で動いた `mov.u32u32` と `(rpt5)nop` と `end` の符号化だけを使う。
+- **図形：** turnip の `r3d_*`（clear / blit）と同じく `RECTLIST`（2頂点で矩形）を使う。GRAS_CL_CNTL で clip と viewport 変換と透視除算を止め、頂点座標をそのまま画素座標として使う。
+- 手本は Mesa turnip（AOSP ミラーの main）：`tu_clear_blit.cc` の `r3d_common` / `r3d_setup` / `r3d_dst_buffer` / `r3d_run`、`tu_cmd_buffer.cc` の `tu6_init_static_regs` / `tu6_init_hw` / `tu6_sysmem_render_begin`、`tu_shader.cc` の `tu6_emit_xs` / `tu6_emit_vs` / `tu6_emit_fs` / `tu6_emit_fs_inputs` / `tu6_emit_fs_outputs` / `tu6_emit_vfd_dest`、`tu_pipeline.cc` の `tu6_emit_xs_config` / `tu6_emit_vpc` / `tu6_setup_streamout` / `tu6_emit_vertex_input`。a635 は `CHIP == A6XX`、`a6xx_gen4` の経路をとる。
+- レジスタのオフセットとビットは、すべて新しい Mesa の a6xx.xml（A6XX の variant）で確かめた。IB の pkt4 で書く 190 個のレジスタは、§9.19.2 の a660 の CP_PROTECT 表（41項目、項目40は末尾まで）のどの範囲にも入らないことを機械的に確かめた。0xAE02（SP_NC_MODE_CNTL）、0xB604、0x8E00、0xBE02/03 は保護されているので、隣の番地を書くときも pkt4 の範囲に含めない。
+
+**位置づけ：** S-1 が成功した後に、同じ OOB の中で続けて実行する。G-5b の magic レジスタ（0x8E04 / 0x8E01 / 0xE12）と RB_CCU_CNTL（0x10000000、sysmem）はすでに入っているので、そのまま使う。0xE19（UCHE_CLIENT_PF）は今回も書かない。
+
+##### probe（新しい EpiGpuProbe2）
+
+EpiGpuProbe の 32 bit はすべて使った。そこで、同じ Device Parameters キーに **EpiGpuProbe2**（REG_DWORD）を新しく作る。
+
+- **bit0（0x1）= R-1。** EpiGpuProbe が **0xBFFFFE80**（S-1 まで全部）で、EpiGpuProbe2 が **0x1** のときだけ実行する。
+- EpiGpuProbe2 が 0 か、値がないときは、従来の動作をまったく変えない。
+- EpiGpuProbe2 に未定義の bit があるとき、または EpiGpuProbe が 0xBFFFFE80 でないのに bit0 が立っているときは、何も実行しない（従来の不正な組み合わせと同じ扱いで status=6）。
+- 読むタイミングと一回限りの解除は EpiGpuProbe と同じにする。EpiGpuProbe を消すときは EpiGpuProbe2 も消す。
+- 以後の段階は EpiGpuProbe2 の bit1, bit2, … を順に使う。
+- 実行条件：S-1 の Checks が 0x1F で、Reason 0、WPTR 82、data[14]=0xCAFE000C、S-1 の出力[0]=0xC0DE5EED であること。満たさなければ Reason 8 として送らない。
+
+##### メモリ（すべて既存の ring 領域。新しい map は作らない）
+
+S-1 までに使った 0x6000〜0x7FFF の空きでは足りないので、まだ使っていない 0x70014000 からの 8 KB を使う。
+
+| IOVA | 大きさ | 内容 |
+|---|---|---|
+| 0x70014000 | 314 dw | IB5（下の表） |
+| 0x70014800 | 32 dw（128 B） | VS（16命令） |
+| 0x70014880 | 32 dw（128 B） | FS（16命令） |
+| 0x70014900 | 8 dw | 頂点バッファ（2頂点 × vec4 float） |
+| 0x70014C00 | 256 dw（1 KB） | 描画先。16×16 画素、RGBA8（FMT6_8_8_8_8_UNORM 0x30）、リニア、pitch 64 B。投入前に CPU が 0xFFFFFFFF で埋める |
+| 0x70015000 | 16 dw | 番兵。投入前に 0xFFFFFFFF |
+| 0x7001703C | 1 dw | data[15]。投入前に 0xFFFFFFFF、期待値 0xCAFE000D（IB の中の CCU flush） |
+| 0x70017040 | 1 dw | data[16]。投入前に 0xFFFFFFFF、期待値 0xCAFE000E（ring の CACHE_FLUSH_TS） |
+
+シェーダの先頭は 128 B 境界に置く（turnip の `tu6_emit_xs` の条件）。
+
+##### 頂点バッファ（0x70014900）
+
+| 頂点 | x | y | z | w |
+|---|---|---|---|---|
+| 0 | 4.0（0x40800000） | 4.0（0x40800000） | 0（0） | 1.0（0x3F800000） |
+| 1 | 12.0（0x41400000） | 12.0（0x41400000） | 0（0） | 1.0（0x3F800000） |
+
+RECTLIST の矩形は (4,4)〜(12,12) で、画素の中心が中に入るのは x=4..11、y=4..11 の **64 画素**になるはず [I]。turnip の r3d も、矩形の右下を「左上 + 幅」で渡している。
+
+##### シェーダ（a6xx ir3。各命令は64ビットで、下位 dword が先）
+
+VS（0x70014800）：
+
+| # | 命令 | 下位 dword | 上位 dword |
+|---|---|---|---|
+| 0 | `nop` | 0x00000000 | 0x00000000 |
+| 1 | `end` | 0x00000000 | 0x03000000 |
+| 2〜15 | `nop` | 0 | 0 |
+
+- 入力：VFD_DEST_CNTL_INSTR[0] が、頂点の4成分を r0.x〜r0.w に書く。
+- 出力：SP_VS_OUT_REG[0] で、r0.xyzw（compmask 0xF）を位置として VPC の loc 0 に送る。
+- レジスタ footprint は r0 だけ（FULLREGFOOTPRINT 1）。
+
+FS（0x70014880）：
+
+| # | 命令 | 下位 dword | 上位 dword |
+|---|---|---|---|
+| 0 | `mov.u32u32 r0.x, 0x3F800000`（R = 1.0） | 0x3F800000 | 0x204CC000 |
+| 1 | `mov.u32u32 r0.y, 0x3E4CCCCD`（G = 0.2） | 0x3E4CCCCD | 0x204CC001 |
+| 2 | `mov.u32u32 r0.z, 0`（B = 0） | 0x00000000 | 0x204CC002 |
+| 3 | `mov.u32u32 r0.w, 0`（A = 0） | 0x00000000 | 0x204CC003 |
+| 4 | `(rpt5)nop` | 0x00000000 | 0x00000500 |
+| 5 | `end` | 0x00000000 | 0x03000000 |
+| 6〜15 | `nop` | 0 | 0 |
+
+- 出力：SP_FS_OUTPUT_REG[0] で、r0.xyzw を MRT0 の色とする（full precision）。
+- 期待する画素は R=0xFF、G=0x33（0.2×255＝51.0000008）、B=0、A=0。G-5 と同じ並び（WZYX、R が最下位バイト）で、メモリ上は **0x000033FF**。並びが逆なら 0xFF330000 になる。R/G/B/A の値をすべて違えてあるので、どの成分がどこに出たかが分かる。
+- 符号化は §9.21.31 と同じ規則。mov の DST は bit32..39＝レジスタ番号×4＋成分なので、r0.y〜r0.w は上位 dword の下位バイトが 1〜3 になる。
+
+##### IB5（0x70014000、314 dw、103 packet）
+
+packet の header は、これまでと同じ規則（pkt4 は count と register の奇数パリティ、pkt7 は count と opcode の奇数パリティ）で計算した。既知の 0x408E0701、0x488C0101、0x70BF8003、0x70460004、0x70268000、0x48088501 と照合済み。値の欄の 0x31 は CACHE_INVALIDATE（49）、0x1D は PC_CCU_FLUSH_COLOR_TS（29）。「位置」は IB 内の dword 番号（header の位置）。
+
+グループの内訳：
+- A（#1〜#27）：`tu6_init_hw` の CACHE_INVALIDATE と `tu6_init_static_regs`
+- B（#28〜#41）：`tu_disable_draw_states` と `tu6_sysmem_render_begin`（window scissor、window offset、bin control、MSAA、marker）
+- C（#42〜#55）：シェーダの段の有効化と、VS/FS のプログラム（`tu6_emit_xs_config` / `tu6_emit_xs`）
+- D（#56〜#74）：VPC の linkage（位置だけ）、streamout なし、PC
+- E（#75〜#79）：VFD（頂点 fetch 1本）
+- F（#80〜#89）：FS の入力（なし）と出力（MRT0）
+- G（#90〜#100）：GRAS の scissor、RB の MRT0、深度、ステンシル、LRZ を無効にする
+- H（#101〜#103）：draw、CCU flush、WFI
+
+| # | 位置 | packet | header | 値 | 意味 |
+|---|---|---|---|---|---|
+| 1 | 0 | pkt7 0x46 ×1 | 0x70460001 | 0x31 | CP_EVENT_WRITE CACHE_INVALIDATE |
+| 2 | 2 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 3 | 3 | pkt4 0xAE00 ×1 | 0x40AE0001 | 6 | SP_DBG_ECO_CNTL |
+| 4 | 5 | pkt4 0xAE03 ×2 | 0x40AE0302 | 0x1400、0 | SP_CHICKEN_BITS, SP_FLOAT_CNTL |
+| 5 | 8 | pkt4 0xAE0F ×1 | 0x40AE0F01 | 0x3F | SP_PERFCTR_ENABLE |
+| 6 | 10 | pkt4 0xB600 ×1 | 0x40B60001 | 0x5008000 | TPL1_DBG_ECO_CNTL |
+| 7 | 12 | pkt4 0xB605 ×1 | 0x40B60501 | 0x44 | TPL1_UNKNOWN_B605 |
+| 8 | 14 | pkt4 0xBE00 ×2 | 0x48BE0002 | 0x80、0 | HLSQ_UNKNOWN_BE00, BE01 |
+| 9 | 17 | pkt4 0xBE04 ×1 | 0x40BE0401 | 0 | HLSQ_DBG_ECO_CNTL |
+| 10 | 19 | pkt4 0x9600 ×1 | 0x48960001 | 0x2000000 | VPC_DBG_ECO_CNTL |
+| 11 | 21 | pkt4 0x8600 ×1 | 0x40860001 | 0 | GRAS_DBG_ECO_CNTL |
+| 12 | 23 | pkt4 0xAB20 ×1 | 0x48AB2001 | 0 | SP_IBO_COUNT |
+| 13 | 25 | pkt4 0xB182 ×2 | 0x48B18202 | 0、0 | SP_UNKNOWN_B182, B183 |
+| 14 | 28 | pkt4 0xA9A8 ×2 | 0x40A9A802 | 0、0 | SP_UNKNOWN_A9A8, SP_FS_PVT_MEM_HW_STACK_OFFSET |
+| 15 | 31 | pkt4 0xAB00 ×1 | 0x40AB0001 | 5 | SP_MODE_CONTROL |
+| 16 | 33 | pkt4 0xA007 ×3 | 0x40A00783 | 0、0、1 | VFD_MODE_CNTL, VFD_MULTIVIEW_CNTL, VFD_ADD_OFFSET |
+| 17 | 37 | pkt4 0x9804 ×2 | 0x48980402 | 0x1F、1 | PC_MODE_CNTL, PC_POWER_CNTL |
+| 18 | 40 | pkt4 0x8110 ×1 | 0x40811001 | 0 | GRAS_UNKNOWN_8110 |
+| 19 | 42 | pkt4 0x8818 ×7 | 0x48881807 | 0、0、0、0、0、0、0 | RB_UNKNOWN_8818..881E |
+| 20 | 50 | pkt4 0x88F0 ×1 | 0x4888F001 | 0 | RB_UNKNOWN_88F0 |
+| 21 | 52 | pkt4 0x9236 ×1 | 0x40923601 | 0 | VPC_POINT_COORD_INVERT |
+| 22 | 54 | pkt4 0x8099 ×1 | 0x40809901 | 0 | GRAS_SU_CONSERVATIVE_RAS_CNTL |
+| 23 | 56 | pkt4 0x80AF ×1 | 0x4080AF01 | 0 | GRAS_UNKNOWN_80AF |
+| 24 | 58 | pkt4 0x9602 ×1 | 0x40960201 | 0 | VPC_UNKNOWN_9602 |
+| 25 | 60 | pkt4 0x9E72 ×1 | 0x409E7201 | 0 | PC_UNKNOWN_9E72 |
+| 26 | 62 | pkt4 0xB309 ×1 | 0x40B30901 | 0xA2 | SP_TP_MODE_CNTL |
+| 27 | 64 | pkt4 0x8864 ×2 | 0x40886402 | 0、0xFFFF0000 | RB_ALPHA_CONTROL, RB_BLEND_CNTL |
+| 28 | 67 | pkt7 0x43 ×3 | 0x70438003 | 0x40000、0、0 | CP_SET_DRAW_STATE (DISABLE_ALL_GROUPS) |
+| 29 | 71 | pkt4 0x80F0 ×2 | 0x4080F002 | 0、0xF000F | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 30 | 74 | pkt4 0x840A ×2 | 0x48840A02 | 0、0xF000F | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 31 | 77 | pkt4 0x8890 ×2 | 0x48889002 | 0、1 | RB_WINDOW_OFFSET, RB_SAMPLE_COUNT_CONTROL |
+| 32 | 80 | pkt4 0x88D3 ×2 | 0x4088D302 | 0、0 | RB_BIN_CONTROL2, RB_WINDOW_OFFSET2 |
+| 33 | 83 | pkt4 0xB4D1 ×1 | 0x48B4D101 | 0 | SP_WINDOW_OFFSET |
+| 34 | 85 | pkt4 0xB307 ×1 | 0x48B30701 | 0 | SP_TP_WINDOW_OFFSET |
+| 35 | 87 | pkt4 0x8800 ×4 | 0x48880004 | 0xC00000、0、0、4 | RB_BIN_CONTROL, RB_RENDER_CNTL, RB_RAS_MSAA_CNTL, RB_DEST_MSAA_CNTL |
+| 36 | 92 | pkt4 0x80A0 ×4 | 0x4080A004 | 2、0xC00000、0、4 | GRAS_SC_CNTL, GRAS_BIN_CONTROL, GRAS_RAS_MSAA_CNTL, GRAS_DEST_MSAA_CNTL |
+| 37 | 97 | pkt4 0xB300 ×2 | 0x40B30002 | 0、4 | SP_TP_RAS_MSAA_CNTL, SP_TP_DEST_MSAA_CNTL |
+| 38 | 100 | pkt7 0x65 ×1 | 0x70E50001 | 1 | CP_SET_MARKER RM6_BYPASS |
+| 39 | 102 | pkt7 0x1D ×1 | 0x709D0001 | 0 | CP_SKIP_IB2_ENABLE_GLOBAL |
+| 40 | 104 | pkt7 0x64 ×1 | 0x70640001 | 1 | CP_SET_VISIBILITY_OVERRIDE |
+| 41 | 106 | pkt7 0x63 ×1 | 0x70E30001 | 0 | CP_SET_MODE |
+| 42 | 108 | pkt4 0xBB08 ×1 | 0x40BB0801 | 0xBF | HLSQ_INVALIDATE_CMD |
+| 43 | 110 | pkt4 0xA823 ×3 | 0x48A82383 | 0x100、1、0 | SP_VS_CONFIG, SP_VS_INSTRLEN, SP_VS_PVT_MEM_HW_STACK_OFFSET |
+| 44 | 114 | pkt4 0xA83B ×1 | 0x48A83B01 | 0 | SP_HS_CONFIG |
+| 45 | 116 | pkt4 0xA863 ×1 | 0x40A86301 | 0 | SP_DS_CONFIG |
+| 46 | 118 | pkt4 0xA894 ×1 | 0x48A89401 | 0 | SP_GS_CONFIG |
+| 47 | 120 | pkt4 0xAB04 ×2 | 0x48AB0402 | 0x100、1 | SP_FS_CONFIG, SP_FS_INSTRLEN |
+| 48 | 123 | pkt4 0xB800 ×4 | 0x48B80004 | 0x101、0、0、0 | HLSQ_VS_CNTL, HS, DS, GS |
+| 49 | 128 | pkt4 0xBB10 ×2 | 0x40BB1002 | 0x101、0 | HLSQ_FS_CNTL, HLSQ_SHARED_CONSTS |
+| 50 | 131 | pkt4 0xA800 ×1 | 0x40A80001 | 0x100080 | SP_VS_CTRL_REG0 |
+| 51 | 133 | pkt4 0xA81B ×7 | 0x40A81B07 | 0、0x70014800、0、0、0、0、0 | SP_VS_OBJ_FIRST_EXEC_OFFSET, OBJ_START lo/hi, PVT_MEM_PARAM, PVT_MEM_ADDR lo/hi, PVT_MEM_SIZE |
+| 52 | 141 | pkt7 0x32 ×3 | 0x70328003 | 0x620000、0x70014800、0 | CP_LOAD_STATE6_GEOM (SB6_VS_SHADER, 1 unit) |
+| 53 | 145 | pkt4 0xA980 ×1 | 0x40A98001 | 0x81000080 | SP_FS_CTRL_REG0 |
+| 54 | 147 | pkt4 0xA982 ×7 | 0x48A98207 | 0、0x70014880、0、0、0、0、0 | SP_FS_OBJ_FIRST_EXEC_OFFSET .. PVT_MEM_SIZE |
+| 55 | 155 | pkt7 0x34 ×3 | 0x70348003 | 0x720000、0x70014880、0 | CP_LOAD_STATE6_FRAG (SB6_FS_SHADER, 1 unit) |
+| 56 | 159 | pkt4 0x9B00 ×2 | 0x409B0002 | 0、4 | PC_PRIMITIVE_CNTL_0, PC_VS_OUT_CNTL |
+| 57 | 162 | pkt4 0xA802 ×2 | 0x48A80202 | 1、0xF00 | SP_VS_PRIMITIVE_CNTL, SP_VS_OUT_REG[0] |
+| 58 | 165 | pkt4 0xA813 ×1 | 0x48A81301 | 0 | SP_VS_VPC_DST_REG[0] |
+| 59 | 167 | pkt4 0x9300 ×2 | 0x48930002 | 0、0xFF0004 | VPC_UNKNOWN_9300, VPC_VS_PACK |
+| 60 | 170 | pkt4 0x9101 ×1 | 0x48910101 | 0xFFFF00 | VPC_VS_CLIP_CNTL |
+| 61 | 172 | pkt4 0x9311 ×1 | 0x48931101 | 0xFFFF00 | VPC_VS_CLIP_CNTL_V2 |
+| 62 | 174 | pkt4 0x8000 ×2 | 0x40800002 | 0x381、0 | GRAS_CL_CNTL, GRAS_VS_CL_CNTL |
+| 63 | 177 | pkt4 0x9104 ×1 | 0x48910401 | 0xFFFF | VPC_VS_LAYER_CNTL |
+| 64 | 179 | pkt4 0x9314 ×1 | 0x48931401 | 0xFFFF | VPC_VS_LAYER_CNTL_V2 |
+| 65 | 181 | pkt4 0x809B ×1 | 0x48809B01 | 0 | GRAS_VS_LAYER_CNTL |
+| 66 | 183 | pkt4 0x9107 ×1 | 0x48910701 | 0 | VPC_UNKNOWN_9107 |
+| 67 | 185 | pkt4 0x9200 ×1 | 0x40920001 | 0 | VPC_VARYING_INTERP_MODE[0] |
+| 68 | 187 | pkt4 0x9208 ×1 | 0x48920801 | 0 | VPC_VARYING_PS_REPL_MODE[0] |
+| 69 | 189 | pkt4 0x9210 ×7 | 0x48921007 | 0、0、0xFFFFFFFF、0xFFFFFFFF、0xFFFFFFFF、0xFFFFFFFF、0 | VPC_UNKNOWN_9210/9211, VPC_VAR_DISABLE[0..3], VPC_SO_CNTL |
+| 70 | 197 | pkt4 0x9304 ×3 | 0x40930483 | 0xFF00FF00、0、1 | VPC_CNTL_0, VPC_SO_STREAM_CNTL, VPC_SO_DISABLE |
+| 71 | 201 | pkt4 0x9806 ×1 | 0x40980601 | 0 | PC_PS_CNTL |
+| 72 | 203 | pkt4 0x9808 ×1 | 0x48980801 | 0 | PC_SO_STREAM_CNTL |
+| 73 | 205 | pkt4 0x9980 ×1 | 0x40998001 | 0 | PC_RASTER_CNTL |
+| 74 | 207 | pkt4 0x9B07 ×1 | 0x489B0701 | 0 | PC_MULTIVIEW_CNTL |
+| 75 | 209 | pkt4 0xA000 ×7 | 0x48A00007 | 0x101、0xFCFCFCFC、0xFCFC、0xFCFCFCFC、0xFC、0xFCFC、0 | VFD_CONTROL_0..6 |
+| 76 | 217 | pkt4 0xA00E ×2 | 0x40A00E02 | 0、0 | VFD_INDEX_OFFSET, VFD_INSTANCE_START_OFFSET |
+| 77 | 220 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70014900、0、0x20、0x10 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 78 | 225 | pkt4 0xA090 ×2 | 0x48A09002 | 0xC8200000、1 | VFD_DECODE[0] INSTR, STEP_RATE |
+| 79 | 228 | pkt4 0xA0D0 ×1 | 0x40A0D001 | 0xF | VFD_DEST_CNTL_INSTR[0] |
+| 80 | 230 | pkt4 0xA99E ×1 | 0x40A99E01 | 8 | SP_FS_PREFETCH_CNTL |
+| 81 | 232 | pkt4 0xB980 ×1 | 0x48B98001 | 0 | HLSQ_FS_CNTL_0 |
+| 82 | 234 | pkt4 0xB982 ×5 | 0x40B98285 | 7、0xFCFCFCFC、0xFCFCFCFC、0xFCFCFCFC、0xFCFC | HLSQ_CONTROL_1..5_REG |
+| 83 | 240 | pkt4 0x8005 ×1 | 0x40800501 | 0 | GRAS_CNTL |
+| 84 | 242 | pkt4 0x8809 ×7 | 0x48880907 | 0、0、0、1、0xF、0、0 | RB_RENDER_CONTROL0/1, RB_FS_OUTPUT_CNTL0/1, RB_RENDER_COMPONENTS, RB_DITHER_CNTL, RB_SRGB_CNTL |
+| 85 | 250 | pkt4 0x8810 ×2 | 0x40881002 | 0、0x10 | RB_SAMPLE_CNTL, RB_UNKNOWN_8811 |
+| 86 | 253 | pkt4 0x8100 ×2 | 0x48810002 | 0、0 | GRAS_LRZ_CNTL, GRAS_LRZ_PS_INPUT_CNTL |
+| 87 | 256 | pkt4 0x8109 ×1 | 0x48810901 | 0 | GRAS_SAMPLE_CNTL |
+| 88 | 258 | pkt4 0xA989 ×6 | 0x40A98986 | 0、0、0xF、0xFCFCFC00、1、0 | SP_BLEND_CNTL, SP_SRGB_CNTL, SP_FS_RENDER_COMPONENTS, SP_FS_OUTPUT_CNTL0/1, SP_FS_OUTPUT_REG[0] |
+| 89 | 265 | pkt4 0xA996 ×1 | 0x48A99601 | 0x30 | SP_FS_MRT_REG[0] |
+| 90 | 267 | pkt4 0x8090 ×1 | 0x40809001 | 0 | GRAS_SU_CNTL |
+| 91 | 269 | pkt4 0x80D0 ×2 | 0x4880D002 | 0、0x7FFF7FFF | GRAS_SC_VIEWPORT_SCISSOR_TL/BR[0] |
+| 92 | 272 | pkt4 0x80B0 ×2 | 0x4880B002 | 0、0x7FFF7FFF | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 93 | 275 | pkt4 0x8094 ×1 | 0x48809401 | 0 | GRAS_SU_DEPTH_PLANE_CNTL |
+| 94 | 277 | pkt4 0x8098 ×1 | 0x48809801 | 0 | GRAS_SU_DEPTH_BUFFER_INFO |
+| 95 | 279 | pkt4 0x8114 ×2 | 0x48811402 | 0、0 | GRAS_SU_DEPTH_CNTL, GRAS_SU_STENCIL_CNTL |
+| 96 | 282 | pkt4 0x8820 ×8 | 0x40882008 | 0x780、0、0x30、1、0、0x70014C00、0、0 | RB_MRT[0] CONTROL, BLEND_CONTROL, BUF_INFO, PITCH, ARRAY_PITCH, BASE lo/hi, BASE_GMEM |
+| 97 | 291 | pkt4 0x8870 ×3 | 0x40887083 | 0、0、0 | RB_DEPTH_PLANE_CNTL, RB_DEPTH_CNTL, RB_DEPTH_BUFFER_INFO |
+| 98 | 295 | pkt4 0x8880 ×2 | 0x40888002 | 0、0 | RB_STENCIL_CONTROL, RB_STENCIL_INFO |
+| 99 | 298 | pkt4 0x8887 ×3 | 0x48888783 | 0、0、0 | RB_STENCILREF, RB_STENCILMASK, RB_STENCILWRMASK |
+| 100 | 302 | pkt4 0x8898 ×1 | 0x40889801 | 0 | RB_LRZ_CNTL |
+| 101 | 304 | pkt7 0x38 ×3 | 0x70388003 | 0x88、1、2 | CP_DRAW_INDX_OFFSET (RECTLIST, AUTO_INDEX, 1 instance, 2 vertices) |
+| 102 | 308 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x7001703C、0、0xCAFE000D | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[15] |
+| 103 | 313 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+値の根拠（turnip と違えたところ、注意するところ）：
+- **static の値（A）**：a635 の `magic_regs`（`freedreno_devices.py`）を使う。SP_DBG_ECO_CNTL=0x6、SP_CHICKEN_BITS=0x1400、TPL1_DBG_ECO_CNTL=0x05008000、VPC_DBG_ECO_CNTL=0x02000000、GRAS / HLSQ_DBG_ECO_CNTL=0、PC_MODE_CNTL=0x1F、PC_POWER_CNTL=1。PC_POWER_CNTL は turnip の `tu6_init_static_regs` には無いが、magic_regs の一つなので入れる。SP_TP_MODE_CNTL は 0xA0｜ISAMMODE_GL(2) = 0xA2。border color（SP_TP_BORDER_COLOR_BASE_ADDR）は texture を使わないので書かない。
+- **SP_VS_CTRL_REG0 = 0x00100080：** FULLREGFOOTPRINT 1（bit7..12）、MERGEDREGS（VS では bit20）。HALFREGFOOTPRINT は 0。
+- **SP_FS_CTRL_REG0 = 0x81000080：** FULLREGFOOTPRINT 1、UNK24（turnip が常に立てる）、MERGEDREGS（FS では bit31）。THREADSIZE は THREAD64（0）、VARYING は 0。HLSQ_FS_CNTL_0 も THREAD64 で varying なし（0）。
+- **HLSQ_VS_CNTL / HLSQ_FS_CNTL = 0x101：** CONSTLEN 4 vec4（shr 2 で 1）、ENABLED。S-1 の HLSQ_CS_CNTL と同じ形。
+- **SP_xS_CONFIG = 0x100：** ENABLED だけ。HS/DS/GS は SP_xS_CONFIG と HLSQ_xS_CNTL を 0 にして無効。
+- **CP_LOAD_STATE6：** VS は CP_LOAD_STATE6_GEOM（0x32）で SB6_VS_SHADER（8）、FS は CP_LOAD_STATE6_FRAG（0x34）で SB6_FS_SHADER（0xC）。どちらも ST6_SHADER、SS6_INDIRECT、NUM_UNIT 1（instrlen 1）。dword0 は 0x00620000 / 0x00720000（S-1 の CS は 0x00760000）。
+- **VPC：** FS が varying を読まないので、linkage は位置だけ（loc 0、4成分）。SP_VS_OUT_REG[0]=0x0F00（r0、compmask 0xF）、SP_VS_VPC_DST_REG[0]=0、VPC_VS_PACK=0x00FF0004（STRIDE_IN_VPC 4、POSITIONLOC 0、PSIZELOC 0xFF）、PC_VS_OUT_CNTL=4、SP_VS_PRIMITIVE_CNTL=1（出力1個）。clip と layer の loc は 0xFF。VPC_CNTL_0=0xFF00FF00（varying なし、PRIMIDLOC / VIEWIDLOC 0xFF）、VPC_VAR_DISABLE はすべて 1。
+- **streamout なし：** `tu6_setup_streamout` は CP_CONTEXT_REG_BUNCH で VPC_SO_CNTL、VPC_SO_STREAM_CNTL、PC_SO_STREAM_CNTL（gen4 は tess_use_shared）に 0 を書く。ここでは同じ値を pkt4 で書く。VPC_SO_DISABLE=1 は static の値。
+- **VFD：** VFD_CONTROL_0=0x101（FETCH_CNT 1、DECODE_CNT 1）。VFD_CONTROL_1〜5 の sysval はすべて r63.x（0xFC）、VFD_CONTROL_6=0。VFD_FETCH[0]：BASE 0x70014900、SIZE 32 B、STRIDE 16 B。VFD_DECODE[0].INSTR=0xC8200000（IDX 0、OFFSET 0、FORMAT FMT6_32_32_32_32_FLOAT 0x82、SWAP WZYX、UNK30、FLOAT）、STEP_RATE 1（turnip の頂点単位の divisor）。VFD_DEST_CNTL_INSTR[0]=0xF（WRITEMASK 0xF、REGID r0.x）。
+- **FS の入力：** SP_FS_PREFETCH_CNTL=0x8（prefetch 0 個、IJ_WRITE_DISABLE）。HLSQ_CONTROL_1=7（PRIMALLOCTHRESHOLD、a6xx_base の値）、HLSQ_CONTROL_2〜4=0xFCFCFCFC、HLSQ_CONTROL_5=0xFCFC。GRAS_CNTL、RB_RENDER_CONTROL0/1、RB_SAMPLE_CNTL、GRAS_LRZ_PS_INPUT_CNTL、GRAS_SAMPLE_CNTL は 0。
+- **FS の出力：** SP_FS_OUTPUT_CNTL0=0xFCFCFC00（深度、sample mask、stencil ref は出さない）、SP_FS_OUTPUT_CNTL1=1（MRT 1個）、SP_FS_OUTPUT_REG[0]=0（r0.x、full）、SP_FS_RENDER_COMPONENTS=0xF。RB 側は RB_FS_OUTPUT_CNTL0=0、RB_FS_OUTPUT_CNTL1=1、RB_RENDER_COMPONENTS=0xF。SP_FS_MRT_REG[0]=0x30（UNORM なので SINT / UINT は 0）。
+- **MRT0：** RB_MRT[0].CONTROL=0x780（COMPONENT_ENABLE 0xF、ブレンドと ROP なし）、BLEND_CONTROL=0、BUF_INFO=0x30（リニア、WZYX）、PITCH=1（64 B、shr 6）、ARRAY_PITCH=0、BASE=0x70014C00、BASE_GMEM=0。RB_RENDER_CNTL=0（UBWC の flag なし）。RB_BLEND_CNTL=0xFFFF0000（SAMPLE_MASK 0xFFFF）、SP_BLEND_CNTL=0。
+- **GRAS：** GRAS_CL_CNTL=0x381（CLIP_DISABLE、VP_CLIP_CODE_IGNORE、VP_XFORM_DISABLE、PERSP_DIVISION_DISABLE）、GRAS_SU_CNTL=0（cull なし）、GRAS_SC_CNTL=2（CCUSINGLECACHELINESIZE 2）。viewport と screen の scissor は (0,0)〜(0x7FFF,0x7FFF)。window scissor と GRAS_2D_RESOLVE_CNTL は (0,0)〜(15,15)（端を含む）。
+- **sysmem：** GRAS_BIN_CONTROL と RB_BIN_CONTROL は 0x00C00000（BUFFERS_LOCATION = BUFFERS_IN_SYSMEM、RENDER_MODE = RENDERING_PASS、bin の大きさ 0）。LRZ feedback は 0 にした（LRZ 自体を使わない）。RB_BIN_CONTROL2=0。window offset（RB / RB2 / SP / SP_TP）はすべて 0。MSAA は1サンプルで MSAA_DISABLE（RAS 側 0、DEST 側 4）。
+- **marker：** CP_SET_MARKER は RM6_BYPASS（1、新しい名前は RM6_DIRECT_RENDER）。S-1 で RM6_COMPUTE にしたので、描画の前に戻す。CP_SKIP_IB2_ENABLE_GLOBAL 0、CP_SET_VISIBILITY_OVERRIDE 1、CP_SET_MODE 0 は `tu6_sysmem_render_begin` と同じ。CP_SET_DRAW_STATE は DISABLE_ALL_GROUPS（bit18）だけ。
+- **draw：** CP_DRAW_INDX_OFFSET の dword0 = 0x88（PRIM_TYPE DI_PT_RECTLIST 8、SOURCE_SELECT DI_SRC_SEL_AUTO_INDEX 2<<6、VIS_CULL IGNORE_VISIBILITY 0）、instance 数 1、頂点数 2（`r3d_run` と同じ）。
+- **後始末：** RB は CCU を通して書くので、PC_CCU_FLUSH_COLOR_TS で data[15] に 0xCAFE000D を書かせる（G-5 と同じ形）。そのあと WFI。
+
+##### ring（WPTR 82 → 91）
+
+```
+CP_INDIRECT_BUFFER（0x70BF8003）, 0x70014000, 0, 314
+CP_EVENT_WRITE（0x70460004）, 4 (CACHE_FLUSH_TS), 0x70017040, 0, 0xCAFE000E
+```
+
+##### 投入前の CPU 処理
+
+1. IB5、VS、FS、頂点バッファを書く。描画先 256 dw、番兵 16 dw、data[15]、data[16] を 0xFFFFFFFF にする。
+2. barrier を置いてから IB5・シェーダ・頂点バッファを読み返して比べ、記録する。違えば投入しない。
+3. S-1 と同じく前段の状態を確かめる：ring[0..81]、既存の IB、data[0..14]、S-1 の出力、WPTR・RPTR・shadow がすべて 82、MASK=0。
+
+##### 待ちと判定
+
+fence（0xCAFE000E）と idle の待ちは、G-5 / S-1 と同じ関数と時間上限を使う（WPTR 91、エラー bit も同じ）。
+
+Checks の各 bit：
+- 1：S-1 が成功している
+- 2：CP が idle で、WPTR・RPTR・shadow が 91、エラーの割り込みがなく、RBBM が busy でない
+- 4：data[15] が 0xCAFE000D で、data[16] が 0xCAFE000E
+- 8：四角形の中の 64 画素（x=4..11、y=4..11）がすべて 0x000033FF
+- 16：四角形の外の 192 画素と番兵 16 dw がすべて 0xFFFFFFFF のまま
+
+期待値は 0x1F。
+
+##### 記録（EpiDiag `GpuGmuR1`、REG_BINARY）
+
+- 前段の要約：S-1 の Checks と Reason
+- 追加 ring packet（9 dw）、VS（32 dw）、FS（32 dw）、頂点バッファ（8 dw）の読み返し
+- IB5 の読み返しの結果：不一致の数、最初の不一致の位置と値（IB5 全体は大きいので、全部は残さなくてよい）
+- 描画先 256 dw の投入後の値（全部）と、番兵 16 dw の投入後の値
+- 集計：0x000033FF の画素数（中／外）、0xFFFFFFFF の画素数、それ以外の画素数と最初のその位置と値
+- data[15] / data[16] の投入前後の値
+- S-1 と同じ CP / RBBM の診断値：CpHwFault、CpInterrupt、CpProtect、CpStatus1、IbBase と Remaining、RBBM_STATUS、INT_STATUS、CX busy
+- global fault と context bank の fault（FSR / FAR / FSYNR）
+- ring 領域の走査：0x000033FF と 0xFF330000 の個数と最初の位置。除外する範囲は、S-1 の除外に加えて `[0x4000,0x44E8)`（IB5）、`[0x4800,0x4920)`（シェーダと頂点）、`[0x4C00,0x5040)`（描画先と番兵）。data の範囲は `[0x7000,0x7044)` に広げる。
+
+breadcrumb は 0x1800 番台とする。S-1 と同じく、各段階の直前に guard を置く。
+
+##### 結果の読み方
+
+| 観測 | 判断 |
+|---|---|
+| Checks 0x1F | VS/FS による初めての 3D 描画が成功した。次は描画先を scanout のフレームバッファにする、または varying を使う（色を頂点ごとに変える）方向に進む |
+| CpProtect が 0 でない | IB のどこかが保護されたレジスタに触れた。CP_PROTECT_STATUS の番地から packet を特定する（机上では 190 個とも範囲外のはず） |
+| CP が DRAW で止まる（RPTR が 91 に届かず、IbRemaining が残る、または idle にならない） | 3D の状態が足りない。RBBM_STATUS の busy bit（VFD、PC、VPC、RAS、RB、SP など）から止まったブロックを絞る。最初に疑うのは VFD の fetch、VPC の linkage、HLSQ の FS の設定 |
+| idle になり data[15] も書かれたが、画素が全部 0xFFFFFFFF | 描画が捨てられた。候補は rasterization（scissor、CL_CNTL、RECTLIST の座標の解釈）、FS の出力（RENDER_COMPONENTS、MRT の COMPONENT_ENABLE）、VS の位置（VFD が r0 に書いていない） |
+| 256 画素がすべて塗られた | scissor か座標の解釈が違う（矩形が全体を覆った） |
+| 64 画素が塗られたが値が違う | 0xFF330000 ならバイトの並びが逆。そのほかの値なら、FS の出力レジスタか MRT の形式の解釈を見直す |
+| 塗られた画素の数が 64 と違う（49、81 など） | 画素の中心と矩形の端の扱いの違い。描画は成功している |
+| 走査で別の場所に見つかる | RB_MRT_BASE か PITCH の解釈の誤り |
+| context bank の fault | FAR が 0x70014900 付近なら VFD の読み込み、0x70014C00 付近なら RB の書き込み、0x700148xx なら命令の読み込みの経路 |
+
+#### 9.21.35 R-1 の実装（v72 で実行、§9.21.36）
+
+- `EpiGpuProbe2` の bit0（`EPI_GMU_PROBE2_R1=1`）を追加した。旧値がちょうど `0xBFFFFE80` で新値が1の組み合わせだけを許容し、新値の未知ビットや前提不足は GPU に触る前に status=6。両値を先に読み、ワンショット解除は両方を0にして同じキーを flush する。解除・flush の失敗は status=7。Probe2=0 / 未設定の場合の試験内容と既存の依存関係は変更しない。
+- S-1 の後、OOB を解除する前に実行する。S-1 の Cp.Status 成功、Reason=0、Checks=`0x1F`、WPTR=82、data[14]=`0xCAFE000C`、出力[0]=`0xC0DE5EED` を要求し、不成立なら R-1 の Cp.Reason=8 で未投入とする。入口でも RPTR / WPTR / shadow=82、ring[0..81]、既存の IB と compute シェーダ、data[0..14]、S-1 の全出力、MASK=0 を確認する。前提不成立では新しいバッファを変更しない。
+- IB5 の314 dwordは §9.21.34 の103 packet表から転記し、指定された `r1_ib5.txt` と全語が一致することを確認した。ビルドは Temp のファイルやスクリプトには依存しない。VS / FS / 頂点は仕様の固定値。IB・シェーダ・頂点・描画先はすべて既存の ring メモリに置き、SMMU や GPU メモリ確保を追加しない。
+- 描画先256語、番兵16語、data[15..16] を `0xFFFFFFFF` で準備し、IB・VS・FS・頂点・追加 ring を書いてメモリバリアを置く。読み返しを比べ、IB は不一致数・最初の位置と値、他は全値を記録する。不一致なら投入しない。ring[82..90] に IB 呼び出しと CACHE_FLUSH_TS、WPTR=91。待ちとエラー割り込みの扱いは S-1 と同じ。
+- 描画先と番兵は全値を記録する。`0x000033FF` の矩形内／外の個数、全体の `0xFFFFFFFF` の数、それら以外の値の数・最初の画素番号と値を集計する。判定は仕様の5条件で、全成功=`0x1F`。49画素や81画素、チャンネルの並びが違う場合を成功に丸めず、そのまま判定と値を残す。
+- ring 走査は `0x000033FF` / `0xFF330000` の個数と最初のバイト位置を別々に記録する。除外はバイトの半開区間 `[0,0x16C)`、`[0x4000,0x44E8)`、`[0x4800,0x4920)`、`[0x4C00,0x5040)`、`[0x6000,0x6240)`、`[0x6300,0x6400)`、`[0x6800,0x6880)`、`[0x7000,0x7044)`、`[0x7400,0x7840)`、`[0x7C00,0x7C40)`。対象は6898 dword。
+- global / context bank の fault、CP / RBBM / CX の状態は既存と同じ読み取りで残す。GX の前提が崩れた後は GX の診断読みを中止し、CPU メモリの記録は続ける。最初の Reason を保持する。OOB 解除、slumber、reset、idle 確認、復元は変更しない。安全に片付いた R-1 の失敗は GMU status=15、片付け失敗は8 / KeepCx。KeepCx 時は描画先・IB・シェーダも既存 ring とともに保持する。
+
+`GpuGmuR1` は REG_BINARY、**1716バイト（ULONG 429個）**。既存の診断形式は変更しない。
+
+```text
+{ Cp (140-byte GpuGmuG2 layout), SChecks, SReason, Packet[9], Vs[32], Fs[32], Vertices[8],
+  IbBadCount, IbFirstBad, IbBadValue, Target[256], Sentinel[16],
+  InsideMatches, OutsideMatches, WhiteCount, OtherCount, OtherFirst, OtherValue,
+  DataBefore[2], DataAfter[2], CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+  GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAtSubmit, MaskAfter,
+  ScanCount[2], ScanFirst[2], ScanDwords, Checks, Prepared }
+```
+
+- SChecks / SReason は S-1 の要約。Checks の bit0 は S-1 成功、bit1 は idle・91・エラーなし、bit2 は2個の fence 値、bit3 は矩形内64画素、bit4 は矩形外192画素と番兵16個。前段が通った時点で bit0 を立てる。DataBefore / After の順は data[15] / [16]。
+- IbFirstBad は IB 内 dword番号、OtherFirst は行優先の画素番号（y×16+x）、ScanFirst は ring 内バイト位置。最初の該当値なし／未記録は `0xFFFFFFFF`。IbBadCount と画素の集計は準備・読み返しを行った後だけ有効。Prepared / Checks は0から始める。Cp の SQE 前後と Packet は未使用、SqeWritten=0。Global の順は sGFSR / sGFSYNR0 / 1 / 2、読み取りの NTSTATUS は GlobalStatus に保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1800 / 0x1801 | 既存2ページの map / 前段の状態と MASK |
+| 0x1802 | 元の global fault |
+| 0x1803 | IB・VS・FS・頂点・描画先・番兵・ring の準備と読み返し |
+| 0x1804 | MASK 再確認、WPTR=91 |
+| 0x1805 / 0x1806 | fence / idle 待ち |
+| 0x1810〜0x181B | RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0、IB1_BASE下位／上位、IB1_REM_SIZE、MASK |
+| 0x1820 | 後の global fault |
+
+shim と試験ケースには、Probe2 の厳密な組み合わせ、64画素の模擬描画、49／81画素やチャンネル反転、外側／番兵破壊、IB・VS・FS・頂点の読み返し破壊で未投入となること、走査の境界と2色、再送と時間切れ、エラー割り込み、breadcrumb / map / GX / 前段 / MASK の失敗、最初の Reason、旧モードで未実行、KeepCx 時の保持を追加した。ホスト peer は shader ISA や rasterizer の正しさを検証するものではない。テスト、ビルド、版番号変更、配置、実機実行、コミットは行っていない。
+
+#### 9.21.36 v72 の結果（R-1、2026-11-13）：最初の 3D 描画
+
+v72（20.0.2.72、oem130）。ビルド修正はなかった。机上試験（SMMU / GMU）は通った。phone を 22:02 に再起動したあと、EpiGpuProbe=0xBFFFFE80、EpiGpuProbe2=1 で実行した。**GpuGmuStatus 0、NtStatus 0**。KeepCx 0、DisableStatus 0、FaultStatus 0、Step 0xFFFF で、両 probe は0に戻った。phone は落ちていない。
+
+**GpuGmuR1（1716 B）：**
+- Cp：Attempted 1、Reason 0、Status 0、WptrWrites 1（再送なし）。WPTR は 0x52 → 0x5B（82 → 91）、RPTR と shadow も 91。RBBM_STATUS 1、INT_STATUS 0、CP_HW_FAULT 0。
+- SChecks 0x1F、SReason 0（同じ実行の S-1 も WPTR 73 → 82 で成功）。
+- Packet の読み返しは書いた値と一致した。IbBadCount 0、VS / FS / 頂点も一致した。
+- **描画先：x,y = 4..11 の 64 画素がすべて 0x000033FF、残り 192 画素は 0xFFFFFFFF**。InsideMatches 64、OutsideMatches 0、WhiteCount 192、OtherCount 0。番兵16語は変化なし。
+- data[15] = 0xCAFE000D（PC_CCU_FLUSH_COLOR_TS）、data[16] = 0xCAFE000E（CACHE_FLUSH_TS）。
+- CP_INTERRUPT、CP_PROTECT、CP_STATUS_1 は 0。IB1_BASE は 0x70014000、IB1_REM_SIZE は 0。
+- global fault は前後とも 0、MASK は 0 / 0 / 0。
+- 走査では 6898 dw の中に 0x000033FF も 0xFF330000 も 0 個だった。
+- context bank の FSR 0x400、FAR 0x0001F734_6FE73FD7、FSYNR 0x000F001B は、同じ実行の S-1 の記録と同じ値であり、R-1 で新しく起きた fault ではない。
+- **Checks 0x1F**、Prepared 1。
+
+**結論：** VS / FS のグラフィックスパイプライン（VFD → VS → VPC → GRAS → RB → CCU → sysmem）で、RECTLIST の四角形を1枚描けた。これは Epinephrine で初めての 3D 描画である。次のことが確かめられた。
+- `nop` / `end` だけの VS でも、VFD が置いた位置がそのまま出力として使われる。
+- §9.21.34 の 190 レジスタの組で足りていた。
+- RGBA8 の成分順は R が最下位バイトである（0xFF330000 ではなく 0x000033FF）。
+- RECTLIST の端の規則では (4,4)–(12,12) が 8×8 = 64 画素になる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

@@ -27,6 +27,11 @@
 #define EPI_GMU_PROBE_G5B       0x10000000UL // modifier: requires G5 (0x1FFFFE80 total), magic registers then repeat CP_BLIT
 #define EPI_GMU_PROBE_Z1        0x20000000UL // Z-1c: requires G5b (0x3FFFFE80 total), direct PAS zap; IS_SUPPORTED x1 is advisory
 #define EPI_GMU_PROBE_S1        0x80000000UL // requires Z-1c (0xBFFFFE80 total); one compute invocation/global store
+#define EPI_GMU_PROBE2_R1      0x1UL // EpiGpuProbe2 bit0, valid only with EpiGpuProbe exactly BFFFFE80
+inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
+{
+    return Probe2==0 || (Probe2==EPI_GMU_PROBE2_R1 && Probe==0xBFFFFE80UL);
+}
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -275,6 +280,21 @@
 // 1704 publish, 1705 fence, 1706 idle, 1710..171B RPTR/WPTR/HW_FAULT/CP_INT/PROTECT/STATUS_1/
 // RBBM/INT0/IB1_BASE_LO/IB1_BASE_HI/IB1_REM_SIZE/MASK, 1720 global readback. Reasons match G-5.
 
+// GpuGmuR1: 1716 bytes {Cp (140-byte GpuGmuG2 layout), SChecks, SReason, Packet[9], Vs[32], Fs[32],
+// Vertices[8], IbBadCount, IbFirstBad, IbBadValue, Target[256], Sentinel[16], InsideMatches, OutsideMatches,
+// WhiteCount, OtherCount, OtherFirst, OtherValue, DataBefore[2], DataAfter[2], CpInterrupt, CpProtect,
+// CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining, GlobalStatus[2], GlobalBefore[4], GlobalAfter[4],
+// MaskBefore, MaskAtSubmit, MaskAfter, ScanCount[2], ScanFirst[2], ScanDwords, Checks, Prepared}.
+// Checks: 1 parent S1, 2 idle/RPTR/WPTR/shadow=91/no errors, 4 data[15..16]=CAFED/CAFEE,
+// 8 inside 8x8 pixels 000033FF, 16 outside pixels and sentinel FFFFFFFF. Require 1F.
+// Inside/OutsideMatches count 000033FF in/out of x/y [4,12). WhiteCount covers the full target;
+// OtherCount/First/Value cover values other than 000033FF and FFFFFFFF. First is a pixel index.
+// IB mismatch first is an IB DWORD index; IB data is not duplicated in the trace. ScanFirst is a ring byte offset.
+// Scan colors are 000033FF/FF330000, 6898 DWORDs after excluding command/IB/shader/data/target ranges.
+// Unrecorded values and absent first matches are FFFFFFFF. Cp.Packet/SQE fields unused, SqeWritten=0.
+// Breadcrumbs 1800 map, 1801 prior state/MASK, 1802 global, 1803 prepare/readback, 1804 publish,
+// 1805 fence, 1806 idle, 1810..181B and 1820 are the same diagnostics as S1. Parent failure: Reason=8.
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off
@@ -301,6 +321,7 @@
 // G5b: requires G5 completed without transport/access errors; magic registers and repeat fill (probe 0x1FFFFE80).
 // Z1: requires G5b Checks=B and blank pixels; direct PAS zap then SET_SECURE_MODE and repeat fill (0x3FFFFE80).
 // S1: requires successful Z-1c; one compute invocation/global store under the same OOB (0xBFFFFE80).
+// R1: EpiGpuProbe2 bit0 with exactly 0xBFFFFE80, after successful S1; private target VS/FS RECTLIST draw.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -310,4 +331,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
-                     BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE);
+                     BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE);

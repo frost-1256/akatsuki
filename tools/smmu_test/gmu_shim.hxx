@@ -15,7 +15,12 @@ using PCWSTR=const wchar_t*;
 #define MmNonCached 0
 #define NT_ASSERT(x) assert(x)
 #define REG_BINARY 3
-inline void RtlCopyMemory(void* a,const void* b,SIZE_T n) { std::memcpy(a,b,n); }
+static void* r1CopyTarget=nullptr;
+static ULONG r1CopyBadDword=0xFFFFFFFF;
+inline void RtlCopyMemory(void* a,const void* b,SIZE_T n) {
+    std::memcpy(a,b,n);
+    if(a==r1CopyTarget && r1CopyBadDword<n/4) static_cast<ULONG*>(a)[r1CopyBadDword]^=1;
+}
 inline void RtlFillMemory(void* a,SIZE_T n,UCHAR value) { std::memset(a,value,n); }
 template<class... T> inline void RtlStringCchPrintfW(wchar_t* p,SIZE_T n,const wchar_t* f,T... args) {
     _snwprintf_s(p,n,_TRUNCATE,f,args...);
@@ -91,6 +96,10 @@ static std::vector<ULONG> z1Writes;
 static bool allowS1Writes=false,s1Completes=true,s1Store=true,s1Event=true,s1FenceForever=false,s1BadRptr=false;
 static ULONG s1FenceDrops=0,s1ErrorBits=0,s1BadGuard=0xFFFFFFFF,s1Scatter=0xFFFFFFFF;
 static std::vector<ULONG> s1Writes;
+static bool allowR1Writes=false,r1Completes=true,r1Draw=true,r1Ccu=true,r1Event=true,r1FenceForever=false,r1BadRptr=false;
+static ULONG r1FenceDrops=0,r1ErrorBits=0,r1BadSentinel=0xFFFFFFFF,r1BadPixel=0xFFFFFFFF,r1Color=0x000033FF,r1Scatter=0xFFFFFFFF;
+static ULONG r1RectEnd=12;
+static std::vector<ULONG> r1Writes;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -156,6 +165,35 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v==91) {
+        assert(allowG2Writes && allowR1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70BF8003,0x70014000,0,314,0x70460004,4,0x70017040,0,0xCAFE000E};
+        const ULONG vs[32]={0,0,0,0x03000000};
+        const ULONG fs[32]={0x3F800000,0x204CC000,0x3E4CCCCD,0x204CC001,0,0x204CC002,
+                            0,0x204CC003,0,0x500,0,0x03000000};
+        const ULONG vb[]={0x40800000,0x40800000,0,0x3F800000,0x41400000,0x41400000,0,0x3F800000};
+        assert(std::memcmp(g2Ring+82,packet,sizeof(packet))==0 && std::memcmp(g2Ring+0x4800/4,vs,sizeof(vs))==0);
+        assert(std::memcmp(g2Ring+0x4880/4,fs,sizeof(fs))==0 && std::memcmp(g2Ring+0x4900/4,vb,sizeof(vb))==0);
+        assert(g2Ring[0x4000/4+304]==0x70388003 && g2Ring[0x4000/4+308]==0x70460004 && g2Ring[0x4000/4+313]==0x70268000);
+        g2Writes.push_back({0x807,v}); r1Writes.push_back(v);
+        if(r1FenceForever || r1FenceDrops) {
+            if(r1FenceDrops) --r1FenceDrops;
+            gPages[2][0x313]=1; return;
+        }
+        gPages[2][0x313]=0;
+        *GmuCfgReg(0x928)=0x70014000; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=314;
+        if(r1Completes) {
+            if(r1Draw) for(ULONG y=4;y<r1RectEnd;++y) for(ULONG x=4;x<r1RectEnd;++x) g2Ring[0x4C00/4+y*16+x]=r1Color;
+            if(r1BadPixel<256) g2Ring[0x4C00/4+r1BadPixel]=0;
+            if(r1BadSentinel<16) g2Ring[0x5000/4+r1BadSentinel]=0;
+            if(r1Scatter<0x8000) g2Ring[r1Scatter/4]=r1Color;
+            if(r1Ccu) g2Ring[0x703C/4]=0xCAFE000D;
+            if(r1Event) g2Ring[0x7040/4]=0xCAFE000E;
+            *g2Shadow=91; *GmuCfgReg(0x806)=r1BadRptr ? 90 : 91; *GmuCfgReg(0x92A)=0;
+        }
+        gPages[8][0x210]=g2RbbmBusy ? 2 : 1; gPages[8][0x201]=r1ErrorBits|(g2Hang ? (1UL<<23) : 0);
+        gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0; *p=v; return;
+    }
     if(p==GmuCfgReg(0x807) && v==82) {
         assert(allowG2Writes && allowS1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG packet[]={0x70BF8003,0x70016300,0,53,0x70460004,4,0x70017038,0,0xCAFE000C};

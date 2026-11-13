@@ -718,7 +718,7 @@ out:
 //              12 map failed, 13 CX GDSC did not collapse again on restore,
 //              14 SMMU/CM3 boot/RSCC write test needs initially collapsed CX, 15 post-collapse SMMU read cycle failed,
 //              16 GMU boot test failed (GpuGmuStatus contains the reason), 17 RSCC write test failed
-static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile ULONG* Cc, PWCHAR Text,
+static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags2, volatile ULONG* Cc, PWCHAR Text,
                           const EPI_GMU_FW* Fw, PULONG FwStatus, BOOLEAN* KeepCx)
 {
     *KeepCx = FALSE;
@@ -834,7 +834,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, volatile UL
                                                (Flags & EPI_GMU_PROBE_G5) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_G5B) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_Z1) ? TRUE : FALSE,Fw->Zap,Fw->ZapLen,
-                                               (Flags & EPI_GMU_PROBE_S1) ? TRUE : FALSE);
+                                               (Flags & EPI_GMU_PROBE_S1) ? TRUE : FALSE,
+                                               (Flags2 & EPI_GMU_PROBE2_R1) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -912,6 +913,14 @@ restore:
     return status;
 }
 
+static NTSTATUS EpiGpuClearProbes(HANDLE Params)
+{
+    const NTSTATUS first=EpiSetDword(Params,L"EpiGpuProbe",0);
+    const NTSTATUS second=EpiSetDword(Params,L"EpiGpuProbe2",0);
+    if (!NT_SUCCESS(first)) { return first; }
+    if (!NT_SUCCESS(second)) { return second; }
+    return ZwFlushKey(Params);
+}
 VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 {
     PAGED_CODE();
@@ -930,6 +939,8 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     PVOID gcc = NULL;
     PVOID gpucc = NULL;
     ULONG flags = 0;
+    ULONG flags2 = 0;
+    BOOLEAN probesCleared = FALSE;
     ULONG cxStatus = 0xFFFFFFFF;
     PWCHAR cxText = NULL;
     EPI_GMU_FW fw = {};
@@ -967,11 +978,17 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // bit30 = standalone read-only SCM query; no GPU/GMU/SMMU access or firmware loading.
     // bit31 = requires bit29 (0xBFFFFE80, without bit30), one compute invocation/global store after Z-1c succeeds.
     flags = EpiQueryDword(hParams, L"EpiGpuProbe", 0);
-    if (flags == 0) { status = 1; goto done; }
+    flags2 = EpiQueryDword(hParams,L"EpiGpuProbe2",0);
+    if (flags == 0 && flags2 == 0) { status = 1; goto done; }
+    if (flags2!=0)
+    {
+        if (!NT_SUCCESS(EpiGpuClearProbes(hParams))) { status=7; goto done; }
+        probesCleared=TRUE;
+        if (!EpiGmuProbe2Valid(flags,flags2)) { status=6; goto done; }
+    }
     if (flags & EPI_ZAP_PROBE_QUERY)
     {
-        const NTSTATUS cleared=EpiSetDword(hParams,L"EpiGpuProbe",0);
-        if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status=7; goto done; }
+        if (!probesCleared && !NT_SUCCESS(EpiGpuClearProbes(hParams))) { status=7; goto done; }
         if (flags!=EPI_ZAP_PROBE_QUERY) { status=6; goto done; }
         EPI_ZAP_QUERY_TRACE query;
         status=NT_SUCCESS(EpiZapQuery(hParams,hDiag,&query)) ? 0UL : 9UL;
@@ -984,8 +1001,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         EpiSetDword(hDiag, L"GpuRsccWCount", 0);
         EpiSetDword(hDiag, L"GpuRsccWBadIndex", 0xFFFFFFFF);
         EpiSetDword(hDiag, L"GpuRsccWRestoreBadIndex", 0xFFFFFFFF);
-        const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
-        if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
+        if (!probesCleared && !NT_SUCCESS(EpiGpuClearProbes(hParams))) { status=7; goto done; }
         if (flags & ~(EPI_RSCC_PROBE_WRITE | 3UL))
         { EpiSetDword(hDiag, L"GpuRsccWStatus", 6); status = 6; goto done; }
     }
@@ -996,8 +1012,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
                       EPI_GMU_PROBE_G3 | EPI_GMU_PROBE_G3B | EPI_GMU_PROBE_G3C | EPI_GMU_PROBE_G4 | EPI_GMU_PROBE_G5 |
                       EPI_GMU_PROBE_G5B | EPI_GMU_PROBE_Z1 | EPI_GMU_PROBE_S1))
     {
-        const NTSTATUS cleared = EpiSetDword(hParams, L"EpiGpuProbe", 0);
-        if (!NT_SUCCESS(cleared) || !NT_SUCCESS(ZwFlushKey(hParams))) { status = 7; goto done; }
+        if (!probesCleared && !NT_SUCCESS(EpiGpuClearProbes(hParams))) { status=7; goto done; }
         if (!(flags & EPI_GMU_PROBE_BOOT) ||
             ((flags & EPI_GMU_PROBE_GX_VOTE) && !(flags & EPI_GMU_PROBE_HFI_START)) ||
             ((flags & EPI_GMU_PROBE_CLOCK) &&
@@ -1026,7 +1041,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             ((flags & EPI_GMU_PROBE_S1) && !(flags & EPI_GMU_PROBE_Z1)))
         { status = 6; goto done; }
     }
-    else { EpiSetDword(hParams, L"EpiGpuProbe", 0); }
+    else { EpiSetDword(hParams,L"EpiGpuProbe",0); EpiSetDword(hParams,L"EpiGpuProbe2",0); }
     EpiGpuStep(hParams, 1);
     if (!pRes->GpuCcFound) { status = 2; goto done; }
 
@@ -1101,7 +1116,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & EPI_GPU_CX_FLAGS) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, c, cxText, &fw, &fwStatus, &keepCx); }
+        if (flags & EPI_GPU_CX_FLAGS) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, flags2, c, cxText, &fw, &fwStatus, &keepCx); }
     }
 
 done:
