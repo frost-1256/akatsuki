@@ -126,6 +126,10 @@ extern "C" VOID EpiSmcInvoke(EPI_SMC_REGS* r) {
     if(cmd==5) z1Authorized=true;
 }
 static void Reset() {
+    allowW1Writes=false; w1Active=false; w1FenceForever=false; w1Pending=false; w1ShadowOnly=false; w1SaveFails=false;
+    w1FenceDrops=0; w1StopPub=0xFFFFFFFF; w1BadSizePub=0xFFFFFFFF; w1WrongPub=0xFFFFFFFF; w1ErrorPub=0xFFFFFFFF;
+    w1DamageRing=0xFFFFFFFF; w1DamageOutside=0xFFFFFFFF; w1Cursor=2287; w1NextPacket=0; w1DelayUs=0;
+    w1Writes.clear(); w1Pubs.clear(); w1ReadPackets.clear(); w1Progress.clear();
     t1CopyTrigger=nullptr; t1CorruptTarget=nullptr;
     allowT1Writes=false; t1Completes=true; t1Zero=false; t1Black=false; t1Pad=false; t1Transpose=false; t1FlipX=false; t1FlipY=false;
     t1Outside=false; t1BoxDamage=false; t1Odd=true; t1FenceForever=false; t1BadRemaining=false; t1SaveFails=false; t1Pending=false;
@@ -203,7 +207,7 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false,BOOLEAN d1=false,BOOLEAN v1=false,BOOLEAN a1=false,BOOLEAN t1=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false,BOOLEAN d1=false,BOOLEAN v1=false,BOOLEAN a1=false,BOOLEAN t1=false,BOOLEAN w1=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
     allowG4Writes=g4;
@@ -211,11 +215,11 @@ static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
     allowG5bWrites=g5b;
     allowZ1Writes=z1; const auto zap=ZapImage();
     allowS1Writes=s1;
-    allowR1Writes=r1; allowD1Writes=d1; allowV1Writes=v1; allowA1Writes=a1; allowT1Writes=t1;
+    allowR1Writes=r1; allowD1Writes=d1; allowV1Writes=v1; allowA1Writes=a1; allowT1Writes=t1; allowW1Writes=w1;
     const ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1,d1,d1 ? disp : nullptr,v1,a1,t1);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1,d1,d1 ? disp : nullptr,v1,a1,t1,w1);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -229,7 +233,7 @@ int main(int argc,char** argv) {
     // Probe2 is optional, but R-1 must have exactly the full S-1 value and no unknown bits.
     assert(EpiGmuProbe2Valid(0,0) && EpiGmuProbe2Valid(0x80,0) && EpiGmuProbe2Valid(0xBFFFFE80,1));
     for(ULONG invalid:{0UL,0x3FFFFE80UL,0x80000000UL,0xFFFFFF80UL}) assert(!EpiGmuProbe2Valid(invalid,1));
-    for(ULONG invalid:{2UL,4UL,5UL,6UL,8UL,9UL,14UL,16UL,30UL,32UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{2UL,4UL,5UL,6UL,8UL,9UL,14UL,16UL,30UL,32UL,62UL,64UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
     assert(EpiGmuProbe2Valid(0xBFFFFE80,3) && !EpiGmuProbe2Valid(0x3FFFFE80,3));
     {
         ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
@@ -271,6 +275,15 @@ int main(int argc,char** argv) {
             {3,3,0xFF707040},{4,5,0xFF90B0C0},{1,1,0xFF303040}};
         for(const auto& pt:samples) assert(GmuT1Texel(pt[0],pt[1])==pt[2]);
         for(ULONG j=0;j<8;++j) for(ULONG i=8;i<16;++i) assert(GmuT1Word(0x6C00+(j*16+i)*4)==0xFFFF00FF);
+    }
+    assert(EpiGmuProbe2Valid(0xBFFFFE80,63) && !EpiGmuProbe2Valid(0x3FFFFE80,63));
+    {
+        GMU_G1_TRACE g1; GmuG1TraceInit(&g1); assert(g1.Value[4]==0x20C);
+        GmuG1TraceInit(&g1,TRUE); assert(g1.Value[4]==0x20B);
+        ULONG model[4096]={}; // host-only reference; the driver computes each expected word without this array
+        for(ULONG i=0;i<1000;++i) for(ULONG j=0;j<9;++j) model[(2287+9*i+j)%4096]=GmuW1Word(i,j);
+        for(ULONG i=0;i<4096;++i) assert(model[i]==GmuW1Expected(i));
+        assert(model[0]==0x70016400 && model[4095]==0x70BF8003 && model[3095]==0xB1000220);
     }
     // Z-1b: only read-only SMCs; independent of ZapOnce and every GPU power/memory prerequisite.
     {
@@ -1892,6 +1905,90 @@ int main(int argc,char** argv) {
             assert(submitT1()==0 && t1.Cp.WptrWrites==4);
             seedT1(); initT1(); t1FenceForever=true;
             assert(submitT1()==STATUS_IO_TIMEOUT && t1.Cp.Reason==10 && d1Band==bandBefore);
+            const auto seedW1=[&]() {
+                seedT1(); allowW1Writes=true; w1Active=false; w1FenceForever=false; w1Pending=false; w1ShadowOnly=false; w1SaveFails=false;
+                w1FenceDrops=0; w1StopPub=0xFFFFFFFF; w1BadSizePub=0xFFFFFFFF; w1WrongPub=0xFFFFFFFF; w1ErrorPub=0xFFFFFFFF;
+                w1DamageRing=0xFFFFFFFF; w1DamageOutside=0xFFFFFFFF; w1Cursor=2287; w1NextPacket=0; w1DelayUs=0;
+                w1Writes.clear(); w1Pubs.clear(); w1ReadPackets.clear(); w1Progress.clear();
+                std::memcpy(cpRing.data()+0x6400/4,GmuT1Ib,sizeof(GmuT1Ib));
+                for(ULONG r=0;r<RTL_NUMBER_OF(GmuT1Regions);++r) for(ULONG off=GmuT1Regions[r][0];off<GmuT1Regions[r][0]+GmuT1Regions[r][1];off+=4)
+                    cpRing[off/4]=GmuT1Word(off);
+                std::memcpy(cpRing.data()+2278,GmuT1Packet,sizeof(GmuT1Packet));
+                cpShadow[0]=2287; *GmuCfgReg(0x806)=2287; *GmuCfgReg(0x807)=2287; *GmuCfgReg(0x802)=0x20B;
+                cpRing[0x7068/4]=0xCAFE0017; cpRing[0x706C/4]=0xCAFE0018; cpRing[0x7070/4]=0xCAFE0019;
+                GmuT1TraceInit(&t1); t1.Cp.Status=0; t1.Cp.Reason=0; t1.Checks=0x3F; t1.Cp.WptrAfter=2287;
+                t1.DataAfter[0]=0xCAFE0017; t1.DataAfter[1]=0xCAFE0018; t1.DataAfter[2]=0xCAFE0019;
+                t1.RestoreMismatch=0; t1.RestoreStatus=0;
+            };
+            GMU_W1_TRACE w1;
+            const auto initW1=[&]() {GmuW1TraceInit(&w1); w1.TChecks=t1.Checks; w1.TReason=t1.Cp.Reason; w1.RbCntlG1=0x20B;};
+            const auto submitW1=[&]() {return GmuW1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&w1,reinterpret_cast<HANDLE>(2),&d1);};
+            seedW1(); initW1(); assert(GmuW1CanFollow(&t1) && submitW1()==0);
+            assert(w1.Checks==0x3F && w1.PubsDone==650 && w1.PacketsDone==1000 && w1.WrapCount==2 && w1.Cp.Reason==0);
+            assert(w1.RbCntlG1==0x20B && w1.RbCntlLive==0x20B && w1.ZeroWptrPub==200 && w1.ZeroSeenRptr==0 && w1.StraddlePub==607);
+            assert(w1.Cp.Rptr==3095 && w1.Cp.WptrAfter==3095 && w1.Cp.ShadowAfter==3095 && w1.DataAfter[3]==0xB10003E7);
+            assert(w1.MaxRptrSeen==4095 && w1.RingBad==0 && w1.OutsideRingBad==0 && w1.ScanDwords==1597 && w1.ScanCount==0);
+            assert(w1.SqGoodEven==12800 && w1.SqGoodOdd==12800 && w1.BoxGoodEven==19968 && w1.BoxGoodOdd==19968);
+            assert(w1.HoldMs==2000 && w1.RestoreMismatch==0 && d1Band==bandBefore && allocations.size()==poolBefore && d1Unmaps==1);
+            assert(w1Pubs.size()==650 && w1ReadPackets.size()==1000 && w1Pubs[200]==0 && w1Pubs[606]==4095 && w1Pubs[607]==71);
+            assert(w1Progress.size()==11 && w1Progress.front()==0x1D40 && w1Progress.back()==0x1D4A);
+            for(ULONG i=0;i<4096;++i) assert(cpRing[i]==GmuW1Expected(i));
+            for(ULONG i=0;i<1000;++i) assert(w1ReadPackets[i]==i);
+            seedW1(); initW1(); w1DelayUs=200;
+            assert(submitW1()==0 && w1.WaitMaxUs==200 && w1.WaitTotalUs==130000);
+            for(ULONG bad=0;bad<4;++bad) {
+                seedW1(); initW1();
+                if(bad==0) w1DamageRing=0;
+                if(bad==1) w1DamageOutside=0x6400;
+                if(bad==2) w1DamageOutside=0x7070;
+                if(bad==3) t1Zero=true;
+                assert(submitW1()==STATUS_IO_DEVICE_ERROR && w1.Cp.Reason==13 && d1Band==bandBefore);
+                if(bad==0) assert(w1.RingBad==1 && w1.RingFirst==0);
+                if(bad==1 || bad==2) assert(w1.OutsideRingBad==1 && w1.OutsideRingFirst==w1DamageOutside);
+            }
+            for(ULONG bad=0;bad<4;++bad) {
+                seedW1(); initW1(); w1BadSizePub=bad>=2 ? 0 : 200;
+                if(bad==1) w1ShadowOnly=true;
+                if(bad==2 || bad==3) w1FenceForever=true;
+                assert(submitW1()==STATUS_IO_DEVICE_ERROR && w1.Cp.Reason==18 && w1.MaxRptrSeen>=4096 && w1.HoldMs==0 && d1Band==bandBefore);
+                if(bad<2) assert(w1.PubsDone==200 && w1.FailPub==200 && w1Writes.size()==201);
+                if(bad==3) assert(w1.Cp.WptrWrites==1 && w1.FailPub==0); // detects a mismatch before any AHB retry
+            }
+            for(ULONG bad=0;bad<3;++bad) {
+                seedW1(); initW1();
+                if(bad==0) w1StopPub=607;
+                if(bad==1) w1WrongPub=607;
+                if(bad==2) w1ErrorPub=607;
+                assert(!NT_SUCCESS(submitW1()) && w1.PubsDone==607 && w1.PacketsDone==656 && w1.FailPub==607 && w1.FailPacket==663);
+                assert(w1.Cp.Reason==(bad==2 ? 14UL : 16UL) && d1Band==bandBefore && w1Writes.size()==608);
+            }
+            for(ULONG bad=0;bad<6;++bad) {
+                seedW1(); initW1();
+                if(bad==0) *GmuCfgReg(0x802)=0x20C;
+                if(bad==1) w1.RbCntlG1=0x20C;
+                if(bad==2) cpRing[0x7074/4]=1;
+                if(bad==3) cpRing[2286]=0;
+                if(bad==4) d1MapFails=true;
+                if(bad==5) failAfter=0;
+                assert(!NT_SUCCESS(submitW1()) && w1Writes.empty() && d1Maps==0 && allocations.size()==poolBefore);
+                if(bad<4) assert(!(w1.Checks&1));
+            }
+            for(ULONG step:{0x1D00UL,0x1D01UL,0x1D02UL,0x1D08UL,0x1D03UL,0x1D41UL,0x1D10UL,0x1D20UL,0x1D30UL,0x1D31UL,0x1D32UL}) {
+                seedW1(); initW1(); failGmuStep=step;
+                assert(submitW1()==STATUS_IO_DEVICE_ERROR && d1Band==bandBefore && allocations.size()==poolBefore);
+                if(step==0x1D41) assert(w1.PubsDone==64 && w1.FailPub==64 && w1Writes.size()==64);
+            }
+            seedW1(); initW1(); w1SaveFails=true;
+            assert(submitW1()==STATUS_IO_DEVICE_ERROR && w1.HoldMs==0 && d1Band==bandBefore);
+            seedW1(); initW1(); w1StopPub=607; failGmuStep=0x1D20;
+            assert(submitW1()==STATUS_IO_TIMEOUT && w1.Cp.Reason==16 && d1Band==bandBefore);
+            seedW1(); initW1(); d1RestoreDrop=(1130*4320+470*4-0x462000)/4;
+            assert(submitW1()==STATUS_IO_DEVICE_ERROR && w1.RestoreMismatch==1 && !(w1.Checks&32));
+            seedW1(); initW1(); w1FenceDrops=3;
+            assert(submitW1()==0 && w1.Cp.WptrWrites==653 && w1.PubsDone==650);
+            seedW1(); initW1(); w1FenceForever=true;
+            assert(submitW1()==STATUS_IO_TIMEOUT && w1.Cp.Reason==10 && w1.PubsDone==0 && d1Band==bandBefore);
+            allowW1Writes=false; w1Active=false;
             t1CopyTrigger=nullptr; t1CorruptTarget=nullptr; allowT1Writes=false;
             allowA1Writes=false;
             allowV1Writes=false;
@@ -2268,6 +2365,23 @@ int main(int argc,char** argv) {
         Reset(); g5Fill=false; g5bFill=false; g2KeepGxOn=true;
         assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep);
         assert(d1Band==original && d1Maps==4 && d1Unmaps==4); ClearQuarantine(); Reset();
+    }
+    {
+        const auto sqe=SqeImage();
+        Reset(); g5Fill=false; g5bFill=false; const auto original=d1Band;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(w1Pubs.size()==650 && w1ReadPackets.size()==1000 && testMaps.size()==12 && d1Maps==5 && d1Unmaps==5 && d1Band==original);
+        bool sawSmall=false; for(const auto& w:g1Writes) if(w.first==0x802) {assert(w.second==0x20B); sawSmall=true;} assert(sawSmall);
+        Reset(); g5Fill=false; g5bFill=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true)==0 && w1Writes.empty());
+        for(const auto& w:g1Writes) if(w.first==0x802) assert(w.second==0x20C);
+        Reset(); g5Fill=false; g5bFill=false; failG1Dword=0x802;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_CP && !keep && g2Writes.empty() && w1Writes.empty());
+        Reset(); g5Fill=false; g5bFill=false; t1Zero=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_CP && !keep && w1Writes.empty());
+        Reset(); g5Fill=false; g5bFill=false; g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep);
+        assert(d1Band==original && d1Maps==5 && d1Unmaps==5); ClearQuarantine(); Reset();
     }
     std::puts("GMU tests passed: firmware regions, synthetic/real image load, allocation failures, boot timeout, reset and SMMU teardown quarantine.");
 }

@@ -4723,6 +4723,205 @@ v77（20.0.2.77、oem135）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuPro
 
 **次：** texture を貼った正方形を A-1 の回転と組み合わせる、または GMEM（tile 描画）や ring の折り返しに進む。
 
+#### 9.21.50 W-1 の提案：ring を 16 KB にして IB を ring の外に出し、ring を 2 周させる（文章仕様）
+
+いままでは ring が 32 KB（IOVA 0x70010000..0x70018000 全体）で、0x4000 以降の IB・shader・頂点・data も ring の中にあった。そのため ring packet は dword 4096 未満に収め、折り返しを避けてきた。
+
+W-1 では、`CP_RB_CNTL` の BUFSZ を 12 から 11 に下げて、ring を前半 16 KB（0x70010000..0x70014000、4096 dw）だけにする。こうすると、0x4000 以降の IB と data は、**1 byte も動かさず、SMMU の region も増やさずに ring の外**になる。そのうえで T-1 の IB9 を 1000 回呼び、ring を 2 周させる。折り返しの境目は 2 種類を確かめる。
+
+- WPTR がちょうど 0 になる場合。
+- packet が ring の末尾と先頭にまたがる場合。
+
+途中で、1 packet ごとの投入と、8 packet をまとめた投入の両方を使う。
+
+**前提の事実：**
+- BUFSZ の意味：Linux は `MSM_GPU_RB_CNTL_DEFAULT` を `BUFSZ(ilog2(ring bytes / 8)) | BLKSZ(2)` としている（§9.20.1）。ring の大きさは `8 × 2^BUFSZ` B で、BUFSZ 11 なら 16 KB になる。値は `0x20B` で、BLKSZ 2 はそのまま。
+- いままでの段階で ring packet が使った範囲は dword 0..2286（T-1 の終わりで WPTR 2287）で、すべて 4096 未満にある。したがって 16 KB の ring でも、T-1 までのすべての段階は、ring の境目に一度も触れずに同じように動くはずである。
+- SMMU の ring region（0x70010000、0x8000、RW）は変えない。後半 16 KB は、ring の外の「IB / data 用のメモリ」として、いままでどおり map されたまま使う。
+- CP が読むのは RPTR から WPTR までだけで、ring の大きさを超えた位置は先頭に戻る（Linux の `OUT_RING` は、packet の途中でも先頭に折り返して書く）。
+
+**G-1 の変更（W-1 を指定したときだけ）：**
+- `EpiGpuProbe2` の bit5（W-1）が立っているときだけ、G-1 で `CP_RB_CNTL` に `0x20B` を書く。それ以外は従来どおり `0x20C` のままにし、既存の段階の動きは変えない。
+- G-1 trace の `Value[4]` にも書いた値を入れる。G-2 の「After が Value と一致」の確認は、そのまま 0x20B に対して働く。
+
+**投入する packet：**
+- packet i（i = 0..999）は 9 dw で、`70BF8003 70016400 00000000 0000006B 70460004 00000004 70017074 00000000 (0xB1000000|i)`。
+- IB9（T-1 の textured quad）を呼び、CACHE_FLUSH_TS で data[29]（0x70017074）に i を書く。
+- 書く位置は、packet i の j 語目が ring dword `(2287 + 9i + j) mod 4096`。
+- 毎回 T-1 と同じ正方形を描き直すので、最後の画面は T-1 の期待画像と同じになる。
+
+**投入の分け方（650 回）：**
+
+| 投入 k | packet | 投入後の WPTR | 備考 |
+|---|---|---|---|
+| 0 | 0 | 2296 | |
+| 199 | 199 | 4087 | |
+| **200** | 200 | **0** | **WPTR がちょうど 0 になる**（1 回目の折り返し） |
+| 201 | 201 | 9 | |
+| 599 | 599 | 3591 | 1 packet ごとの投入はここまで |
+| 600 | 600..607 | 3663 | ここから 8 packet ずつ（72 dw）まとめて投入する |
+| 606 | 648..655 | 4095 | |
+| **607** | 656..663 | 71 | **packet 656 が dword 4095 から始まり、1 語が末尾、8 語が先頭にまたがる**（2 回目の折り返し） |
+| 649 | 992..999 | **3095** | 最後 |
+
+- 投入 0..599 は 1 packet ずつ、投入 600..649 は 8 packet ずつ（50 回）で、合計 1000 packet。
+- 書いた dword の総数は 9000 で、通算位置は 2287 → 11287、つまり 2 周する。最後の data[29] は `0xB10003E7`。
+
+**手順（T-1 の復元の後、OOB 解除前）：**
+1. 前段：次がすべて成り立つことを確かめる。不成立なら Reason 8 / 12 / 15 で未投入とする。
+   - T-1 の Status が成功、Reason 0、Checks 0x3F。
+   - RPTR / WPTR / shadow 2287、data[26..28] = CAFE0017 / CAFE0018 / CAFE0019。
+   - `CP_RB_CNTL` を読み直して **0x20B**、MASK 0、data[29] が 0。
+   - T-1 と同じ ring の照合（この時点ではまだ折り返していない）。
+2. band の map と退避は T-1 と同じ。T-1 の復元後の band を改めて退避する。
+3. ring の外の 16 KB（ring 先頭から 0x4000..0x8000）を pool に退避して、後で比べる。data[29] = 0xFFFFFFFF にする。
+4. 投入 k = 0..649 について、次を繰り返す。
+   1. その投入の packet をすべて、上の位置に 1 語ずつ書く（mod 4096）。バリアを置いて読み返し、もう一度バリアを置く。
+   2. WPTR = 投入後の位置を書く。
+   3. data[29] == `0xB1000000 | (その投入の最後の packet)`、かつ RPTR == WPTR == shadow == 投入後の位置になるまで待つ。1 回の上限は 100 ms。
+   - **前の投入が終わってから次を書く**ので、CP がまだ読んでいない語を書き換えることはない。
+   - 0 は正当な WPTR / RPTR / shadow の値である。0 を「未設定」の目印に使ってはいけない。
+   - 待つ間に **RPTR ≥ 4096 を一度でも読んだら、すぐに止める（Reason 18）**。これは CP が ring を 32 KB のまま扱っている証拠である。
+   - 64 投入ごとに breadcrumb `0x1D40 + k/64` を書く。毎回の flush はしない。間の delay も入れない。
+5. 最後の投入の後で判定し、**2 秒保持**してから復元する。
+6. 復元と照合は D-1 と同じ。途中で止まった場合も、band を map できていれば必ず復元する。
+
+**ring の最後の内容：**
+- 4096 語すべてに、最後に書いた packet の語が入っている。packet i の j 語目は位置 `(2287+9i+j) mod 4096` にあり、i の大きいものが残る。
+- たとえば dword 0 と dword 4095 は packet 656、dword 3095 は packet 544 の語である。
+- 実装は、この規則で期待値を計算して 4096 語を照合する。
+
+**判定（Checks）：**
+- bit0：T-1 成功（前段の条件すべて）、かつ `CP_RB_CNTL` が 0x20B。
+- bit1：650 回の投入すべてが順に完了した。投入 200 の後に WPTR / RPTR / shadow が 0 になり、投入 607 で packet 656 がまたがった。最後に data[29] = 0xB10003E7、RPTR / WPTR / shadow 3095、idle、IB1 の残り 0、エラー割り込みなし。
+- bit2：ring の 4096 語が上の規則と完全に一致し、ring の外の 16 KB が退避値と同じ。ただし data[26]、data[27]、data[29] の 3 語は除く。
+- bit3：正方形が両パリティとも 12800 画素すべて T-1 の期待値と完全に一致する。
+- bit4：箱の残りが両パリティとも 19968 画素すべて退避値と同じで、箱の外の band も退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**probe：** `EpiGpuProbe2` の bit5 を W-1 とする。W-1 は bit0..4 を必要とし、実行値は Probe 0xBFFFFE80 + Probe2 **63**。許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15, 31, 63} だけで、それ以外は status 6。0x20B を書くのは 63 のときだけである。
+
+**診断 `GpuGmuW1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`TChecks`、`TReason`、`RbCntlG1`（G-1 の After[4]）、`RbCntlLive`（前段で読んだ値）。
+- `PubsDone`（期待値 650）、`PacketsDone`（1000）、`FailPub`、`FailPacket`、`FailData29`、`FailRptr`、`FailWptr`、`MaxRptrSeen`。
+- 折り返しの記録：`WrapCount`（期待値 2）、`ZeroWptrPub`（200）、`ZeroSeenRptr`（投入 200 の完了時の RPTR、0）、`StraddlePub`（607）。
+- 時間：`WaitMaxUs`、`WaitTotalUs`、`ElapsedMs`（投入 0 から最後の完了まで、`KeQueryInterruptTime`）。
+- ring：`RingBad`、`RingFirst`、`RingValue`、`RingExpected`、`OutsideRingBad`、`OutsideRingFirst`、`OutsideRingOld`、`OutsideRingNew`。
+- 画素：T-1 と同じ `Sq*` / `MaxErr[3]` / `TexelBad[2]` / `SqZero` / `SqPad` / `Box*` / `Outside*`、`Sample[20]`（T-1 と同じ 10 点）。
+- レジスタと状態：`DataAfter[4]`（data[26..29]）、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`。
+- `ScanCount / ScanFirst / ScanDwords`：T-1 と同じ走査。ring 全体（`off < 0x4000`）と data `[0x7000, 0x7078)` を除外に加える。
+- 後始末：`RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- breadcrumb は 0x1D00 番台。Reason 16 は 100 ms の上限、Reason 18 は RPTR ≥ 4096（ring の大きさが合わない）。
+
+**危険と対策：**
+- **CP が BUFSZ 11 を 32 KB のまま扱っていた場合：** 投入 200 で WPTR を 0 にすると、CP は 4087 から 8191 まで読み進める。その範囲の 0x4000 以降にある R-1 の IB5 や 0 の語を、ring packet として実行してしまう。
+  - 対策 1：0x20B の読み戻しを前段で確かめる。
+  - 対策 2：投入 200 の待ちで RPTR ≥ 4096 を見たら、すぐ止める（Reason 18）。
+  - 対策 3：エラー割り込み（opcode error など）でも止まる。
+  - いずれの場合も、band の復元と GX の後始末は通常どおり行う。CP_RB_CNTL の意味は Linux / Mesa と同じなので、起こる見込みは低い。
+- **0x20B で G-2 の ME_INIT や前の段階が通らない場合：** W-1 を指定したときだけ 0x20B にするので、Probe2 = 31 以下に戻せば従来どおりに動く。
+- **時間：** 650 回の投入と 1000 回の描き直しは、それぞれ 1 tick 未満で終わる見込みで、全体で 1〜2 秒、保持を足して約 3〜4 秒。StartDevice 全体では約 33 秒になる。長すぎる兆候が出たら、A-1 の FRAMES を減らす。
+- **後の段階への影響：** W-1 の後は ring の中身が置き換わる。これより後の段階（GMEM、回る textured quad）の前段照合は、ring[0..2286] ではなく W-1 の最後の状態（WPTR 3095、上の ring の規則）で行う。
+
+**本物の IB 用のバッファ（別の SMMU region）について：** 将来、IB を動的に確保する段階では、ring とは別の buffer を map する。これは SMMU の region を追加する作業なので、ユーザーの担当として別の段階で扱う。W-1 は、そのための前提（ring の外の IB で正しく動き、ring を何周でも使えること）を、今の map のままで確かめる段階である。
+
+**生成器：** scratchpad の `tools/w1ring.py`。投入表、折り返しの位置、ring の最後の内容の規則を出力する。
+
+**この後：** 2（GMEM）、1（回る textured quad）の順に進める。
+
+
+#### 9.21.51 W-1 の実装（v78 で実機成功、§9.21.52）
+
+§9.21.50 を実装した。実行値は `EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=63`。Probe2 は 0 / 1 / 3 / 7 / 15 / 31 / 63 を許し、0以外は Probe が上記と完全一致する必要がある。W-1 は T-1 までの全段を必須とする。
+
+W-1 指定時だけ G-1 の Value[4] を20Bにし、CP_RB_CNTL にその値を書く。指定しない場合は20Cのままである。G-1 の After[4] と Value[4] の一致を既存の G-2 前提検査で求めるため、20Bを読み戻せなければ SQE / ME_INIT に進まない。ring の SMMU region は8000 Bのまま、IB・shader・頂点・data の配置も変更しない。
+
+T-1 の成功・復元後、同じ OOB 内で前段の ring / IB / shader / 頂点 / data、native RPTR / WPTR / shadow 2287、MASK 0、CP_RB_CNTL の20B、G-1 After[4]の20B、data[29]=0を再確認する。T-1 の未使用部分も0を確認する。親の未成功は Reason 8、前提不一致は12、MASK は15で未投入となる。
+
+framebuffer の120000 Bと ring 外側の4000 Bを、1つの非ページプール124000 Bに退避する。CPU map は framebuffer だけで、外側16 KBは既存 ring region の CPU Va から読む。新しい SMMU region / map は増やさない。data[29] を FFFFFFFF にし、前半600回は1 packet、後半50回は8 packetを、全語 mod4096 で書く。読み返しとバリアの後にWPTRを更新する。
+
+次の投入を書けるのは、前の投入の最後の packet の固有 fence と native RPTR / WPTR / shadow の一致を確認した後だけ。0も正当な値として比較する。1回の投入は100 msまでで、AHB fenced write は従来どおり2 ms・200再送を上限とする。AHB再送中も RPTR を読み、範囲を確認してから再送する。最後の投入では RBBM / CX_BUSY の idle と IB残り0も上限内に要求する。間の delay は入れない。
+
+native RPTR または shadow が4096以上なら **Reason 18** で即座に止め、その後の投入・CP/RBBMの診断レジスタ読み取りを省く。範囲外の検出は、通常の診断失敗より優先して残す。Reason 16は100 msの完了時間切れ、10はAHBの時間切れ。後の診断でも観測したRPTRを検査する。
+
+最後の ring は、位置 p に対して、11286以下で p と mod4096 が等しい最大の絶対位置を求め、その packet 番号・語番号から期待値を計算する。4096語の期待配列をカーネルスタックには作らない。ring 外側は退避値と全語を比較するが、data[26]、[27]、[29] だけは除く。data[28]は比較対象のままである。画素判定は T-1 と同じ誤差0。完了後に2秒保持して framebuffer を復元・照合する。途中失敗や診断失敗では保持を省略し、退避済みの framebuffer の復元と CPU unmap を必ず行う。
+
+ring とIB/dataの内容は元に戻さない。正常終了時は通常のGX後始末・SMMU Disable / unmap / freeへ進み、KeepCx時は既存のGMU_TESTがメモリを保持する。W-1 trace は GMU_BOOT_TRACES のプールメンバで、cleanup / keep の両方で保存してから解放する。
+
+`GpuGmuW1` は **REG_BINARY、552 B（138 DWORD）**。すべて ULONG / NTSTATUS、順序は以下。
+
+```text
+Cp (140 B、G2 形式), TChecks, TReason, RbCntlG1, RbCntlLive
+PubsDone, PacketsDone, FailPub, FailPacket, FailData29, FailRptr, FailWptr, MaxRptrSeen
+WrapCount, ZeroWptrPub, ZeroSeenRptr, StraddlePub, WaitMaxUs, WaitTotalUs, ElapsedMs
+RingBad, RingFirst, RingValue, RingExpected, OutsideRingBad, OutsideRingFirst, OutsideRingOld, OutsideRingNew
+SqGoodEven, SqGoodOdd, SqBad, SqFirst, SqValue, SqExpected, MaxErr[3], TexelBad[2], SqZero, SqPad
+BoxGoodEven, BoxGoodOdd, BoxBad, BoxFirst, BoxValue, BoxOld
+OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[20], DataAfter[4]
+CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter
+ScanCount, ScanFirst, ScanDwords, RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared
+BackupStatus, HoldStatus, RestoreStatus
+```
+
+Checks は仕様の6項目、期待値3F。bit0は親だけでなく前段全体と20Bの確認後に立てる。PubsDone / PacketsDone は完了した数で、WrapCountも完了した投入がまたいだ境界の数。ZeroWptrPub / ZeroSeenRptr は投入完了時に記録し、ZeroSeenRptr=0は実測値である。StraddlePubは packet656を含む投入が完了した番号。FailPacket はその投入の最後のpacket（待ったfenceの番号）、FailRptr / Wptrは安全に読めた最後の値である。MaxRptrSeen は native / shadow 両方の観測値の最大。
+
+RingFirst は ring 内の DWORD 番号0..4095、OutsideRingFirst は割り当て先頭からのバイト位置4000..7FFC。SqFirst / BoxFirst / OutsideFirst / RestoreFirst は framebuffer band内バイト位置で、Sample / TexelBad / MaxErr の順は T-1 と同じ。DataAfter は data[26..29]。走査は仕様の範囲を除く1597 DWORD。未記録・該当なしは FFFFFFFF、未実行StatusはNOT_FOUND。PubsDone / PacketsDone / MaxRptrSeen / WrapCount / WaitMaxUs / WaitTotalUs / HoldMs / Checks / Prepared は0で初期化する。時間は KeQueryInterruptTime、待ち時間にはAHB再送も含む。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1D00 / 0x1D01 | CP診断用2ページ map / 前段・RB_CNTL・MASK・RPTR範囲 |
+| 0x1D02 / 0x1D08 / 0x1D03 | 元のglobal fault / framebufferとring外側の退避 / data29の準備 |
+| 0x1D40〜0x1D4A | k=0,64,...,640 の進行記録。個々の待ちの中ではregistryを書かない |
+| 0x1D10〜0x1D1B / 0x1D20 | 従来と同じCP診断12項目（範囲外検出後は省略） / 後のglobal fault |
+| 0x1D30 / 0x1D31 / 0x1D32 | 保持前の保存・flushと2秒待機 / 必須復元 / 復元後の全域照合 |
+
+生成器 w1ring.py の規則を読み、独立した書き込みモデルとの静的照合で650投入・1000packet・2周、投入200のWPTR0、投入607の末尾1語／先頭8語、最終WPTR3095、4096語の最終内容、552 BのABI、1597語の走査を確認した。shim は W-1 の準備後だけ折り返しを解釈し、8 packet のまとめ投入、0のWPTR、packet順序、遅延fence、範囲外RPTRを模擬する。最終画像はT-1のpeerを再利用するが、実際のCP / TPを実行するものではない。
+
+試験ケースには成功、最終ring／外側破壊（data28を含む）、両RPTRの範囲外、AHB再送前の範囲外検出、途中の停止・誤ったfence・IRQエラー、前提・map・退避・粗い進行記録・診断保存・復元の失敗、AHB再送、20Bを読み戻せない場合のME_INIT前停止、旧モード20C、親の失敗時の未実行、KeepCxを追加した。ドライバ／ホスト試験のビルド・実行、版番号変更、署名、配置、実機実行、コミットは行っていない。
+
+#### 9.21.52 W-1 の実機結果（v78、DriverVer 20.0.2.78）：成功、ring 16 KB で 2 周、IB は ring の外
+
+実行値は Probe 0xBFFFFE80 + Probe2 63。GpuProbeStatus 0、GpuGmuStatus 0、step FFFF、デバイスは正常（CM_PROB_NONE）。スタックは GpuStackAtCx 0x11F60、GpuStackMin 0x11428。`GpuGmuW1` は 552 B（138 ULONG）、`GpuGmuT1` は 468 B。
+
+**判定：** `Checks` **0x3F**、Reason 0、Prepared 1。T-1 の Checks も 0x3F（TReason 0）。
+
+**ring の大きさ：**
+- `RbCntlG1` と `RbCntlLive` は、どちらも **0x20B**。
+- `MaxRptrSeen` は **4095** で、4096 以上を一度も読まなかった。CP は BUFSZ 11 を 16 KB の ring として扱っている。
+
+**投入と折り返し：**
+- `PubsDone` 650、`PacketsDone` 1000。Fail* はすべて 0xFFFFFFFF（失敗なし）。
+- `WrapCount` 2、`ZeroWptrPub` 200、`ZeroSeenRptr` 0、`StraddlePub` 607。どちらの境目（WPTR がちょうど 0、packet が末尾と先頭にまたがる）も、仕様どおりに通った。
+- 最後は WPTR / RPTR / shadow が **0xC17（3095）**。WptrWrites は 0x28A（650）、`DataAfter` は CAFE0017 / CAFE0018 / CAFE0019 / **B10003E7**。
+- IB1 の base は 0x70016400、残りは 0。CpInterrupt、CpProtect、CpStatus1、IntStatus、CpHwFault、FaultStatus はすべて 0。
+
+**時間：**
+- `ElapsedMs` は **109**。1000 回の描き直しを含めて約 0.1 秒で、仕様の見積もり（1〜2 秒）より大幅に短い。
+- `WaitTotalUs` 93920、`WaitMaxUs` 15785。最大値は tick の丸めによるもので、100 ms の上限には遠い。
+
+**ring と外側のメモリ：**
+- `RingBad` 0：4096 語すべてが最後の ring の規則と一致した。
+- `OutsideRingBad` 0：ring の外の 16 KB は、除外した 3 語以外は変わっていない。
+- `ScanCount` 0（ScanDwords 1597）。GlobalStatus、GlobalBefore / After、MASK は前後とも 0。
+
+**画面：**
+- 正方形は `SqGoodEven` / `SqGoodOdd` が 12800 / 12800、`SqBad` 0。MaxErr 0 / 0 / 0、TexelBad 0 / 0、SqZero 0、SqPad 0。
+- 箱の残りは `BoxGoodEven` / `BoxGoodOdd` が 19968 / 19968、`BoxBad` 0。`OutsideChanged` 0。
+- `Sample` は T-1 の期待値と同じ（例：FF101040、FFF010C0、FFF0F040、FF10F0C0、FF707040、FF90B0C0、FF303040）。
+
+**後始末：** HoldMs 2000、`RestoreMismatch` 0。BackupStatus、HoldStatus、RestoreStatus はすべて 0。
+
+**SMMU の残り値：** Fsr 0x400、FarHigh 0x1F634、Fsynr 0xF001B は、v77 / v78 の T-1 の Cp にも同じ値がある。以前から残っている値で、W-1 で新しく出たものではない。FaultStatus は 0。
+
+**わかったこと：**
+- `CP_RB_CNTL` の BUFSZ は Linux と同じ意味（ring = 8 × 2^BUFSZ B）。
+- CP は ring の外の IB を、ring を何周させても正しく実行する。packet が ring の境目をまたいでも、WPTR = 0 の発行でも問題ない。
+- これより後の段階の前段照合は、W-1 の最後の状態（WPTR 3095、ring の規則）を基準にする。
+
+**次：** 2（GMEM / tile rendering）の仕様を書く。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

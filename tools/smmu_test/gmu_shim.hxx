@@ -191,6 +191,22 @@ inline void T1PeerComplete() {
     if(t1Fences&4) g2Ring[0x7070/4]=0xCAFE0019;
     *g2Shadow=2287; *GmuCfgReg(0x806)=2287; *GmuCfgReg(0x92A)=t1BadRemaining ? 1 : 0;
 }
+static bool allowW1Writes=false,w1Active=false,w1FenceForever=false,w1Pending=false,w1ShadowOnly=false,w1SaveFails=false;
+static ULONG w1FenceDrops=0,w1StopPub=0xFFFFFFFF,w1BadSizePub=0xFFFFFFFF,w1WrongPub=0xFFFFFFFF,w1ErrorPub=0xFFFFFFFF;
+static ULONG w1DamageRing=0xFFFFFFFF,w1DamageOutside=0xFFFFFFFF,w1Cursor=2287,w1NextPacket=0,w1DelayUs=0;
+static ULONG w1PendingTarget=0,w1PendingLast=0,w1PendingPub=0;
+static ULONGLONG w1Due=0;
+static std::vector<ULONG> w1Writes,w1Pubs,w1ReadPackets,w1Progress;
+inline void W1PeerComplete(ULONG pub,ULONG target,ULONG last) {
+    w1Pending=false;
+    if(pub==649) T1PeerComplete(); // only the final image is rasterized by this protocol peer
+    g2Ring[0x7074/4]=0xB1000000|(pub==w1WrongPub ? 0xFFFF : last);
+    *g2Shadow=target; *GmuCfgReg(0x806)=target; *GmuCfgReg(0x92A)=0; w1Cursor=target;
+    if(pub==649) {
+        if(w1DamageRing<4096) g2Ring[w1DamageRing]^=1;
+        if(w1DamageOutside>=0x4000 && w1DamageOutside<0x8000) g2Ring[w1DamageOutside/4]^=1;
+    }
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -239,7 +255,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes || allowW1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
         ++d1Maps; d1Restoring=false; return d1Band.data();
     }
@@ -261,6 +277,7 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(D1BandPointer(p)) return *p;
     if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
     if(t1Pending && testInterruptTime>=t1Due) T1PeerComplete();
+    if(w1Pending && testInterruptTime>=w1Due) W1PeerComplete(w1PendingPub,w1PendingTarget,w1PendingLast);
     if(g3cPolling && g3cPending) {
         if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
         if(p==GmuCfgReg(0x201) && g3cShowStatus && g3cSample>=g3cStatusDelay) *p|=1UL<<20;
@@ -277,6 +294,33 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && allowW1Writes && w1Active) {
+        assert(*GmuCfgReg(0x802)==0x20B && v<4096 && *GmuCfgReg(0x38)==0);
+        w1Writes.push_back(v); g2Writes.push_back({0x807,v});
+        const ULONG pub=static_cast<ULONG>(w1Pubs.size()); assert(pub<650);
+        if(pub==w1BadSizePub) {
+            w1Pubs.push_back(v); *p=v;
+            *GmuCfgReg(0x806)=w1ShadowOnly ? w1Cursor : 4096; *g2Shadow=4096;
+            gPages[2][0x313]=w1FenceForever ? 1 : 0; return;
+        }
+        if(w1FenceForever || w1FenceDrops) {if(w1FenceDrops) --w1FenceDrops; gPages[2][0x313]=1; return;}
+        gPages[2][0x313]=0;
+        const ULONG count=pub<600 ? 1 : 8,first=w1NextPacket,last=first+count-1;
+        assert(v==((w1Cursor+count*9)%4096) && first==(pub<600 ? pub : 600+(pub-600)*8));
+        for(ULONG i=first;i<=last;++i) {
+            const ULONG expected[]={0x70BF8003,0x70016400,0,107,0x70460004,4,0x70017074,0,0xB1000000|i};
+            for(ULONG j=0;j<9;++j) assert(g2Ring[(w1Cursor+(i-first)*9+j)%4096]==expected[j]);
+            w1ReadPackets.push_back(i);
+        }
+        w1NextPacket+=count; w1Pubs.push_back(v); *p=v;
+        *GmuCfgReg(0x928)=0x70016400; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=107;
+        gPages[8][0x210]=1; gPages[8][0x201]=pub==w1ErrorPub ? (1UL<<9) : 0; gPages[2][0x30C]=0;
+        if(pub!=w1StopPub) {
+            if(w1DelayUs) {w1Pending=true; w1Due=testInterruptTime+w1DelayUs*10; w1PendingTarget=v; w1PendingLast=last; w1PendingPub=pub;}
+            else W1PeerComplete(pub,v,last);
+        }
+        return;
+    }
     if(p==GmuCfgReg(0x807) && v==2287) {
         assert(allowG2Writes && allowT1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG packet[]={0x70BF8003,0x70016400,0,107,0x70460004,4,0x70017070,0,0xCAFE0019};
@@ -648,8 +692,10 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
+        if(v==0x1D03 && allowW1Writes) w1Active=true;
+        if(v>=0x1D40 && v<=0x1D4A) w1Progress.push_back(v);
         if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
-        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -661,6 +707,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuW1")==0 && value && size && w1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuT1")==0 && value && size && t1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuA1")==0 && value && size && a1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuV1")==0 && value && size && v1SaveFails) return STATUS_IO_DEVICE_ERROR;
