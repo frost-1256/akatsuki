@@ -18,6 +18,12 @@ NTSTATUS EpiSmmuCreate(HANDLE,EPI_SMMU** c) {
 NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG iova,PHYSICAL_ADDRESS pa,SIZE_T size,ULONG flags) {
     if(iova==failMapIova) return STATUS_INSUFFICIENT_RESOURCES;
     testMaps.push_back({iova,size,flags});
+    if(iova==0x70010000 || iova==0x70020000) {
+        for(const auto& a:allocations) if(a.second==static_cast<ULONGLONG>(pa.QuadPart)) {
+            if(iova==0x70010000) g2Ring=static_cast<ULONG*>(a.first);
+            else g2Shadow=static_cast<ULONG*>(a.first);
+        }
+    }
     if(iova==0x60008000) {
         for(const auto& a:allocations) if(a.second==static_cast<ULONGLONG>(pa.QuadPart))
             hfiMemory=static_cast<ULONG*>(a.first);
@@ -64,6 +70,8 @@ static std::vector<UCHAR> SqeImage() {
     return sqe;
 }
 static void Reset() {
+    allowG2Writes=false; g2Completes=true; g2FenceForever=false; g2Hang=false; g2RbbmBusy=false; g2GmuBusy=false;
+    g2FenceDrops=0; g2Ring=nullptr; g2Shadow=nullptr; g2Writes.clear(); g2KeepGxOn=false;
     testMaps.clear(); failMapIova=~0ULL; g1Writes.clear(); allowG1Writes=false; failG1Dword=0xFFFFFFFF;
     stageFWrites.clear(); allowStageFWrite=false; ignoreStageFWrite=false; dropGxAtStep=0xFFFFFFFF;
     stageEWrites.clear(); failStageEDword=0xFFFFFFFF;
@@ -90,6 +98,12 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
+}
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep) {
+    WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true;
+    return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
+                          text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -462,6 +476,74 @@ int main(int argc,char** argv) {
             for(ULONG i=fail;i<7;++i) assert(g1.After[i]==0xFFFFFFFF);
         }
         allowG1Writes=false; failGmuStep=0xFFFFFFFF;
+        // G-2: independent memory fixture, one ME_INIT packet, bounded fence retries and all idle predicates.
+        {
+            std::vector<ULONG> cpSqe(0xA000/4), cpRing(0x8000/4), cpShadow(0x1000/4);
+            EPI_SMMU cpSmmu={true,true}; probe.Smmu=&cpSmmu;
+            for(ULONG i=0;i<3;++i) assert(GmuAdd(&probe,GmuG1Iova[i],GmuG1Size[i],GmuG1Flags[i]));
+            probe.Regions[0].Va=cpSqe.data(); probe.Regions[1].Va=cpRing.data(); probe.Regions[2].Va=cpShadow.data();
+            const auto seedG2=[&]() {
+                allowG2Writes=true; g2Writes.clear(); g2Completes=true; g2FenceForever=false; g2FenceDrops=0;
+                g2Hang=false; g2RbbmBusy=false; g2GmuBusy=false; failGmuStep=0xFFFFFFFF; failAddrMap=0xFFFFFFFF;
+                dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0; gPages[2][0x313]=0; gPages[2][0x30C]=0;
+                cc[0x100C/4]=0x80000000; g2Ring=cpRing.data(); g2Shadow=cpShadow.data();
+                std::memset(cpRing.data(),0,0x8000); std::memset(cpShadow.data(),0,0x1000);
+                for(ULONG i=0;i<3;++i) probe.Regions[i].Mapped=true;
+                *GmuCfgReg(0x808)=0; *GmuCfgReg(0x807)=0; *GmuCfgReg(0x806)=0; *GmuCfgReg(0x821)=0;
+                gPages[8][0x210]=1; gPages[8][0x201]=0;
+            };
+            const ULONG expectedPacket[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
+            seedG2(); GMU_G2_TRACE cp=GmuG2Trace();
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==0);
+            assert(cp.Reason==0 && cp.Attempted==1 && cp.SqeWritten==1 && cp.WptrWrites==1 && cp.Polls==0);
+            assert(cp.ShadowBefore==0 && cp.ShadowAfter==9 && cp.Rptr==9 && cp.WptrAfter==9 && cp.FenceStatus==0);
+            assert(cp.RbbmStatus==1 && cp.CxBusy==0 && cp.IntStatus==0 && cp.CpHwFault==0 && cp.FaultStatus==0);
+            assert(g2Writes.size()==2 && g2Writes[0].first==0x808 && g2Writes[0].second==1);
+            assert(g2Writes[1].first==0x807 && g2Writes[1].second==9);
+            assert(std::memcmp(cpRing.data(),expectedPacket,sizeof(expectedPacket))==0);
+            assert(std::memcmp(cp.Packet,expectedPacket,sizeof(expectedPacket))==0);
+            seedG2(); cp=GmuG2Trace(); g2FenceDrops=3;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==0 && cp.WptrWrites==4 && cp.ShadowAfter==9);
+            seedG2(); cp=GmuG2Trace(); g2FenceForever=true;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT);
+            assert(cp.Reason==10 && cp.WptrWrites==201 && cp.FenceStatus==1 && cp.Polls==0xFFFFFFFF);
+            for(ULONG predicate=0;predicate<3;++predicate) {
+                seedG2(); cp=GmuG2Trace();
+                if(predicate==0) g2Completes=false;
+                if(predicate==1) g2RbbmBusy=true;
+                if(predicate==2) g2GmuBusy=true;
+                *GmuCfgReg(0x821)=0x55;
+                assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT);
+                assert(cp.Reason==9 && cp.Polls==10000 && cp.CpHwFault==0x55 && cp.FaultStatus==0 && cp.FarLow==0x4000);
+            }
+            seedG2(); cp=GmuG2Trace(); g2Hang=true;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_DEVICE_ERROR);
+            assert(cp.Reason==11 && cp.Polls==0 && (cp.IntStatus&(1UL<<23)));
+            const ULONG steps[]={0xD00,0xD01,0xD02,0xD03,0xD04,0xD05,0xD06,0xD07};
+            for(ULONG step:steps) {
+                seedG2(); cp=GmuG2Trace(); failGmuStep=step;
+                assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_DEVICE_ERROR && cp.Reason==6);
+                assert(cp.Attempted==(step<=0xD02 ? 0UL : 1UL) && cp.WptrWrites==(step<=0xD04 ? 0UL : 1UL));
+            }
+            seedG2(); cp=GmuG2Trace(); g2Completes=false; failGmuStep=0xD07;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT && cp.Reason==9);
+            seedG2(); cp=GmuG2Trace(); dropGxAtStep=0xD06;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_INVALID_DEVICE_STATE);
+            assert(cp.Reason==GX_REG_HM_OFF && cp.WptrAfter==0xFFFFFFFF && cp.CpHwFault==0xFFFFFFFF);
+            seedG2(); cp=GmuG2Trace(); failAddrMap=0;
+            assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_INSUFFICIENT_RESOURCES && g2Writes.empty());
+            for(ULONG bad=0;bad<4;++bad) {
+                seedG2(); cp=GmuG2Trace();
+                if(bad==0) cpShadow[0]=1;
+                if(bad==1) cpRing[0]=1;
+                if(bad==2) *GmuCfgReg(0x807)=1;
+                if(bad==3) probe.Regions[2].Mapped=false;
+                assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_INVALID_DEVICE_STATE);
+                assert(cp.Reason==12 && cp.Attempted==0 && g2Writes.empty());
+            }
+            allowG2Writes=false; g2Ring=nullptr; g2Shadow=nullptr; probe.Count=0; probe.Smmu=nullptr;
+            failGmuStep=0xFFFFFFFF; failAddrMap=0xFFFFFFFF; dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0;
+        }
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;
@@ -521,6 +603,24 @@ int main(int argc,char** argv) {
         Reset(); smmuEnableFails=true; smmuDisableFails=true;
         assert(RunG1(f,sqe,&keep)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu && !allocations.empty());
         assert(g_KeptGmu->Smmu->gpuStreams);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
+    // Full G-2 path: normal completion frees memory, CP errors preserve cleanup, GX/Disable failures retain data.
+    {
+        const auto sqe=SqeImage();
+        Reset(); assert(RunG2(f,sqe,&keep)==0 && !keep && allocations.empty());
+        assert(g2Writes.size()==2 && g2Writes[0].first==0x808 && g2Writes[1].first==0x807);
+        Reset(); g2Completes=false;
+        assert(RunG2(f,sqe,&keep)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); failG1Dword=0x830;
+        assert(RunG2(f,sqe,&keep)==EPI_GMU_E_CP && g2Writes.empty() && !keep && allocations.empty());
+        Reset(); g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu && g_KeptGmu->Smmu->enabled);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine();
+        Reset(); g2Completes=false; smmuDisableFails=true;
+        assert(RunG2(f,sqe,&keep)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
         ClearQuarantine(); Reset();
     }

@@ -2104,6 +2104,71 @@ Enable時には追加2組の元値をすべて保存し、S2CR1→S2CR2→既存
     - 読み戻しはすべて一致した。
 - 次は G-2（§9.20.7）：CP_SQE_CNTL=1、ME_INIT 9 dword、WPTR=9、idle 待ち。仕様は文章だけで示し、実装はユーザーが行う。
 
+#### 9.20.12 G-2の実装（実機未実行）
+
+bit22 `EPI_GMU_PROBE_G2=0x400000` の拒否を解除し、G-1とその全前提を必要とする`EpiGpuProbe=0x7FFE80`を追加した。G-1のメモリ・7レジスタ設定成功後、同じOOB GPU_SETの解除前に実行する。前提不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。既存の`0x3FFE80`ではCPを動かさない。
+
+CP起動前に、G-1の7個のAfterがValueと一致していること、3バッファが正しい属性でmap済みであること、RPTRの影とリング先頭9 DWORDとCP_RB_WPTRが0であることを確認する。G-1自体の読み戻しは従来どおり診断専用だが、G-2を指定した場合だけ実行前のベース設定確認に使う。不成立ならCPを起動せずReason 12を残す。GX用には既知の先頭ページと+0x2000の2枚だけを一時mapする。
+
+CP_SQE_CNTL=1を書き、直後の読み戻しを保存する。続いてリング先頭に `{0x70C80008, 0x2F, 3, 0x20000000, 0, 0, 0, 0, 0}` をコピーし、メモリバリア後にCP_RB_WPTR=9を書く。SQEの読み戻しは診断専用。WPTRはメモリバリア後、GMU_AHB_FENCE_STATUS（GPU dword 0x23B13）のbit0を確認する。bit0が立つ間だけ、10 µs待ってGXを再確認してから同じWPTR=9を再送する。上限は200回の待ち（約2 ms、初回を含む書き込み最大201回）。bit0が消えなければReason 10 / STATUS_IO_TIMEOUTで止める。fence確認のハードウェア条件は[Linuxのfenced_writeとa6xx_flush](https://codebrowser.dev/linux/linux/drivers/gpu/drm/msm/adreno/a6xx_gpu.c.html#50)を事実として確認し、実装は既存プローブ用に新規記述した。
+
+CPの完了待ちは100 µs間隔、最大10,000回（待ちの合計1秒）。各回でOOB/GXの前提を再確認し、RPTR影=9、RBBM_STATUSのbit0以外が0、RBBM_INT_0_STATUSのbit23=0、CX_BUSY_STATUSのbit23=0が同時に成立することを求める。最後の条件は[Linuxのa6xx_gmu_isidle](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gmu.c)の条件と同じ。ハング検出bit23が立てばReason 11 / STATUS_IO_DEVICE_ERRORで打ち切り、ほかのbusyが残る場合はReason 9 / STATUS_IO_TIMEOUTとする。fence/idleのループ内ではレジストリへの書き込みをしない。
+
+完了・失敗時には、まだ同じOOB中かつGX確認が通る場合に限りCP_RB_RPTR、WPTR、CP_HW_FAULT、RBBM_STATUS、INT_0_STATUS、CX_BUSYとRPTR影を保存する。SMMUのFSR/FAR/FSYNRも読み、値は生の診断として残す。CP_HW_FAULTやFSRの値だけによる追加判定はしない。診断用breadcrumb/GX確認で後から失敗しても、先に失敗していれば元のStatus/Reasonを保持する。
+
+G-2の結果にかかわらず、既存のOOB解除→GBIF halt→PREPARE_SLUMBER→CM3 reset→rpmh_stop→GX OFF/idle確認→SMMU Disableの順に進む。SQEを止める値3やRBBMソフトリセットは追加しない。GX OFFやSMMU Disableで止まった場合はSQE・リング・影を含むメモリとCXを保持し、CPが使い得るメモリを解放しない。G-2だけが失敗し、それ以外の後片付けが成功した場合は新しいstatus 15（EPI_GMU_E_CP）。従来の段階やslumberの失敗はstatus 13、teardown失敗は引き続きstatus 8 / KeepCxが優先する。zap、SECVID_TRUST_CNTL、割り込みマスク、CP_SET_SECURE_MODEは追加しない。
+
+`GpuGmuG2`はREG_BINARY・140バイト（35 DWORD）：`{Requested, Attempted, Reason, Status, SqeWritten, WptrWrites, FenceStatus, Polls, ShadowBefore, ShadowAfter, SqeBefore, SqeAfter, WptrBefore, WptrAfter, Rptr, RbbmStatus, IntStatus, CpHwFault, CxBusy, Gdscr, GxHm, FaultStatus, Fsr, FarLow, FarHigh, Fsynr, Packet[9]}`。Attempted/SqeWrittenはSQE=1の書き込み直前に1。WptrWritesは実際に試みたWPTR書き込み回数。Pollsは100 µsのidle待ち回数で、未到達なら0xFFFFFFFF。Packetはコピー後にリングから保存した9 DWORD。Status/FaultStatusはNTSTATUS、未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。Reason 0〜6は従来と同じ、8=G-1未完了、9=idle時間切れ、10=fence時間切れ、11=ハング検出、12=起動前のメモリ・ベース・初期ポインタ条件不成立。cleanup/keepの両経路で保存する。GpuGmuG1、GPUストリーム、既存HFI診断の形式は変更しない。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0xD00 | 起動前提確認・map前 |
+| 0xD01 | 初期SQE/WPTR/影と空リングの確認 |
+| 0xD02 | SQE=1の書き込み |
+| 0xD03 | ME_INIT 9 DWORDコピー |
+| 0xD04 | 最初のWPTR=9 |
+| 0xD05 | fence確認・必要時のみWPTR再送 |
+| 0xD06 | CP/GMU idle待ち |
+| 0xD07 | 最終のGX診断読み取り |
+
+shim/ホスト試験に、G-2だけでSQE/WPTR書き込みを許す仕組み、パケット・順序・正常完了、fenceによる再送と上限、RPTR/RBBM/GMUの各未完了条件、ハング検出、各breadcrumb失敗、元のエラーの保持、GX喪失後の診断中止、mapと起動前条件の不成立を追加した。全体の経路には、正常解放、CP時間切れ後の後片付け、G-1ベース不一致時に起動しないこと、GX OFF失敗・Disable失敗時のバッファ保持のケースを追加。ME_INITヘッダは§9.20.4のパリティ計算式との独立した計算で一致した。ホスト試験の実行・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.20.13 v61 実機結果（2026-11-13、0x7FFE80、G-2）
+
+- 版 20.0.2.61（oem119）。端末は 11:01 に再起動してから実行した。
+  - 机上試験の段階で直したのは、`GmuG2Start` の変数名 `far` → `faultAddr` だけ（`far` は Windows ヘッダーのマクロで、ビルドエラーになった）。処理は変えていない。
+- **CP が起動し、ME_INIT を処理して idle になった。**
+  - EpiGpuProbeStep 0xFFFF、GpuGmuStatus 0、GpuGmuNtStatus 0。
+  - KeepCx 0、DisableStatus 0、CxStatus 0、FaultStatus 0。デバイスは Started。
+- `GpuGmuG2`（140 B）：
+  | 項目 | 値 |
+  |---|---|
+  | Requested / Attempted / Reason / Status | 1 / 1 / 0 / 0 |
+  | SqeWritten / WptrWrites | 1 / 1（fence の再送なし） |
+  | FenceStatus | 0 |
+  | Polls | **0**（最初の 1 回目で idle） |
+  | Shadow 前 → 後 | 0 → **9** |
+  | SQE_CNTL 前 → 後 | 0 → 1 |
+  | WPTR 前 → 後 | 0 → 9 |
+  | RPTR（0x806） | 9 |
+  | RBBM_STATUS | 0x1（bit0 CP_AHB_BUSY_CX_MASTER のみ） |
+  | INT0_STATUS | 0（hang 検出なし） |
+  | CP_HW_FAULT | 0 |
+  | CX_BUSY（0x23B0C） | 0x71000000（bit23 GPUBUSYIGNAHB は 0） |
+  | GX GDSCR / GxHm | 0xF8222800 / 0 |
+  | Packet | {0x70C80008, 0x2F, 3, 0x20000000, 0, 0, 0, 0, 0}（書いたとおり） |
+  - FSR は 0x400。これは FORMAT フィールドだけで、フォルトのビットは立っていない。FAR 0x1F634_67E73FD7 と FSYNR 0xF001B は以前の残り値 [P]（§9.10 以降と同じ見方）。
+- G-1 部分は v60 と同じ値だった。SMR1/2 は再び受け付けられ、後片付けで元に戻った。
+  - S2CR の残り値は今回も起動ごとに違っていた（0x3FAA8BFF、0x2ACE59FF）。
+- 意味：
+  - SQE のマイクロコードは、SMMU 経由で IOVA 0x70000000 から読み込まれて動いた。
+  - CP は ring（0x70010000）から ME_INIT を取り出した。
+  - CP は RPTR の shadow（0x70020000、特権バッファ）へ書き戻した。
+  - Linux の `a6xx_cp_init` → `a6xx_idle` に当たるところまで、Windows 上で届いた。
+- まだ残っていること：
+  - zap shader と SECVID_TRUST_CNTL（§9.20.5）。0xF400 には触れない方針は変えていない。
+  - zap なしでは GPU は secure mode から抜けられない [P]。そのため、次の段階で何ができるかは別に調べる必要がある。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

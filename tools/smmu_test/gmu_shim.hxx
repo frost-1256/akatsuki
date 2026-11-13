@@ -55,6 +55,13 @@ static std::vector<std::pair<ULONG,ULONG>> g1Writes;
 static bool allowG1Writes=false;
 static ULONG failG1Dword=0xFFFFFFFF;
 static const ULONG g1Dwords[]={0x830,0x831,0x800,0x801,0x802,0x804,0x805};
+static bool allowG2Writes=false, g2Completes=true, g2FenceForever=false, g2Hang=false;
+static bool g2RbbmBusy=false, g2GmuBusy=false;
+static bool g2KeepGxOn=false;
+static ULONG g2FenceDrops=0;
+static ULONG* g2Ring=nullptr;
+static ULONG* g2Shadow=nullptr;
+static std::vector<std::pair<ULONG,ULONG>> g2Writes;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -109,7 +116,23 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
-    assert(p!=GmuCfgReg(0x808) && p!=GmuCfgReg(0x807)); // no SQE start / WPTR publication in G-1
+    if(p==GmuCfgReg(0x808) || p==GmuCfgReg(0x807)) {
+        assert(allowG2Writes); const ULONG reg=p==GmuCfgReg(0x808) ? 0x808 : 0x807;
+        g2Writes.push_back({reg,v}); assert(v==(reg==0x808 ? 1UL : 9UL));
+        if(reg==0x807) {
+            const ULONG packet[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
+            assert(g2Ring && g2Shadow && std::memcmp(g2Ring,packet,sizeof(packet))==0);
+            if(g2FenceForever || g2FenceDrops!=0) {
+                if(g2FenceDrops!=0) --g2FenceDrops;
+                gPages[2][0x313]=1; return;
+            }
+            gPages[2][0x313]=0;
+            if(g2Completes) { *g2Shadow=9; *GmuCfgReg(0x806)=9; }
+            gPages[8][0x210]=g2RbbmBusy ? 2 : 1;
+            gPages[8][0x201]=g2Hang ? (1UL<<23) : 0;
+            gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0;
+        }
+    }
     for(ULONG i=0;i<7;++i) if(p==GmuCfgReg(g1Dwords[i])) {
         assert(allowG1Writes); g1Writes.push_back({g1Dwords[i],v});
         if(g1Dwords[i]==failG1Dword) return;
@@ -175,7 +198,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         data[w]=(1UL<<16)|(3UL<<8)|126;
         data[(w+1)&0x3FF]=header; data[(w+2)&0x3FF]=0; data[(w+3)&0x3FF]=0xFAFAFAFA;
         cmd[10]=cmd[11]; rsp[11]=(w+4)&0x3FF; gPages[1][0x192]|=1;
-        if((header&0xFF)==33) {
+        if((header&0xFF)==33 && !g2KeepGxOn) {
             cc[0x100C/4]=(cc[0x100C/4]&~0x80000000UL)|1;
             gPages[1][0xD0]=0xC0; gPages[1][0xEC]=0xF;
         }

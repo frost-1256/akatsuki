@@ -18,11 +18,12 @@
 #define EPI_GMU_PROBE_STAGE_E   0x80000UL // modifier: requires 0x7FE80 (0xFFE80 total), UBWC and CP protection
 #define EPI_GMU_PROBE_STAGE_F   0x100000UL // modifier: requires 0xFFE80 (0x1FFE80 total), CP_AHB_CNTL and four reads
 #define EPI_GMU_PROBE_G1        0x200000UL // modifier: requires 0x1FFE80 (0x3FFE80 total), GPU memory/streams and CP bases only
+#define EPI_GMU_PROBE_G2        0x400000UL // modifier: requires 0x3FFE80 (0x7FFE80 total), SQE start / ME_INIT / idle wait
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
 // Result codes (EpiDiag GpuGmuStatus)
-#define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
+#define EPI_GMU_OK              0           // FW init and all requested stages succeeded, CM3 reset, teardown ok
 #define EPI_GMU_E_PRECOND       1           // CM3 not in reset on entry: nothing touched
 #define EPI_GMU_E_FW            2           // firmware block list malformed or a block matches no region
 #define EPI_GMU_E_NOMEM         3           // memory or register map allocation failed
@@ -37,6 +38,7 @@
 #define EPI_GMU_E_CLOCK         12          // clock setup failed (CM3 never released); failed restoration returns 8
 #define EPI_GMU_E_GX            13          // OOB/slumber/optional GX initialization failed, but safe teardown succeeded
 #define EPI_GMU_E_GPU_MEMORY    14          // G-1 firmware/IOVA preparation failed (CM3 never released)
+#define EPI_GMU_E_CP            15          // G-2 CP initialization failed, safe teardown succeeded; failed teardown remains 8
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -158,6 +160,16 @@
 // Status fields are NTSTATUS, unattempted=STATUS_NOT_FOUND; unread values=0xFFFFFFFF.
 // Breadcrumbs: 0xC00 preparation, 0xC01 SQE copy, 0xC10..0xC16 original reads, 0xC20..0xC26 writes.
 // GpuSmmuGpuStreams: EPI_SMMU_GPU_STREAMS_TRACE (64 bytes), arrays ordered SMR/S2CR index 1, then 2.
+// GpuGmuG2: 140 bytes {Requested, Attempted, Reason, Status, SqeWritten, WptrWrites, FenceStatus, Polls,
+// ShadowBefore, ShadowAfter, SqeBefore, SqeAfter, WptrBefore, WptrAfter, Rptr, RbbmStatus, IntStatus,
+// CpHwFault, CxBusy, Gdscr, GxHm, FaultStatus, Fsr, FarLow, FarHigh, Fsynr, Packet[9]}.
+// Attempted/SqeWritten become 1 before CP_SQE_CNTL=1; WptrWrites counts publication attempts (WPTR=9).
+// Reason 0..6 match GxReg; 8=G-1 incomplete; 9=idle timeout; 10=fence timeout; 11=hang detected;
+// 12=invalid buffers/G-1 bases or nonzero initial shadow/ring/WPTR. Status fields are NTSTATUS; unattempted=STATUS_NOT_FOUND.
+// Unread values=0xFFFFFFFF. Polls is the number of 100-us idle waits, up to 10000 (1 s).
+// Fence bit0 retries: up to 200 x 10 us (2 ms); no registry writes inside either poll loop.
+// Breadcrumbs 0xD00 preconditions/map, D01 initial state, D02 SQE start, D03 packet copy,
+// D04 WPTR, D05 fence/retries, D06 idle wait, D07 final diagnostics (all GX accesses still under OOB).
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -176,6 +188,7 @@
 // GxCfg: requires Hwcg and its prerequisites; stage D follows stage C under OOB (probe 0x7FE80).
 // StageE: requires GxCfg and its prerequisites; follows successful stage D under OOB (probe 0xFFE80).
 // StageF: requires StageE and its prerequisites; follows successful stage E under OOB (probe 0x1FFE80).
+// G2: requires G1 and its prerequisites; starts SQE/ME_INIT under OOB, before the existing slumber (probe 0x7FFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -183,4 +196,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
-                     BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0);
+                     BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE);
