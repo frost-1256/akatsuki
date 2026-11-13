@@ -2169,6 +2169,148 @@ shim/ホスト試験に、G-2だけでSQE/WPTR書き込みを許す仕組み、�
   - zap shader と SECVID_TRUST_CNTL（§9.20.5）。0xF400 には触れない方針は変えていない。
   - zap なしでは GPU は secure mode から抜けられない [P]。そのため、次の段階で何ができるかは別に調べる必要がある。
 
+### 9.21 cp_init の後（zap なしで何ができるか）
+
+#### 9.21.1 Linux の流れ（cp_init の後）[L]
+
+1. `a6xx_zap_shader_init` → `adreno_zap_shader_load(gpu, GPU_PAS_ID)`。TZ の PAS に zap を読み込ませる。`static bool loaded` で、読み込みは最初の 1 回だけ。
+2. 成功したら、リングで `CP_SET_SECURE_MODE`（0x70E60001、本体 0）を送り、`a6xx_idle` を待つ。
+3. zap が DT にない（-ENODEV）ときだけ、`RBBM_SECVID_TRUST_CNTL`（0xF400）= 0 を直接書く。
+4. その後は通常の投入（`a6xx_submit`）になる。fence は次の 2 つで返す：
+   - `PKT4 CP_SCRATCH(2)` に書く。
+   - `CP_EVENT_WRITE(CACHE_FLUSH_TS | IRQ)` でメモリに書く。
+
+#### 9.21.2 いまわかっていること
+
+- G-2（v61）は secure mode のまま動いた。
+  - 読み出し：SQE の命令と ring は SMMU 経由で読めた。
+  - 書き込み：RPTR shadow（特権バッファ）には書けた。
+- secure mode が何を制限するのかは、Linux のソースには書かれていない [U]。
+  - KGSL の考え方では、secure mode 中の GPU は secure でない（non-secure）メモリへ書けない（保護されたコンテンツを漏らさないため）とされている [U]。
+  - しかし RPTR shadow には書けた。shadow の書き込みは特別扱いの可能性もある [U]。
+- したがって、**ふつうの CP の書き込みが secure mode で通るかを、まず実機で確かめる**のがいちばん安くて安全な次の一歩、と考える [I]。
+
+#### 9.21.3 zap を入れる手段（整理）
+
+| 手段 | 状態 |
+|---|---|
+| Windows から SCM の PAS を呼ぶ | qcscm は軽々しく戻さない方針。使わない |
+| `RBBM_SECVID_TRUST_CNTL`（0xF400）を直接書く | 禁止（§9.20.5）。読みもしない |
+| UEFI（Mu）の段階で zap を読み込む | 未調査 [U]。Qualcomm の UEFI に PIL／SCM のプロトコルがあるか、Mu-spacewar に入っているかを別に調べる |
+| secure mode のまま進む | G-3 で、何が動くかを確かめる |
+
+#### 9.21.4 G-3 の提案（bit23、0xFFFE80）
+
+- G-2 が成功した後、同じ OOB の中で続けて行う。ME_INIT（dword 0〜8）の後ろに、パケットを足す。
+- 使うバッファ：
+  - 新しいメモリは確保しない。SMMU の変更も不要。
+  - ring（IOVA 0x70010000、32 KB、RW、非特権）の **オフセット 0x7000（IOVA 0x70017000）** を、データ領域として借りる。
+  - ring が使うのは先頭の 20 dword だけなので、重ならない。
+- 準備：
+  - データ領域の先頭 4 dword に、目印として 0xFFFFFFFF を書いておく（CPU から書く。メモリバリアを入れる）。
+  - `CP_SCRATCH[2]`（0x885）の元の値を読んで記録する（期待値は 0）。
+- ring の dword 9〜19：
+  | dword | 値 | 意味 |
+  |---|---|---|
+  | 9 | 0x48088501 | `PKT4`：レジスタ 0x885（CP_SCRATCH[2]）に 1 dword |
+  | 10 | 0xCAFE0001 | 書く値 |
+  | 11 | 0x703D8003 | `CP_MEM_WRITE`（0x3D）、本体 3 dword |
+  | 12、13 | 0x70017000、0 | 書き込み先 IOVA（下位、上位） |
+  | 14 | 0xCAFE0002 | 書く値 |
+  | 15 | 0x703E8003 | `CP_REG_TO_MEM`（0x3E）、本体 3 dword |
+  | 16 | 0x00040885 | REG=0x885、CNT=1（bit18〜29）、64 ビットでない、加算しない |
+  | 17、18 | 0x70017008、0 | 書き込み先 IOVA |
+  | 19 | 0x70268000 | `CP_WAIT_FOR_IDLE`（0x26）、本体なし |
+  - ヘッダは §9.20.4 の式で計算した。同じ式で ME_INIT（0x70C80008）と SET_SECURE_MODE（0x70E60001）が既知の値と一致することを確かめてある。
+  - PKT4 = 0x40000000 | cnt | parity(cnt)<<7 | reg<<8 | parity(reg)<<27 [L]。
+- WPTR を 9 → **20** にする（fenced write。G-2 と同じ再送の規則）。
+- 待つ条件：G-2 と同じ 3 つ。ただし shadow の期待値は **20**。上限は 1 秒。
+- 成功の判定（どれも読み戻しで確かめる）：
+  - MMIO の `CP_SCRATCH[2]`（0x885）= 0xCAFE0001。PKT4 がレジスタに届いたことを示す。
+  - データ[0]（0x70017000）= 0xCAFE0002。CP_MEM_WRITE で非特権メモリに書けたことを示す。
+  - データ[2]（0x70017008）= 0xCAFE0001。レジスタからメモリへの複写が動いたことを示す。
+  - データ[1] と データ[3] は 0xFFFFFFFF のまま。余計な書き込みがないことを示す。
+- 失敗したときに記録するもの（読み出しは OOB の中で、GX の確認をしてから）：
+  - shadow、`CP_RB_RPTR`（0x806）、WPTR
+  - `CP_INTERRUPT_STATUS`（0x823）、`CP_PROTECT_STATUS`（0x824）、`CP_STATUS_1`（0x825）、`CP_HW_FAULT`（0x821）
+  - `RBBM_STATUS`（0x210）、`RBBM_INT_0_STATUS`（0x201）。とくに bit1 CP_AHB_ERROR、bit9 CP_HW_ERROR、bit23 HANG_DETECT、bit24 UCHE_OOB_ACCESS
+  - SMMU の FSR／FAR／FSYNR
+  - データ領域の 4 dword
+- 0x885 が CP_PROTECT の範囲に入っていないかについて：Linux の a660 の表では `0x800` から 0x82 個（0x800〜0x882）が読み書き禁止で、0x883 からの scratch はそのすぐ外にある [L]。stage E の表でも確かめた：CP_PROTECT[6]（0x856）= 0x82080800 は、base 0x800、個数 0x82（bit18〜30）、bit31 は読み出しも禁止。次の CP_PROTECT[7]（0x857）の base は 0x8A0。したがって 0x885 は保護されていない [P]。
+- 結果の読み方：
+  - 3 つとも成功した場合：secure mode でも、CP のふつうの書き込みは通る。
+  - CP_MEM_WRITE だけ失敗し、FSR にフォルトがない場合：secure mode が非 secure メモリへの書き込みを止めている、という仮説に合う。
+- 後片付けは G-2 と同じ。SQE は止めない（§9.20.6）。
+
+#### 9.21.5 その後の候補（G-3 が通ってから）
+
+- **G-3b：** `CP_EVENT_WRITE`（0x70460004、本体 {0x00000004（CACHE_FLUSH_TS、IRQ なし）, 0x70017010, 0, 0xCAFE0003}）。
+  - CP だけでなく、パイプラインのイベントとキャッシュの flush を通る。Linux の fence と同じ経路。
+  - G-3 よりも触れる範囲が広いので、別のビットに分けることを提案する。
+- `CP_SET_SECURE_MODE 0` は、zap なしで送ると何が起きるかわからない [U]。当面は送らない。
+- 描画（シェーダを動かす）は、zap の問題が解決するか、secure mode のままで何が動くかがはっきりしてから考える。
+
+#### 9.21.6 G-3の実装（実機未実行）
+
+bit23 `EPI_GMU_PROBE_G3=0x800000` を追加し、G-2とその全前提を必要とする`EpiGpuProbe=0xFFFE80`で実行する。G-2成功後、同じOOBを解除する前にG-3を続ける。前提不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。G-3b用の次ビット（bit24）は今回は予約扱いとして拒否する。G-2の140バイトの診断形式と、`0x7FFE80`までの実行内容は維持する。
+
+リングとRPTR影はG-1のものを再利用し、追加のデータ用確保やSMMU mapはしない。既知のGPU先頭ページと+0x2000だけを一時mapする。開始時にリング/影のIOVA・属性・map済み状態、影とWPTRが9、リング先頭9 DWORDがME_INITのままであることを確認する。CP_SCRATCH[2]の元値を記録し、リング+0x7000の4 DWORDにCPUで0xFFFFFFFFを置く。§9.21.4の11 DWORDをring[9..19]にコピーしてメモリバリアを入れ、WPTR=20をfenced writeする。SQEは再起動しない。
+
+fence再送はG-2と同じ200×10 µs、idle待ちは10000×100 µsを上限とする。RPTR影=20、RBBM_STATUSのbit0以外が0、RBBM_INT_0_STATUSのハングbit23が0、CX_BUSYのbit23が0を待つ。G-3ではRBBM_INTのCP_AHB_ERROR（bit1）、CP_HW_ERROR（bit9）、UCHE_OOB_ACCESS（bit24）もエラーとして打ち切り、Reason 14を残す。fence/idleのループ内ではレジストリを書かず、GXの確認は継続する。共通のfence/idle待ち関数は目標WPTRを引数にし、G-2は9、G-3は20を渡す。
+
+結果はscratch=0xCAFE0001、data[0]=0xCAFE0002、data[2]=0xCAFE0001、data[1]/[3]=0xFFFFFFFFを個別に判定する。idleが成立してもいずれかが違えばReason 13 / STATUS_IO_DEVICE_ERROR。すでに時間切れやGX/breadcrumbエラーがあれば、その最初のStatus/Reasonを保持し、値の不一致で上書きしない。部分的に成功した項目はChecksと生値で区別できる。secure modeが原因かどうかは自動では判定しない。
+
+終了時のGX診断は、scratch、CP_RB_RPTR、WPTR、CP_HW_FAULT、CP_INTERRUPT_STATUS、CP_PROTECT_STATUS、CP_STATUS_1、RBBM_STATUS、RBBM_INT_0_STATUSを1つずつ、各breadcrumbの保存・flushとGX確認の後に読む。途中で確認に失敗したら残りのGXレジスタは読まない。RAMの4 DWORDとRPTR影、CX_BUSY、SMMUのFSR/FAR/FSYNRは別に記録する。FSR等は生値の診断であり、その値だけでsecure modeやフォルトを断定しない。
+
+診断 `GpuGmuG3` はREG_BINARY・244バイト（61 DWORD）：`{Cp, ScratchBefore, ScratchAfter, DataBefore[4], DataAfter[4], Packet[11], CpInterrupt, CpProtect, CpStatus1, Checks, Prepared}`。先頭Cpは既存のGpuGmuG2と同じ140バイトの形式だが、G-3単独の進行を表す。Cp.Requested=1、Cp.AttemptedはWPTR=20の書き込み直前に1、Cp.WptrWritesは20の書き込み回数。SQEを起動し直さないのでCp.SqeWritten=0、SqeBefore/AfterとCp.Packet[9]は未読0xFFFFFFFFのまま。追加パケットは外側のPacket[11]へコピー後のリングから保存する。
+
+PreparedはCPUの目印とパケットのコピー・バリアが完了すると1。DataBeforeはコマンド実行前の4個の目印（0xFFFFFFFF）、DataAfterは読み出した生値。Checksはbit0=scratch一致、bit1=data[0]一致、bit2=data[2]一致、bit3=data[1]保持、bit4=data[3]保持で、成功時は0x1F。Prepared=0ではChecksは0のまま。Cp.Reasonの0〜12はG-2と同じ、13=結果不一致、14=上記CP/UCHEエラー割り込み。Status類の未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。G-2のGpuGmuG2は別途そのまま保存し、G-3診断もcleanup/keepの両経路で保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0xE00 | 前提確認・map前 |
+| 0xE01 | scratch元値・影/WPTR・ME_INITの確認 |
+| 0xE02 | 4個の目印と11 DWORDのコピー |
+| 0xE03 | WPTR=20 |
+| 0xE04 | fence確認・再送 |
+| 0xE05 | idle待ち |
+| 0xE10〜0xE18 | 上記9個のGX診断を順に読み取る前 |
+
+後片付けはG-2と同じで、結果にかかわらずOOB解除・バスhalt・slumber・GX OFF確認へ進む。GX OFFやSMMU Disableで失敗したらメモリとCXを保持する。G-3だけの失敗で安全に後片付けできれば既存のCPエラーstatus 15を使い、teardownの失敗はstatus 8 / KeepCxが優先する。0xF400は読み書きとも行わず、SCM/PAS、CP_SET_SECURE_MODE、CP_EVENT_WRITE、SQEの停止、割り込みマスクは追加しない。
+
+shim/ホスト試験に、11 DWORDの実行モデル、5個の結果確認と各項目の失敗、fence再送・時間切れ、RPTR/RBBM/GMUの未完了、エラー割り込み、各breadcrumbとGX喪失時の停止、最初のReasonの保持、追加SMMU mapなし、全体の正常終了とG-2失敗時のG-3不実行、後片付け失敗時のバッファ保持を追加した。11 DWORDの一致と、PKT4/PKT7のヘッダ（既知のME_INIT/SET_SECURE_MODEを含む）は独立したパリティ計算で確認した。ホスト試験の実行・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.21.7 v62 実機結果（2026-11-13、0xFFFE80、G-3）
+
+- 実行条件：版 20.0.2.62（oem120）。端末を 11:52 に再起動してから実行した。
+- **3 つの書き込みはすべて成功した。Checks は 0x1F。**
+  - EpiGpuProbeStep は 0xFFFF、GpuGmuStatus は 0、GpuGmuNtStatus は 0 だった。
+  - KeepCx、DisableStatus、CxStatus、FaultStatus もすべて 0 だった。デバイスは Started のまま。
+- `GpuGmuG3`（244 B）の中身：
+  | 項目 | 値 |
+  |---|---|
+  | Cp：Attempted／Reason／Status | 1／0／0 |
+  | WptrWrites／FenceStatus／Polls | 1／0／**0**（idle 待ちの 1 回目で idle になった） |
+  | shadow の前→後 | 9 → **20** |
+  | WPTR の前→後、RPTR（0x806） | 9 → 20、20 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT | 0x1／0／0 |
+  | CX_BUSY | 0x71000000（bit23 は 0） |
+  | CP_INTERRUPT_STATUS／CP_PROTECT_STATUS／CP_STATUS_1 | 0／0／0 |
+  | CP_SCRATCH[2] の前→後 | 0 → **0xCAFE0001** |
+  | データの前 | {FFFFFFFF ×4} |
+  | データの後 | {**CAFE0002**, FFFFFFFF, **CAFE0001**, FFFFFFFF} |
+  | Packet（ring[9..19]） | §9.21.4 の値と一致 |
+  - FSR は 0x400 だった。これは FORMAT の値で、フォルトは起きていない。FAR と FSYNR は前の値が残っているだけと見ている [P]。
+- G-2 の部分（`GpuGmuG2`）は v61 と同じ値だった。SMR1 と SMR2 もまた受け付けられ、後片付けで元の値に戻った。
+- 意味：
+  - zap を入れず secure mode のままでも、CP の書き込みは 3 種類とも通った。
+    - PKT4 によるレジスタへの書き込み。
+    - `CP_MEM_WRITE` による非特権の非 secure メモリへの書き込み。
+    - `CP_REG_TO_MEM` によるレジスタからメモリへの複写。
+  - 余計な場所への書き込みもなかった（隣の 2 dword は目印の値のまま）。
+  - §9.21.2 の「secure mode 中は非 secure メモリへ書けない」という仮説は、**少なくとも CP の直接の書き込みには当てはまらない** [P]。
+- 次の候補（§9.21.5）：G-3b（`CP_EVENT_WRITE` CACHE_FLUSH_TS で fence を書く）。パイプラインのイベントとキャッシュの flush を通る経路で確かめる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

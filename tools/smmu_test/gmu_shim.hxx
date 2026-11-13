@@ -62,6 +62,10 @@ static ULONG g2FenceDrops=0;
 static ULONG* g2Ring=nullptr;
 static ULONG* g2Shadow=nullptr;
 static std::vector<std::pair<ULONG,ULONG>> g2Writes;
+static bool allowG3Writes=false, g3Completes=true, g3Scratch=true, g3Mem=true, g3Reg=true;
+static bool g3BadGuard1=false, g3BadGuard3=false, g3FenceForever=false;
+static ULONG g3FenceDrops=0, g3ErrorBits=0;
+static std::vector<ULONG> g3Writes;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -118,21 +122,38 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
     if(p==GmuCfgReg(0x808) || p==GmuCfgReg(0x807)) {
         assert(allowG2Writes); const ULONG reg=p==GmuCfgReg(0x808) ? 0x808 : 0x807;
-        g2Writes.push_back({reg,v}); assert(v==(reg==0x808 ? 1UL : 9UL));
+        g2Writes.push_back({reg,v});
+        assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20)));
         if(reg==0x807) {
             const ULONG packet[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
             assert(g2Ring && g2Shadow && std::memcmp(g2Ring,packet,sizeof(packet))==0);
-            if(g2FenceForever || g2FenceDrops!=0) {
-                if(g2FenceDrops!=0) --g2FenceDrops;
+            if(v==20) {
+                const ULONG extra[]={0x48088501,0xCAFE0001,0x703D8003,0x70017000,0,0xCAFE0002,
+                                     0x703E8003,0x00040885,0x70017008,0,0x70268000};
+                assert(std::memcmp(g2Ring+9,extra,sizeof(extra))==0); g3Writes.push_back(v);
+            }
+            ULONG& drops=v==20 ? g3FenceDrops : g2FenceDrops;
+            if((v==20 ? g3FenceForever : g2FenceForever) || drops!=0) {
+                if(drops!=0) --drops;
                 gPages[2][0x313]=1; return;
             }
             gPages[2][0x313]=0;
-            if(g2Completes) { *g2Shadow=9; *GmuCfgReg(0x806)=9; }
+            if(v==9 && g2Completes) { *g2Shadow=9; *GmuCfgReg(0x806)=9; }
+            if(v==20 && g3Completes) {
+                ULONG* data=g2Ring+0x7000/4;
+                if(g3Scratch) *GmuCfgReg(0x885)=0xCAFE0001;
+                if(g3Mem) data[0]=0xCAFE0002;
+                if(g3Reg) data[2]=*GmuCfgReg(0x885);
+                if(g3BadGuard1) data[1]=0;
+                if(g3BadGuard3) data[3]=0;
+                *g2Shadow=20; *GmuCfgReg(0x806)=20;
+            }
             gPages[8][0x210]=g2RbbmBusy ? 2 : 1;
-            gPages[8][0x201]=g2Hang ? (1UL<<23) : 0;
+            gPages[8][0x201]=(g2Hang ? (1UL<<23) : 0) | (v==20 ? g3ErrorBits : 0);
             gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0;
         }
     }
+    assert(p!=GmuCfgReg(0x885)); // scratch must be written by the packet peer, never by the CPU driver
     for(ULONG i=0;i<7;++i) if(p==GmuCfgReg(g1Dwords[i])) {
         assert(allowG1Writes); g1Writes.push_back({g1Dwords[i],v});
         if(g1Dwords[i]==failG1Dword) return;
