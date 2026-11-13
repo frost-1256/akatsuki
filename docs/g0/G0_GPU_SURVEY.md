@@ -2311,6 +2311,63 @@ shim/ホスト試験に、11 DWORDの実行モデル、5個の結果確認と各
   - §9.21.2 の「secure mode 中は非 secure メモリへ書けない」という仮説は、**少なくとも CP の直接の書き込みには当てはまらない** [P]。
 - 次の候補（§9.21.5）：G-3b（`CP_EVENT_WRITE` CACHE_FLUSH_TS で fence を書く）。パイプラインのイベントとキャッシュの flush を通る経路で確かめる。
 
+#### 9.21.8 G-3bの実装（実機未実行）
+
+bit24 `EPI_GMU_PROBE_G3B=0x1000000` の拒否を解除した。G-3とその全前提を必要とし、`EpiGpuProbe=0x1FFFE80`でG-3成功直後、同じOOBを解除する前に実行する。前提不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。G-3未完了ならReason 8でG-3bを飛ばす。`0xFFFE80`までの実行内容と既存の診断形式は維持する。
+
+リングとRPTR影は従来の割り当てを使い、追加のバッファ確保とSMMU mapはしない。既知のGPU先頭ページと+0x2000だけを一時mapする。影とWPTRが20、リング先頭20 DWORDがME_INITとG-3のまま、データ[0..3]がG-3成功時の値であることを確認する。CP_SCRATCH[2]も元値を記録する。データ[4..5]にだけCPUで0xFFFFFFFFを置き、ring[20..24]へ `{0x70460004, 4, 0x70017010, 0, 0xCAFE0003}` をコピーしてメモリバリアを入れる。データ[0..3]と先頭20 DWORDは書き直さない。IRQのbit31は立てない。
+
+WPTR=25をfenced writeし、G-2/G-3と共通の再送処理（200×10 µs）を使う。idle待ちも共通で、RPTR影=25、RBBM_STATUSのbit0以外が0、GMU CX_BUSYのbit23=0を、最大10000×100 µs待つ。RBBM_INT_0_STATUSのbit1/9/24はReason 14、ハングbit23はReason 11で打ち切る。待ちのループ内でレジストリは書かず、GX確認は継続する。
+
+結果は、データ[4]=0xCAFE0003、データ[5]=0xFFFFFFFF、データ[0..3]が投入前から変わっていないことをすべて求める。不一致ならReason 13 / STATUS_IO_DEVICE_ERROR。時間切れやGX/breadcrumbの失敗が先にあれば、その最初のStatus/Reasonを保持する。診断はG-3と同じ9個のGXレジスタを1つずつbreadcrumb保存・flushとGX確認の後に読み、確認に失敗したら残りのGX読み取りを止める。RPTR影、CX_BUSY、SMMUのFSR/FAR/FSYNR、データ6 DWORDも保存する。SQEは起動し直さない。
+
+追加診断 `GpuGmuG3b` はREG_BINARY・236バイト（59 DWORD）：`{Cp, ScratchBefore, ScratchAfter, DataBefore[6], DataAfter[6], Packet[5], CpInterrupt, CpProtect, CpStatus1, Checks, Prepared}`。先頭CpはGpuGmuG2と同じ140バイトで、G-3bだけの進行を表す。Cp.AttemptedはWPTR=25の直前に1、Cp.WptrWritesは25の書き込み回数、Cp.Pollsは100 µsの待ち回数。SQEを起動しないためCp.SqeWritten=0、SqeBefore/AfterとCp.Packet[9]は未読0xFFFFFFFF。Packet[5]はコピー後のリングから保存する。DataBefore[0..3]はG-3の結果、[4..5]はCPUが準備した目印。Preparedは目印とパケットのコピー・バリア完了後に1。
+
+Checksのbit0〜3はそれぞれデータ[0..3]の保持、bit4はデータ[4]=0xCAFE0003、bit5はデータ[5]=0xFFFFFFFFを表し、成功値は0x3F。Prepared=0ならChecksは0のまま。ReasonとNTSTATUSの意味はG-3と同じで、未読値0xFFFFFFFF、未試行StatusはSTATUS_NOT_FOUND。cleanup/keepの両経路で保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0xF00 | 前提確認・map前 |
+| 0xF01 | scratch元値・影/WPTR・G-3のデータとパケット確認 |
+| 0xF02 | データ[4..5]の目印と5 DWORDのコピー |
+| 0xF03 | WPTR=25 |
+| 0xF04 | fence確認・再送 |
+| 0xF05 | idle待ち |
+| 0xF10〜0xF18 | scratch、RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0の個別読み取り前 |
+
+後片付けは従来と同じOOB解除・バスhalt・slumber・GX OFF/idle確認・SMMU Disableの順。G-3bだけが失敗して安全に後片付けできれば既存のstatus 15を使い、teardown失敗はstatus 8 / KeepCxで全バッファを保持する。CP_SET_SECURE_MODE、0xF400の読み書き、SCM/PAS、SQE停止、割り込みマスクの変更は追加しない。
+
+shim/ホスト試験に、IRQなしイベントパケットとWPTR=25、先頭20 DWORDとG-3データの保持、イベント結果と目印の確認、結果6項目の個別失敗、再送と時間切れ、エラー割り込み、各breadcrumb失敗、GX喪失後の読み取り停止、最初のReasonの保持、mapと開始条件の失敗、G-3失敗時の不実行、正常解放とteardown失敗時の保持を追加した。5 DWORDの一致、独立したパリティ計算、IRQ bit31=0、リングとデータ領域の非重複・サイズ境界を静的に確認した。ホスト試験の実行・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.21.9 v63 実機結果（2026-11-13、0x1FFFE80、G-3b）
+
+- 版 20.0.2.63（oem121）。端末は 12:11 に再起動してから実行した。
+- **CACHE_FLUSH_TS で fence が書けた。Checks は 0x3F。**
+  - EpiGpuProbeStep は 0xFFFF。GpuGmuStatus、GpuGmuNtStatus、KeepCx、DisableStatus、CxStatus、FaultStatus はどれも 0。デバイスは Started。
+- `GpuGmuG3b`（236 B）の中身：
+  | 項目 | 値 |
+  |---|---|
+  | Cp：Attempted／Reason／Status | 1／0／0 |
+  | WptrWrites／FenceStatus／Polls | 1／0／**0** |
+  | shadow の前→後 | 20 → **25** |
+  | WPTR の前→後、RPTR | 20 → 25、25 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT | 0x1／0／0 |
+  | CP_INTERRUPT／CP_PROTECT／CP_STATUS_1 | 0／0／0 |
+  | scratch[2] の前／後 | 0xCAFE0001／0xCAFE0001 |
+  | データの前 | {CAFE0002, FFFFFFFF, CAFE0001, FFFFFFFF, FFFFFFFF, FFFFFFFF} |
+  | データの後 | {CAFE0002, FFFFFFFF, CAFE0001, FFFFFFFF, **CAFE0003**, FFFFFFFF} |
+  | Packet（ring[20..24]） | {0x70460004, 4, 0x70017010, 0, 0xCAFE0003}（仕様と一致） |
+  - FSR は 0x400 で、フォルトはない。
+  - INT0 が 0 なのは、IRQ ビットを立てていないので CP_CACHE_FLUSH_TS（bit20）の割り込みが出ないため。予想どおり。
+- G-3 の部分も前回と同じで、Checks は 0x1F だった。
+- 意味：
+  - Linux の fence と同じ経路が、zap も secure mode からの切り替えもなしで通った。CP のイベントがパイプラインを通り、キャッシュを flush してから、タイムスタンプを書く経路である。
+  - IRQ ビットは立てていないので、割り込みの経路はまだ確かめていない。
+- 次の候補 [I]：
+  - CACHE_FLUSH_TS に IRQ を付ける。RBBM_INT_0_MASK の bit20 を立て、INT0_STATUS を polling で見る。ISR はまだつながない。
+  - あるいは、IB（`CP_INDIRECT_BUFFER`）を 1 段使う。
+  - 描画に進むのは、そのあと。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

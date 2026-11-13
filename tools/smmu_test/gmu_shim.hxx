@@ -66,6 +66,9 @@ static bool allowG3Writes=false, g3Completes=true, g3Scratch=true, g3Mem=true, g
 static bool g3BadGuard1=false, g3BadGuard3=false, g3FenceForever=false;
 static ULONG g3FenceDrops=0, g3ErrorBits=0;
 static std::vector<ULONG> g3Writes;
+static bool allowG3bWrites=false, g3bCompletes=true, g3bEvent=true, g3bBadGuard=false, g3bFenceForever=false;
+static ULONG g3bFenceDrops=0, g3bErrorBits=0, g3bDamage=0;
+static std::vector<ULONG> g3bWrites;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -123,17 +126,22 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     if(p==GmuCfgReg(0x808) || p==GmuCfgReg(0x807)) {
         assert(allowG2Writes); const ULONG reg=p==GmuCfgReg(0x808) ? 0x808 : 0x807;
         g2Writes.push_back({reg,v});
-        assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20)));
+        assert(reg==0x808 ? v==1 : (v==9 || (allowG3Writes && v==20) || (allowG3bWrites && v==25)));
         if(reg==0x807) {
             const ULONG packet[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
             assert(g2Ring && g2Shadow && std::memcmp(g2Ring,packet,sizeof(packet))==0);
-            if(v==20) {
+            if(v==20 || v==25) {
                 const ULONG extra[]={0x48088501,0xCAFE0001,0x703D8003,0x70017000,0,0xCAFE0002,
                                      0x703E8003,0x00040885,0x70017008,0,0x70268000};
-                assert(std::memcmp(g2Ring+9,extra,sizeof(extra))==0); g3Writes.push_back(v);
+                assert(std::memcmp(g2Ring+9,extra,sizeof(extra))==0);
+                if(v==20) g3Writes.push_back(v);
             }
-            ULONG& drops=v==20 ? g3FenceDrops : g2FenceDrops;
-            if((v==20 ? g3FenceForever : g2FenceForever) || drops!=0) {
+            if(v==25) {
+                const ULONG event[]={0x70460004,4,0x70017010,0,0xCAFE0003};
+                assert(std::memcmp(g2Ring+20,event,sizeof(event))==0); g3bWrites.push_back(v);
+            }
+            ULONG& drops=v==25 ? g3bFenceDrops : (v==20 ? g3FenceDrops : g2FenceDrops);
+            if((v==25 ? g3bFenceForever : (v==20 ? g3FenceForever : g2FenceForever)) || drops!=0) {
                 if(drops!=0) --drops;
                 gPages[2][0x313]=1; return;
             }
@@ -148,8 +156,15 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
                 if(g3BadGuard3) data[3]=0;
                 *g2Shadow=20; *GmuCfgReg(0x806)=20;
             }
+            if(v==25 && g3bCompletes) {
+                ULONG* data=g2Ring+0x7000/4;
+                if(g3bEvent) data[4]=0xCAFE0003;
+                if(g3bBadGuard) data[5]=0;
+                for(ULONG i=0;i<4;++i) if(g3bDamage&(1UL<<i)) data[i]^=1;
+                *g2Shadow=25; *GmuCfgReg(0x806)=25;
+            }
             gPages[8][0x210]=g2RbbmBusy ? 2 : 1;
-            gPages[8][0x201]=(g2Hang ? (1UL<<23) : 0) | (v==20 ? g3ErrorBits : 0);
+            gPages[8][0x201]=(g2Hang ? (1UL<<23) : 0) | (v==25 ? g3bErrorBits : (v==20 ? g3ErrorBits : 0));
             gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0;
         }
     }

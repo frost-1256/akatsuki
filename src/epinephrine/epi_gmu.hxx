@@ -20,6 +20,7 @@
 #define EPI_GMU_PROBE_G1        0x200000UL // modifier: requires 0x1FFE80 (0x3FFE80 total), GPU memory/streams and CP bases only
 #define EPI_GMU_PROBE_G2        0x400000UL // modifier: requires 0x3FFE80 (0x7FFE80 total), SQE start / ME_INIT / idle wait
 #define EPI_GMU_PROBE_G3        0x800000UL // modifier: requires 0x7FFE80 (0xFFFE80 total), scratch / MEM_WRITE / REG_TO_MEM
+#define EPI_GMU_PROBE_G3B       0x1000000UL // modifier: requires 0xFFFE80 (0x1FFFE80 total), CACHE_FLUSH_TS without IRQ
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -181,6 +182,13 @@
 // Cp.Reason adds 13=result mismatch, 14=CP_AHB/CP_HW/UCHE_OOB error interrupt; other reasons match G-2.
 // Breadcrumbs E00 preconditions/map, E01 initial scratch/shadow/WPTR, E02 data+packet, E03 WPTR=20,
 // E04 fence, E05 idle, E10..E18 guarded individual GX diagnostic reads. No new buffer/SMMU mapping.
+// GpuGmuG3b: 236 bytes {Cp (GpuGmuG2's 140-byte layout), ScratchBefore, ScratchAfter,
+// DataBefore[6], DataAfter[6], Packet[5], CpInterrupt, CpProtect, CpStatus1, Checks, Prepared}.
+// Cp describes WPTR=25 after 20; SQE fields and Cp.Packet[9] are unused as in G-3. No SQE restart.
+// DataBefore[0..3] captures G-3's results; DataBefore[4..5] records CPU-written FFFFFFFF sentinels.
+// Checks bits0..3: data[0..3] unchanged; bit4: data[4]==CAFE0003; bit5: data[5]==FFFFFFFF. Require 0x3F.
+// Packet is ring[20..24], CP_EVENT_WRITE CACHE_FLUSH_TS with IRQ bit clear. Result lives at ring+0x7010.
+// Reason/status meanings and Prepared match G-3. Breadcrumbs F00..F05 and F10..F18 match G-3's phases.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -201,6 +209,7 @@
 // StageF: requires StageE and its prerequisites; follows successful stage E under OOB (probe 0x1FFE80).
 // G2: requires G1 and its prerequisites; starts SQE/ME_INIT under OOB, before the existing slumber (probe 0x7FFE80).
 // G3: requires G2 and its prerequisites; appends the 11-DWORD probe under the same OOB lease (probe 0xFFFE80).
+// G3b: requires G3 and its prerequisites; appends CACHE_FLUSH_TS under the same OOB lease (probe 0x1FFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -208,4 +217,5 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
-                     BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE);
+                     BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
+                     BOOLEAN G3b = FALSE);
