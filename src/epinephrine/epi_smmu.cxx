@@ -36,6 +36,7 @@ struct EPI_SMMU {
     BOOLEAN HasBadWrite; // first mismatch for this context's lifetime; Disable must not overwrite it
     EPI_SMMU_DISABLE_WRITE DisableWrites[EPI_SMMU_DISABLE_WRITE_MAX];
     ULONG DisableWriteCount;
+    EPI_SMMU_GPU_STREAMS_TRACE Gpu;
 };
 static_assert(RTL_NUMBER_OF(ConfigOffsets)==EPI_SMMU_DISABLE_WRITE_MAX,"SMMU disable diagnostic capacity");
 static PVOID volatile Owner = NULL;
@@ -116,6 +117,28 @@ NTSTATUS EpiSmmuDestroy(EPI_SMMU* C)
     }
     for (ULONG i = 0; i < 4; ++i) { FreeTable(&C->L2[i]); }
     FreeTable(&C->Root); ExFreePoolWithTag(C, Tag); return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuConfigureGpuStreams(EPI_SMMU* C)
+{
+    PAGED_CODE();
+    if (C==NULL) { return STATUS_INVALID_PARAMETER; }
+    if (C->Regs!=NULL || C->Saved) { return STATUS_DEVICE_BUSY; }
+    C->Gpu.Configured=1;
+    for (ULONG i=0;i<2;++i)
+    {
+        C->Gpu.SmrOriginal[i]=0xFFFFFFFF; C->Gpu.S2crOriginal[i]=0xFFFFFFFF;
+        C->Gpu.SmrReadback[i]=0xFFFFFFFF; C->Gpu.S2crReadback[i]=0xFFFFFFFF;
+        C->Gpu.SmrDisabled[i]=0xFFFFFFFF; C->Gpu.SmrRestored[i]=0xFFFFFFFF; C->Gpu.S2crRestored[i]=0xFFFFFFFF;
+    }
+    C->Gpu.RestoreStatus=STATUS_NOT_FOUND;
+    return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuQueryGpuStreams(EPI_SMMU* C,EPI_SMMU_GPU_STREAMS_TRACE* Trace)
+{
+    PAGED_CODE();
+    if (C==NULL || Trace==NULL) { return STATUS_INVALID_PARAMETER; }
+    if (!C->Gpu.Configured) { return STATUS_NOT_FOUND; }
+    *Trace=C->Gpu; return STATUS_SUCCESS;
 }
 NTSTATUS EpiSmmuMap(EPI_SMMU* C, ULONGLONG Iova, PHYSICAL_ADDRESS Phys, SIZE_T Size, ULONG Flags)
 {
@@ -274,14 +297,25 @@ static VOID ReleaseHardware(EPI_SMMU* C)
     C->Regs = NULL; C->Cc = NULL; C->Gmu = NULL; C->Saved = FALSE; C->Enabled = FALSE;
     InterlockedExchangePointer(&Owner, NULL);
 }
-NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
+static NTSTATUS EpiSmmuDisableImpl(EPI_SMMU* C)
 {
     PAGED_CODE();
     if (C == NULL) { return STATUS_INVALID_PARAMETER; }
     if (C->Regs == NULL) { return STATUS_SUCCESS; }
     if (!WindowReady(C, TRUE)) { return STATUS_INVALID_DEVICE_STATE; }
     // Keep tables and ownership on ANY failure; caller may retry teardown.
-    NTSTATUS st = Write(C, 0x800, C->Smr & ~0x80000000UL, 0x520);
+    NTSTATUS st=STATUS_SUCCESS;
+    if (C->Gpu.Configured)
+    {
+        for (ULONG i=0;i<2;++i)
+        {
+            const NTSTATUS disabled=Write(C,0x804+i*4,C->Gpu.SmrOriginal[i]&~0x80000000UL,
+                                           0x552+i*5,0xFFFFFFFF,&C->Gpu.SmrDisabled[i]);
+            if (!NT_SUCCESS(disabled) && NT_SUCCESS(st)) { st=disabled; }
+        }
+        if (!NT_SUCCESS(st)) { return st; } // both must be verified invalid before touching CB0
+    }
+    st = Write(C, 0x800, C->Smr & ~0x80000000UL, 0x520);
     if (!NT_SUCCESS(st)) { return st; }
     st = Write(C, Cb, 0, 0x521); if (!NT_SUCCESS(st)) { return st; }
     C->Enabled = FALSE;
@@ -289,6 +323,17 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
     // Stream invalid, CB disabled, TLB sync complete: remaining config writes cannot start translation.
     // Continue only through MMIO readback mismatches. Persistence failures still stop the sweep.
     NTSTATUS restoreStatus = STATUS_SUCCESS;
+    if (C->Gpu.Configured)
+    {
+        for (ULONG i=0;i<2;++i)
+        {
+            BOOLEAN written=FALSE;
+            const NTSTATUS restored=Write(C,0xC04+i*4,C->Gpu.S2crOriginal[i],0x553+i*5,
+                                           0xFFFFFFFF,&C->Gpu.S2crRestored[i],&written);
+            if (!NT_SUCCESS(restored) && NT_SUCCESS(restoreStatus)) { restoreStatus=restored; }
+            if (!NT_SUCCESS(restored) && !written) { return restoreStatus; }
+        }
+    }
     C->DisableWriteCount = 0;
     for (ULONG i = 0; i < RTL_NUMBER_OF(ConfigOffsets); ++i)
     {
@@ -308,10 +353,28 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
         }
     }
     // Any mismatch keeps the CB/stream disabled and ownership/tables pinned; do not run the final restores.
-    if (!NT_SUCCESS(restoreStatus)) { return restoreStatus; }
+    if (!NT_SUCCESS(restoreStatus))
+    { if (C->Gpu.Configured) { C->Gpu.RestoreStatus=restoreStatus; } return restoreStatus; }
     st = Write(C, Cb, C->Sctlr, 0x53B); if (!NT_SUCCESS(st)) { return st; }
     st = Write(C, 0x800, C->Smr, 0x53C); if (!NT_SUCCESS(st)) { return st; }
+    if (C->Gpu.Configured)
+    {
+        for (ULONG i=0;i<2;++i)
+        {
+            const NTSTATUS restored=Write(C,0x804+i*4,C->Gpu.SmrOriginal[i],0x554+i*5,
+                                           0xFFFFFFFF,&C->Gpu.SmrRestored[i]);
+            if (!NT_SUCCESS(restored) && NT_SUCCESS(st)) { st=restored; }
+        }
+        if (!NT_SUCCESS(st)) { return st; }
+    }
     ReleaseHardware(C); return STATUS_SUCCESS;
+}
+NTSTATUS EpiSmmuDisable(EPI_SMMU* C)
+{
+    const BOOLEAN hadHardware=C!=NULL && C->Regs!=NULL;
+    const NTSTATUS st=EpiSmmuDisableImpl(C);
+    if (hadHardware && C->Gpu.Configured) { C->Gpu.RestoreStatus=st; }
+    return st;
 }
 NTSTATUS EpiSmmuEnable(EPI_SMMU* C, volatile ULONG* Cc, volatile ULONG* GmuA)
 {
@@ -338,6 +401,14 @@ NTSTATUS EpiSmmuEnable(EPI_SMMU* C, volatile ULONG* Cc, volatile ULONG* GmuA)
     { if (READ_REGISTER_ULONG(s+(Cb+i*0x1000)/4) & 0x61) { ReleaseHardware(C); return STATUS_DEVICE_BUSY; } }
     // Preserve all registers before any write. Never write sCR0 or clear fault status.
     C->Sctlr = READ_REGISTER_ULONG(s+Cb/4); C->Smr = READ_REGISTER_ULONG(s+0x800/4);
+    if (C->Gpu.Configured)
+    {
+        for (ULONG i=0;i<2;++i)
+        {
+            C->Gpu.SmrOriginal[i]=READ_REGISTER_ULONG(s+(0x804+i*4)/4);
+            C->Gpu.S2crOriginal[i]=READ_REGISTER_ULONG(s+(0xC04+i*4)/4);
+        }
+    }
     for (ULONG i = 0; i < RTL_NUMBER_OF(ConfigOffsets); ++i)
     { C->Original[i] = READ_REGISTER_ULONG(s+ConfigOffsets[i]/4); }
     C->Saved = TRUE;
@@ -350,12 +421,16 @@ NTSTATUS EpiSmmuEnable(EPI_SMMU* C, volatile ULONG* Cc, volatile ULONG* GmuA)
     NTSTATUS st = Write(C, Cb, 0, 0x500);
     for (ULONG i = 0; NT_SUCCESS(st) && i < RTL_NUMBER_OF(values); ++i)
     { st = Write(C, ConfigOffsets[i], values[i], 0x501+i, ConfigCompareMask(ConfigOffsets[i])); }
+    if (C->Gpu.Configured) for (ULONG i=0;NT_SUCCESS(st) && i<2;++i)
+    { st=Write(C,0xC04+i*4,0,0x550+i*5,0xFFFFFFFF,&C->Gpu.S2crReadback[i]); }
     if (NT_SUCCESS(st)) { st = Sync(C, 0x50C); }
     // ASIDPNE/HUPCF/CFRE/AFE/TRE/M: record faults for QueryFault,
     // but CFIE=0 (no IRQ) and CFCFG=0 (no stall on a fault).
     // Ignore SCTLR bit12 (ASIDPNE) in this enable write's readback comparison.
     if (NT_SUCCESS(st)) { st = Write(C, Cb, 0x1127, 0x50D, 0xFFFFEFFFUL); }
     if (NT_SUCCESS(st)) { st = Write(C, 0x800, 0x84000005, 0x50E); }
+    if (C->Gpu.Configured) for (ULONG i=0;NT_SUCCESS(st) && i<2;++i)
+    { st=Write(C,0x804+i*4,0x84000000UL|i,0x551+i*5,0xFFFFFFFF,&C->Gpu.SmrReadback[i]); }
     if (NT_SUCCESS(st)) { C->Enabled = TRUE; return STATUS_SUCCESS; }
     const NTSTATUS cleanup = EpiSmmuDisable(C);
     return NT_SUCCESS(cleanup) ? st : cleanup;

@@ -3,11 +3,21 @@
 #include "../../src/epinephrine/epi_gmu.cxx"
 #include <fstream>
 #include <iterator>
-struct EPI_SMMU { bool enabled; };
+struct EPI_SMMU { bool enabled, gpuStreams; };
+struct TEST_MAP { ULONGLONG Iova; SIZE_T Size; ULONG Flags; };
+static std::vector<TEST_MAP> testMaps;
+static ULONGLONG failMapIova=~0ULL;
+NTSTATUS EpiSmmuConfigureGpuStreams(EPI_SMMU* c) { assert(!c->enabled); c->gpuStreams=true; return 0; }
+NTSTATUS EpiSmmuQueryGpuStreams(EPI_SMMU* c,EPI_SMMU_GPU_STREAMS_TRACE* t) {
+    if(!c->gpuStreams) return STATUS_NOT_FOUND;
+    *t={}; t->Configured=1; return 0;
+}
 NTSTATUS EpiSmmuCreate(HANDLE,EPI_SMMU** c) {
     *c=static_cast<EPI_SMMU*>(ExAllocatePool2(0,sizeof(EPI_SMMU),0)); return *c ? 0 : STATUS_INSUFFICIENT_RESOURCES;
 }
-NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG iova,PHYSICAL_ADDRESS pa,SIZE_T,ULONG) {
+NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG iova,PHYSICAL_ADDRESS pa,SIZE_T size,ULONG flags) {
+    if(iova==failMapIova) return STATUS_INSUFFICIENT_RESOURCES;
+    testMaps.push_back({iova,size,flags});
     if(iova==0x60008000) {
         for(const auto& a:allocations) if(a.second==static_cast<ULONGLONG>(pa.QuadPart))
             hfiMemory=static_cast<ULONG*>(a.first);
@@ -47,7 +57,14 @@ static std::vector<UCHAR> Image() {
     std::vector<UCHAR> code(0xD4CC,0xA5); Block(f,0x4000,static_cast<ULONG>(code.size()),0,0,code.data());
     ULONG version=0x30010008; Block(f,0x10007FE0,4,0,0,&version); return f;
 }
+static std::vector<UCHAR> SqeImage() {
+    std::vector<UCHAR> sqe(EPI_GMU_SQE_FILE_SIZE,0xA5);
+    const ULONG head[]={0,0x016DC094}, tail=0x12345678;
+    std::memcpy(sqe.data(),head,sizeof(head)); std::memcpy(sqe.data()+sqe.size()-4,&tail,4);
+    return sqe;
+}
 static void Reset() {
+    testMaps.clear(); failMapIova=~0ULL; g1Writes.clear(); allowG1Writes=false; failG1Dword=0xFFFFFFFF;
     stageFWrites.clear(); allowStageFWrite=false; ignoreStageFWrite=false; dropGxAtStep=0xFFFFFFFF;
     stageEWrites.clear(); failStageEDword=0xFFFFFFFF;
     cfgWrites.clear(); failCfgDword=0xFFFFFFFF;
@@ -68,6 +85,12 @@ static ULONG Run(const std::vector<UCHAR>& f,BOOLEAN* keep) {
     WCHAR text[3072]={};
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),text,3072,keep);
 }
+static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep) {
+    WCHAR text[3072]={};
+    return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
+                          text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
+                          sqe.data(),static_cast<ULONG>(sqe.size()));
+}
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
     GMU_TEST* s=g_KeptGmu; assert(s);
@@ -77,6 +100,33 @@ static void ClearQuarantine() {
 }
 int main(int argc,char** argv) {
     std::vector<UCHAR> f=Image(); BOOLEAN keep=false;
+    // G-1 planning/copy uses the real region machinery without programming CP or starting CM3.
+    {
+        Reset(); auto sqe=SqeImage(); GMU_TEST mem={};
+        assert(GmuPlan(&mem,f.data(),static_cast<ULONG>(f.size())) && mem.Count==8);
+        assert(GmuG1Plan(&mem,sqe.data(),static_cast<ULONG>(sqe.size())-1)==STATUS_INVALID_PARAMETER && mem.Count==8);
+        auto invalid=sqe; invalid[4]=0;
+        assert(GmuG1Plan(&mem,invalid.data(),static_cast<ULONG>(invalid.size()))==STATUS_INVALID_PARAMETER && mem.Count==8);
+        GMU_TEST overlap={}; assert(GmuAdd(&overlap,0x70000000,0x10000,EPI_SMMU_READ));
+        assert(GmuG1Plan(&overlap,sqe.data(),static_cast<ULONG>(sqe.size()))==STATUS_CONFLICTING_ADDRESSES && overlap.Count==1);
+        assert(GmuG1Plan(&mem,sqe.data(),static_cast<ULONG>(sqe.size()))==0 && mem.Count==11);
+        for(ULONG i=0;i<3;++i) {
+            GMU_REGION* r=GmuFind(&mem,GmuG1Iova[i],GmuG1Size[i]); assert(r && r->Flags==GmuG1Flags[i]);
+            r->Va=GmuAlloc(r->Size,{0},{0xFFFFFFFFFLL},{0},0); assert(r->Va);
+            std::memset(r->Va,0,r->Size);
+        }
+        GMU_G1_TRACE trace=GmuG1Trace();
+        assert(GmuG1Copy(&mem,reinterpret_cast<HANDLE>(1),sqe.data(),&trace)==0);
+        assert(trace.SqeBytes==40492 && trace.SqeFirst==0x016DC094 && trace.SqeLast==0x12345678);
+        for(ULONG i=0;i<3;++i) {
+            GMU_REGION* r=GmuFind(&mem,GmuG1Iova[i],GmuG1Size[i]);
+            if(i==0) assert(std::memcmp(r->Va,sqe.data()+4,40492)==0);
+            const ULONG start=i==0 ? 40492 : 0;
+            for(ULONG j=start;j<r->Size;++j) assert(static_cast<UCHAR*>(r->Va)[j]==0);
+            GmuFree(r->Va,r->Size,0); r->Va=nullptr;
+        }
+        assert(allocations.empty());
+    }
     // Read-only GX probe: independent fixture order, complete count, and stopping before an unpersisted read.
     Reset();
     {
@@ -389,6 +439,29 @@ int main(int argc,char** argv) {
         assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_INVALID_DEVICE_STATE);
         assert(stageF.Reason==GX_REG_HM_OFF && stageF.Count==2 && stageF.Check[2]==0xFFFFFFFF && stageF.Check[3]==0xFFFFFFFF);
         dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0; allowStageFWrite=false;
+        // G-1 register setup: seven writes only, lo/hi order, diagnostic-only readbacks.
+        allowG1Writes=true; GMU_G1_TRACE g1=GmuG1Trace();
+        g1Writes.clear(); failGmuStep=0xFFFFFFFF;
+        for(ULONG i=0;i<7;++i) *GmuCfgReg(g1Dwords[i])=0x300+i;
+        assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==0 && g1.Count==7 && g1Writes.size()==7);
+        for(ULONG i=0;i<7;++i) {
+            assert(g1.Before[i]==0x300+i && g1.After[i]==g1.Value[i]);
+            assert(g1Writes[i].first==g1Dwords[i] && g1Writes[i].second==g1.Value[i]);
+        }
+        for(ULONG fail=0;fail<7;++fail) {
+            g1=GmuG1Trace(); g1Writes.clear(); failG1Dword=g1Dwords[fail];
+            for(ULONG i=0;i<7;++i) *GmuCfgReg(g1Dwords[i])=0x300+i;
+            assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==0 && g1.Count==7);
+            assert(g1.After[fail]==0x300+fail);
+        }
+        failG1Dword=0xFFFFFFFF;
+        for(ULONG fail=0;fail<7;++fail) {
+            g1=GmuG1Trace(); g1Writes.clear(); failGmuStep=0xC20+fail;
+            assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==STATUS_IO_DEVICE_ERROR);
+            assert(g1.Reason==6 && g1.Count==fail && g1Writes.size()==fail);
+            for(ULONG i=fail;i<7;++i) assert(g1.After[i]==0xFFFFFFFF);
+        }
+        allowG1Writes=false; failGmuStep=0xFFFFFFFF;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;
@@ -427,5 +500,29 @@ int main(int argc,char** argv) {
     ClearQuarantine();
     Reset(); resetFails=true; assert(Run(f,&keep)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu); ClearQuarantine();
     Reset();
+    // G-1 failures before CM3 release release every GPU allocation, unless Disable itself fails.
+    {
+        const auto sqe=SqeImage();
+        for(int fail=0;fail<13;++fail) {
+            Reset(); failAfter=fail;
+            const ULONG status=RunG1(f,sqe,&keep); failAfter=-1;
+            assert((status==EPI_GMU_E_NOMEM || status==EPI_GMU_E_SMMU_MAP) && !keep && allocations.empty());
+        }
+        for(ULONG i=0;i<3;++i) {
+            Reset(); failMapIova=GmuG1Iova[i];
+            assert(RunG1(f,sqe,&keep)==EPI_GMU_E_SMMU_MAP && !keep && allocations.empty());
+        }
+        Reset(); smmuEnableFails=true;
+        assert(RunG1(f,sqe,&keep)==EPI_GMU_E_SMMU_ENABLE && !keep && allocations.empty());
+        assert(testMaps.size()==11 && g1Writes.empty());
+        for(ULONG i=0;i<3;++i) {
+            assert(testMaps[8+i].Iova==GmuG1Iova[i] && testMaps[8+i].Size==GmuG1Size[i] && testMaps[8+i].Flags==GmuG1Flags[i]);
+        }
+        Reset(); smmuEnableFails=true; smmuDisableFails=true;
+        assert(RunG1(f,sqe,&keep)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu && !allocations.empty());
+        assert(g_KeptGmu->Smmu->gpuStreams);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
     std::puts("GMU tests passed: firmware regions, synthetic/real image load, allocation failures, boot timeout, reset and SMMU teardown quarantine.");
 }

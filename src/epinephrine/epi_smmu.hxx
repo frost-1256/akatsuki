@@ -14,6 +14,18 @@ struct EPI_SMMU;
 // Params is an optional borrowed Device Parameters key for flushed breadcrumbs.
 NTSTATUS EpiSmmuCreate(HANDLE Params, EPI_SMMU** Context);
 NTSTATUS EpiSmmuDestroy(EPI_SMMU* Context); // refuses while hardware may reference tables
+// Software-only opt-in before Enable. SMR1 ID0/mask0x400 and SMR2 ID1/mask0x400 share CB0.
+// SMR0 remains GMU ID5/mask0x400. Enable/Disable snapshot and restore both GPU SMR/S2CR pairs.
+NTSTATUS EpiSmmuConfigureGpuStreams(EPI_SMMU* Context);
+struct EPI_SMMU_GPU_STREAMS_TRACE {
+    ULONG Configured, SmrOriginal[2], S2crOriginal[2], SmrReadback[2], S2crReadback[2];
+    ULONG SmrDisabled[2], SmrRestored[2], S2crRestored[2];
+    NTSTATUS RestoreStatus;
+};
+static_assert(sizeof(EPI_SMMU_GPU_STREAMS_TRACE)==64,"SMMU GPU streams diagnostic ABI");
+// Array order is SMR/S2CR index 1, then 2. Configured=1 means the two-stream opt-in is enabled.
+// Software-only copy, retained across Disable. Unread values=0xFFFFFFFF; unattempted restore=STATUS_NOT_FOUND.
+NTSTATUS EpiSmmuQueryGpuStreams(EPI_SMMU* Context, EPI_SMMU_GPU_STREAMS_TRACE* Trace);
 
 // Disabled contexts only. Iova/Phys/Size must be 4KB aligned, Size nonzero.
 // Round firmware lengths UP before calling; caller owns the full padded allocation.
@@ -26,6 +38,7 @@ NTSTATUS EpiSmmuUnmap(EPI_SMMU* Context, ULONGLONG Iova, SIZE_T Size);
 // physical 0x03D7E000 (CM3_SYSRESET at offset 0). Both are borrowed and must
 // remain mapped/powered until Disable SUCCEEDS. CM3 must be reset, GX off.
 // Enable snapshots registers, installs stream 5 / mask 0x400 -> CB0 and syncs TLB.
+// ConfigureGpuStreams optionally adds GPU streams 0 and 1 / mask 0x400 -> CB0 using SMR1/2 and S2CR1/2.
 // Disable requires CM3 reset again; restores saved registers and syncs TLB.
 // After verified stream/CB disable and TLB sync, attempt all ConfigOffsets restores on readback mismatches.
 // Any failure retains ownership/tables; final SCTLR/SMR restores run only if every config restore succeeded.

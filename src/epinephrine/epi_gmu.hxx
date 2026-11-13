@@ -17,6 +17,9 @@
 #define EPI_GMU_PROBE_GX_CFG    0x40000UL // modifier: requires 0x3FE80 (0x7FE80 total), stage D without CP_AHB_CNTL
 #define EPI_GMU_PROBE_STAGE_E   0x80000UL // modifier: requires 0x7FE80 (0xFFE80 total), UBWC and CP protection
 #define EPI_GMU_PROBE_STAGE_F   0x100000UL // modifier: requires 0xFFE80 (0x1FFE80 total), CP_AHB_CNTL and four reads
+#define EPI_GMU_PROBE_G1        0x200000UL // modifier: requires 0x1FFE80 (0x3FFE80 total), GPU memory/streams and CP bases only
+#define EPI_GMU_SQE_FILE_SIZE   40496UL
+#define EPI_GMU_SQE_CODE_SIZE   40492UL
 
 // Result codes (EpiDiag GpuGmuStatus)
 #define EPI_GMU_OK              0           // FW init + all requested HFI ACKs succeeded, CM3 reset, teardown ok
@@ -33,6 +36,7 @@
 #define EPI_GMU_E_GBIF          11          // GBIF precondition/read/write/breadcrumb failed (CM3 never released)
 #define EPI_GMU_E_CLOCK         12          // clock setup failed (CM3 never released); failed restoration returns 8
 #define EPI_GMU_E_GX            13          // OOB/slumber/optional GX initialization failed, but safe teardown succeeded
+#define EPI_GMU_E_GPU_MEMORY    14          // G-1 firmware/IOVA preparation failed (CM3 never released)
 
 // EpiDiag GpuGmuBadIndex (REG_DWORD): zero-based setup index on failure, 0xFF for TCM copy failure,
 // 0xFFFFFFFF when neither failed. GpuGmuSetup (REG_BINARY): 19 records of five little-endian ULONGs
@@ -144,6 +148,16 @@
 // Reason 0..6 match GxReg; 8=stage E incomplete. Unread=0xFFFFFFFF; unattempted Status=STATUS_NOT_FOUND.
 // Breadcrumbs: 0xB00 before mapping, 0xB01 original read, 0xB02 write/immediate readback,
 // 0xB10..0xB13 before each Check read. Every breadcrumb flush is followed by a GX guard.
+// GpuGmuG1: 196 bytes {Requested, MemoryStatus, RegisterStatus, Reason, Count, Gdscr, GxHm,
+// SqeBytes, SqeFirst, SqeLast, Regions[3][6], Before[7], Value[7], After[7]}.
+// Regions (SQE/ring/RPTR): {Iova, PaddedSize, SmmuFlags, PhysLow, PhysHigh, Mapped} before teardown.
+// SQE 0x70000000/0xA000 RO, ring 0x70010000/0x8000 RW, RPTR 0x70020000/0x1000 privileged RW.
+// Code copies file[4..40495]; padding/ring/RPTR are zero. CPU/SMMU memory is Normal NC, matching existing mappings.
+// Registers: SQE_BASE lo/hi, RB_BASE lo/hi, RB_CNTL=0x20C, RB_RPTR_ADDR lo/hi; readbacks diagnostic only.
+// Count counts completed writes (0..7); Reason 0..6 match GxReg, 8=stage F incomplete.
+// Status fields are NTSTATUS, unattempted=STATUS_NOT_FOUND; unread values=0xFFFFFFFF.
+// Breadcrumbs: 0xC00 preparation, 0xC01 SQE copy, 0xC10..0xC16 original reads, 0xC20..0xC26 writes.
+// GpuSmmuGpuStreams: EPI_SMMU_GPU_STREAMS_TRACE (64 bytes), arrays ordered SMR/S2CR index 1, then 2.
 
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
@@ -168,4 +182,5 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi = FALSE,
                      BOOLEAN VoteGx = FALSE, BOOLEAN FastClock = FALSE, BOOLEAN GxOn = FALSE, BOOLEAN GxReg = FALSE,
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
-                     BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE);
+                     BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
+                     BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0);

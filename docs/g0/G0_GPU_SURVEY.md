@@ -1983,6 +1983,127 @@ shim/ホスト試験に、stage FでだけCP_AHB_CNTL書き込みを許す仕組
 - G-2 が成功すれば、CP の SQE が動き、GPU が初めて命令を実行したことになる。
 - G-2 の前に、stage F（`CP_AHB_CNTL`）を済ませる。
 
+#### 9.20.8 G-1の実装（実機未実行）
+
+bit21 `EPI_GMU_PROBE_G1=0x200000` を追加した。stage Fと全前提を必要とし、`EpiGpuProbe=0x3FFE80` で実行する。前提不足はワンショット解除・flush後にstatus 6で拒否する。G-2（bit22）は未実装として拒否する。今回の範囲には、ユーザー確認によりSMMU・メモリだけでなくCPの7レジスタ設定も含めた。CP_SQE_CNTL、CP_RB_WPTR、ME_INIT、zap、SECVID_TRUST_CNTLは追加していない。
+
+**SMMU：** `EpiSmmuConfigureGpuStreams()` は無効なコンテキストへのソフトウェア上の指定だけを行う。Enable時にGPU用SMR1（byte offset 0x804、ID 0／mask 0x401、値0x84010000）を追加し、S2CR1（0xC04、値0）でGMUと同じCB0・ページテーブルを共有する。ID 0/1とbit10付きの0x400/0x401を受け、GMUのID 5/0x405とは重ならない。GMUのSMR0は変更しない。既存の全SMR無効・全CB停止の前提確認も維持する。
+
+EnableはSMR1/S2CR1の元値も保存し、S2CR1設定→TLB同期→CB0/GMU SMR有効化→GPU SMR有効化の順に進める。DisableはGPU SMR無効化→GMU SMR無効化→CB停止→TLB同期→GPU S2CRと既存設定の復元→CB/SMR保存値の復元まで成功してから所有権を解放する。追加の比較にも最初の不一致記録を使う。追加の無効化・復元失敗でもctx・ページテーブル・データ・CXを保持し、後でDisableを再試行できる。既存のGpuSmmuDisableWritesは11項目のままで、S2CR1などの追加項目は後述の別診断に残す。
+
+**ファイルとメモリ：** `C:\Epinephrine\fw\a660_sqe.fw` を、GMUファイルと同じフォルダからCX窓に入る前に読む。ファイル長40,496、先頭DWORD 0、次のDWORD 0x016DC094を確認し、完全な読み取りに成功したときだけ進む。`GpuSqeFwStatus`はNTSTATUS、`GpuSqeFwLen`は完全に読み終えたファイル長。失敗時はGpuProbeStatus 8としてGPU_CC/CXの操作前に戻る。ファイルのソース用poolは別管理で、SQEを専用バッファへコピーした後はKeepCx時でも解放できる。
+
+| 用途 | IOVA | 確保・mapサイズ | SMMU属性 | 初期化 |
+|---|---|---|---|---|
+| SQE | 0x70000000 | 0xA000（40KB） | READのみ、GPU読み出し専用 | file[4..40495]の40,492バイトをコピーし、末尾468バイトを0 |
+| リング | 0x70010000 | 0x8000（32KB） | READ/WRITE | 全0 |
+| RPTR影 | 0x70020000 | 0x1000（1ページ） | READ/WRITE/PRIVILEGED | 全0、先頭4バイトを影として使う |
+
+今回は既存のEpiSmmuMapと整合させ、CPUとSMMUの両方をNormal non-cacheableとしている（LinuxのWCを新規導入しない）。物理メモリは既存と同じく連続・非ページ・36ビット未満。IOVAは4GB未満で、GmuPlanの全領域と3領域の追加前に重複検査する。既存領域に包含される場合も使い回さず拒否する。3領域はGMUと同じ所有リストに入り、部分的な確保/map失敗は通常のcleanupで取り消す。SMMU Disable失敗やGX OFF確認失敗では解放せず、成功時だけSMMUから外して解放する。
+
+**レジスタ：** メモリとGPUストリームは既存のSMMU Enableより前に準備する。stage F成功後、OOB解除前にSQE_BASE lo/hi、RB_BASE lo/hi、RB_CNTL=0x20C、RB_RPTR_ADDR lo/hiの順に7個を設定する。全元値を先に読み、各アクセス前にbreadcrumb保存・flushとGX確認を行う。要求値の上位DWORDはすべて0。読み戻しは診断専用で、不一致だけでは止めない。前段未完了なら書かずReason 8を残す。CPは起動しない。元値の復元は行わず、GX OFF後にメモリを片付ける。
+
+**診断：** `GpuGmuG1`はREG_BINARY・196バイト（49 DWORD）：`{Requested, MemoryStatus, RegisterStatus, Reason, Count, Gdscr, GxHm, SqeBytes, SqeFirst, SqeLast, Regions[3][6], Before[7], Value[7], After[7]}`。Regionsは上記SQE・リング・RPTRの順に `{Iova, PaddedSize, SmmuFlags, PhysLow, PhysHigh, Mapped}`。Mappedは解放前のスナップショットであり、成功終了後も割り当てが残る意味ではない。Countは完了したレジスタ書き込み数（最大7）、Reasonは0〜6が従来と同じ、8は前段未完了。NTSTATUSの未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。SQEのコピー後にバイト数と最初/最後のDWORDも保存する。メモリとIOVAの準備不成立に結果コード14（EPI_GMU_E_GPU_MEMORY）を追加した。確保失敗3、map失敗4、SMMU Enable失敗5、レジスタ設定だけの失敗13、後片付け失敗8は既存の扱いに従う。
+
+`GpuSmmuGpuStreams`はREG_BINARY・36バイト：`{Configured, SmrOriginal, S2crOriginal, SmrReadback, S2crReadback, SmrDisabled, SmrRestored, S2crRestored, RestoreStatus}`。SMR1/S2CR1の元値、設定・無効化・復元の生値を記録する。RestoreStatusはGPUストリームを含むDisable全体のNTSTATUSで、未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。G1診断はmap完了時、cleanup/keep、Disable直後に保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x420 | SQEファイル読み込み前 |
+| 0xC00 | G-1ファイル/IOVA計画 |
+| 0xC01 | SQEコピー前 |
+| 0xC10〜0xC16 | CP 7レジスタ元値読み取り前 |
+| 0xC20〜0xC26 | CP 7レジスタ書き込み・即時読み戻し |
+| 0x550 / 0x551 | GPU S2CR1設定 / SMR1有効化 |
+| 0x552 / 0x553 / 0x554 | GPU SMR1無効化 / S2CR1復元 / SMR1元値復元 |
+
+ホスト試験に、GPU用AP属性、SMRのID/maskと元値復元、GPU無効化・復元失敗時の保持、GPU有効化失敗時のrollback、IOVA衝突とファイル長/先頭の拒否、SQEの4バイト除外と末尾ゼロ、リング/影のゼロ、7書き込みの順序と不一致無視、breadcrumb停止、各確保とGPU map失敗時の解放、Disable失敗時に3バッファを保持するケースを追加した。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.20.9 結果（v59）
+
+**結果（2026-11-13、v34-akat、Epinephrine v59 / 20.0.2.59、`EpiGpuProbe=0x3FFE80`、10:18 の再起動後）：SMMU の Enable で停止。安全に後片付けまで通った** [P]。
+
+- 全体：
+  - `GpuGmuStatus=5`（EpiSmmuEnable の失敗）、NtStatus 0xC0000185（読み戻しの不一致）。
+  - KeepCx 0。`GpuGmuDisableStatus=0`。`GpuCxStatus=16`（GMU の試験が成功しなかったときの値）。
+  - GMU の CM3 は動かしていない。GX も ON にしていないので、stage F と G-1 のレジスタの段階には届いていない（stage F は Reason 1、G-1 の RegisterStatus は 0xC0000225、Before／After は未読の 0xFFFFFFFF）。
+- メモリの準備は成功した：
+  - MemoryStatus 0。SqeBytes 40492、SqeFirst 0x016DC094（ファイルの 2 dword 目）、SqeLast 0x0000008E。
+  - 3 つの領域は、どれも確保して SMMU に張れた：
+
+    | IOVA | 大きさ | flags | 物理アドレス |
+    |---|---|---|---|
+    | 0x70000000 | 0xA000 | 1（R） | 0x27FF9A000 |
+    | 0x70010000 | 0x8000 | 3（RW） | 0x27FF92000 |
+    | 0x70020000 | 0x1000 | 7（RW、特権） | 0x27FFE7000 |
+
+- **止まった場所：** `GpuSmmuBadWrite` = step 0x551、オフセット 0x804（SMR1）、書いた値 0x84010000、**読み戻し 0**。
+  - SMR1 への書き込みが受け付けられなかった。
+- `GpuSmmuGpuStreams`：
+  - SMR1 の元の値は 0。S2CR1 の元の値は 0x3F228BFF。
+  - S2CR1 への 0 の書き込みは受け付けられた（読み戻し 0）。
+  - Disable で SMR1 は 0、S2CR1 は 0x3F228BFF に戻った。RestoreStatus 0。
+- 解釈：
+  - SMR0 の 0x84000005（ID 5、mask 0x400）は、v30 以降ずっと書けている [P]。この値は DT の GMU の `iommus = <&adreno_smmu 5 0x400>` と同じ。
+  - 今回の SMR1 は ID 0、mask 0x401 で、DT の GPU の 2 項目（`0 0x400` と `1 0x400`）を 1 本にまとめた値。DT にそのままの組はない。
+  - SMMU の書き込みはハイパーバイザが検査しており、許可された（ID, mask）の組だけを通している可能性がある [U]。
+- 次の候補（文章だけ。実装はユーザー）：
+  - DT のとおりに、ID ごとに 1 本ずつ SMR を使う。SMR1 = 0x84000000（ID 0、mask 0x400）、SMR2 = 0x84000001（ID 1、mask 0x400）。S2CR1 と S2CR2 は CB0 に向ける。
+  - これも通らない場合は、SMR の番号（index）が制限されている可能性もある。そのときは、SMR に書いて読み戻すだけの独立した試験（GMU も GX も動かさない、§9.5 の 0x20 と同じ形）で、ID と mask の組と index を 1 つずつ確かめる。
+
+#### 9.20.10 GPUストリームをDTの2本へ分割（実機未実行）
+
+v59のSMR1読み戻し不一致を受け、GPU用SMRを結合しない形に変更した。SMR1（byte offset 0x804）はID 0／mask 0x400、値0x84000000、SMR2（0x808）はID 1／mask 0x400、値0x84000001とする。S2CR1（0xC04）とS2CR2（0xC08）はどちらも0でCB0へ向ける。GMUのSMR0=0x84000005、GPUメモリのIOVA・属性・コピー、G-1の7レジスタ設定、プローブ指定0x3FFE80は変更していない。ハイパーバイザによる組やindexの制約が原因かどうかは、引き続き未確認。
+
+Enable時には追加2組の元値をすべて保存し、S2CR1→S2CR2→既存のTLB同期・CB0/GMU有効化→SMR1→SMR2の順に進む。途中で失敗した場合は従来どおりDisableでrollbackする。DisableではGPU用SMR1/2の無効化を両方試み、1本でも確認に失敗したらCB0には進まず、ctx・テーブル・データ・CXを保持する。両方の無効化成功後はGMU SMR無効化→CB0停止→TLB同期→S2CR1/2と既存設定の復元へ進む。S2CRの読み戻し不一致があってももう一方の復元と既存の設定復元を試みる。すべて成功した場合だけ保存したSMR1/2へ戻して所有権を解放する。最初のWrite不一致の記録と、失敗時のKeepCx規則は維持する。
+
+`GpuSmmuGpuStreams`（REG_BINARY）は36バイトから**64バイト（16 DWORD）**へ変更した。形式は `{Configured, SmrOriginal[2], S2crOriginal[2], SmrReadback[2], S2crReadback[2], SmrDisabled[2], SmrRestored[2], S2crRestored[2], RestoreStatus}`。各配列の[0]はindex 1、[1]はindex 2。Configured=1はこの2本を有効にする指定。未読値0xFFFFFFFF、未試行RestoreStatus=STATUS_NOT_FOUND、RestoreStatusはDisable全体の結果という扱いは従来どおり。GpuGmuG1の196バイトとGpuSmmuDisableWritesの11項目は変更しない。
+
+| 操作 | index 1 のbreadcrumb | index 2 のbreadcrumb |
+|---|---|---|
+| S2CR設定（CB0へ） | 0x550 | 0x555 |
+| SMR有効化 | 0x551 | 0x556 |
+| SMR無効化 | 0x552 | 0x557 |
+| S2CR元値復元 | 0x553 | 0x558 |
+| SMR元値復元 | 0x554 | 0x559 |
+
+ホスト試験を2本のID/maskとCB0経路の確認、相互・GMUとの非重複、両組の元値復元、各GPUストリームの無効化失敗時の保持、片方のS2CR復元不一致でも他方を試みること、S2CR1/2とSMR1/2の設定失敗時のrollbackに更新した。独立したSMR試験はまだ追加していない。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.20.11 v60 実機結果（2026-11-13、0x3FFE80、GPU SMR 2本）
+
+- 版 20.0.2.60（oem118）。端末は 10:30 に再起動してから実行した。机上試験では `smmu_test.cxx:142` の C4389 だけを直した（定数に `UL` を付けただけ）。
+- **G-1 は最後まで成功した。**
+  - EpiGpuProbeStep 0xFFFF、GpuGmuStatus 0、GpuGmuNtStatus 0、GpuSmmuBadWrite は 0 バイト。
+  - GpuGmuKeepCx 0、GpuGmuDisableStatus 0、GpuCxStatus 0。デバイスは Started。
+- `GpuSmmuGpuStreams`（64 B）：
+  | 項目 | index 1 | index 2 |
+  |---|---|---|
+  | SMR 元の値 | 0 | 0 |
+  | S2CR 元の値 | 0x3FAAABFF | 0x2AAE59FF |
+  | SMR 読み戻し | **0x84000000** | **0x84000001** |
+  | S2CR 読み戻し | 0 | 0 |
+  | SMR 無効化後 | 0 | 0 |
+  | SMR 復元 | 0 | 0 |
+  | S2CR 復元 | 0x3FAAABFF | 0x2AAE59FF |
+  - Configured 1、RestoreStatus 0。
+  - SMR が無効な間の S2CR の元の値は起動ごとに変わる（v59 の S2CR1 は 0x3F228BFF）。意味のない残り値と見てよい [P]。
+- 解釈：DT のとおりの（ID 0, mask 0x400）と（ID 1, mask 0x400）は受け付けられた。v59 で読み戻しが 0 になったのは、2 本をまとめた mask 0x401 の値だった。ハイパーバイザが DT の組だけを許しているという仮説と合う [P]。index 1 と 2 は使えた。
+- `GpuGmuG1`（196 B）：
+  - Requested 1、MemoryStatus 0、RegisterStatus 0、Reason 0、Count 7。
+  - Gdscr 0xF8222800、GxHm 0。
+  - SqeBytes 0x9E2C（40492）、SqeFirst 0x016DC094、SqeLast 0x8E。
+  - 3 つの領域はすべて Mapped=1：
+    | 領域 | IOVA | サイズ | 属性 | PA |
+    |---|---|---|---|---|
+    | SQE | 0x70000000 | 0xA000 | 1 | 0x2_7FFA1000 |
+    | RB | 0x70010000 | 0x8000 | 3 | 0x2_7FF99000 |
+    | RPTR | 0x70020000 | 0x1000 | 7 | 0x2_7FF98000 |
+  - 7 個の CP レジスタ（SQE_INSTR_BASE lo/hi、RB_BASE lo/hi、RB_CNTL、RPTR_ADDR lo/hi）：
+    - 書く前はすべて 0。
+    - 書いた値は {0x70000000, 0, 0x70010000, 0, 0x20C, 0x70020000, 0}。
+    - 読み戻しはすべて一致した。
+- 次は G-2（§9.20.7）：CP_SQE_CNTL=1、ME_INIT 9 dword、WPTR=9、idle 待ち。仕様は文章だけで示し、実装はユーザーが行う。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

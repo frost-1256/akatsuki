@@ -101,5 +101,62 @@ int main() {
     dropOffset=0xFFFFFFFF; assert(EpiSmmuDisable(c)==0);
     assert(EpiSmmuUnmap(c,0x4000,0xE000)==0);
     assert(EpiSmmuDestroy(c)==0); assert(allocations.empty() && Owner==nullptr);
+    // GPU IDs 0/1 use separate DT-compatible SMRs, sharing CB0 without matching each other or GMU ID5.
+    Baseline(); c=NewMapped();
+    assert(EpiSmmuConfigureGpuStreams(c)==0);
+    assert(EpiSmmuMap(c,0x70000000,{0xA0000000},0xA000,EPI_SMMU_READ)==0);
+    assert(EpiSmmuMap(c,0x70010000,{0xA0010000},0x8000,EPI_SMMU_READ|EPI_SMMU_WRITE)==0);
+    assert(EpiSmmuMap(c,0x70020000,{0xA0020000},0x1000,EPI_SMMU_READ|EPI_SMMU_WRITE|EPI_SMMU_PRIVILEGED)==0);
+    assert((Walk(c,0x70000000)&0xC0)==0xC0); // SQE RO, unprivileged reads allowed
+    assert((Walk(c,0x70010000)&0xC0)==0x40); // ring RW
+    assert((Walk(c,0x70020000)&0xC0)==0); // RPTR privileged RW
+    mmio[0x804/4]=0x44; mmio[0xC04/4]=0x200;
+    mmio[0x808/4]=0x88; mmio[0xC08/4]=0x300;
+    assert(EpiSmmuEnable(c,cc,gmu)==0);
+    assert(mmio[0x800/4]==0x84000005 && mmio[0x804/4]==0x84000000 && mmio[0xC04/4]==0);
+    assert(mmio[0x808/4]==0x84000001 && mmio[0xC08/4]==0);
+    for(ULONG i=0;i<2;++i) {
+        const ULONG smr=mmio[(0x804+i*4)/4], mask=(smr>>16)&0x7FFF, id=smr&0x7FFF;
+        assert(mask==0x400 && id==i && ((i^id)&~mask)==0 && (((i|0x400)^id)&~mask)==0);
+        assert((((i^1)^id)&~mask)!=0 && ((5^id)&~mask)!=0);
+    }
+    assert(EpiSmmuConfigureGpuStreams(c)==STATUS_DEVICE_BUSY);
+    // Failed invalidation must leave ownership/tables pinned, before disabling CB0.
+    dropOffset=0x804; dropAlways=true;
+    assert(EpiSmmuDisable(c)==STATUS_IO_DEVICE_ERROR && Owner==c && mmio[Cb/4]==0x1127);
+    assert(mmio[0x808/4]==0x88); // the other GPU stream is still invalidated on this failure
+    assert(EpiSmmuDestroy(c)==STATUS_DEVICE_BUSY);
+    // Failed S2CR1 restore leaves both streams invalid and the CB stopped, and remains retryable.
+    dropOffset=0xC04;
+    assert(EpiSmmuDisable(c)==STATUS_IO_DEVICE_ERROR && Owner==c && mmio[Cb/4]==0);
+    assert(!(mmio[0x800/4]&0x80000000) && !(mmio[0x804/4]&0x80000000) && !(mmio[0x808/4]&0x80000000));
+    assert(mmio[0xC08/4]==0x300); // S2CR2 restore is attempted despite the S2CR1 mismatch
+    dropOffset=0xFFFFFFFF;
+    assert(EpiSmmuDisable(c)==0 && Owner==nullptr);
+    assert(mmio[0x804/4]==0x44 && mmio[0xC04/4]==0x200);
+    assert(mmio[0x808/4]==0x88 && mmio[0xC08/4]==0x300);
+    EPI_SMMU_GPU_STREAMS_TRACE streams={};
+    assert(EpiSmmuQueryGpuStreams(c,&streams)==0 && streams.RestoreStatus==0);
+    for(ULONG i=0;i<2;++i) {
+        assert(streams.SmrReadback[i]==(0x84000000|i) && streams.S2crReadback[i]==0);
+        assert(streams.SmrRestored[i]==(i==0 ? 0x44UL : 0x88UL) && streams.S2crRestored[i]==(i==0 ? 0x200UL : 0x300UL));
+    }
+    // The second GPU stream has the same retention and retry rules.
+    assert(EpiSmmuEnable(c,cc,gmu)==0); dropOffset=0x808; dropAlways=true;
+    assert(EpiSmmuDisable(c)==STATUS_IO_DEVICE_ERROR && Owner==c && mmio[Cb/4]==0x1127);
+    assert(mmio[0x804/4]==0x44 && EpiSmmuDestroy(c)==STATUS_DEVICE_BUSY);
+    dropOffset=0xFFFFFFFF; assert(EpiSmmuDisable(c)==0);
+    assert(EpiSmmuEnable(c,cc,gmu)==0); dropOffset=0xC08;
+    assert(EpiSmmuDisable(c)==STATUS_IO_DEVICE_ERROR && Owner==c && mmio[Cb/4]==0);
+    dropOffset=0xFFFFFFFF; assert(EpiSmmuDisable(c)==0);
+    // Failure in either GPU S2CR/SMR setup rolls back both pairs and the GMU path.
+    const ULONG setupFailures[]={0xC04,0xC08,0x804,0x808};
+    for(ULONG off:setupFailures) {
+        dropOffset=off; dropAlways=false;
+        assert(EpiSmmuEnable(c,cc,gmu)==STATUS_IO_DEVICE_ERROR && c->Regs==nullptr && Owner==nullptr);
+        assert(mmio[0x804/4]==0x44 && mmio[0xC04/4]==0x200);
+        assert(mmio[0x808/4]==0x88 && mmio[0xC08/4]==0x300);
+    }
+    assert(EpiSmmuDestroy(c)==0 && allocations.empty());
     std::puts("SMMU tests passed: descriptors, permissions, boundaries, rollback, faults, TLB timeout, restoration.");
 }

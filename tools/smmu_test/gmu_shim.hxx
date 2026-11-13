@@ -51,6 +51,10 @@ static ULONG failStageEDword=0xFFFFFFFF;
 static bool allowStageFWrite=false, ignoreStageFWrite=false;
 static std::vector<ULONG> stageFWrites;
 static ULONG dropGxAtStep=0xFFFFFFFF;
+static std::vector<std::pair<ULONG,ULONG>> g1Writes;
+static bool allowG1Writes=false;
+static ULONG failG1Dword=0xFFFFFFFF;
+static const ULONG g1Dwords[]={0x830,0x831,0x800,0x801,0x802,0x804,0x805};
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -105,6 +109,12 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
+    assert(p!=GmuCfgReg(0x808) && p!=GmuCfgReg(0x807)); // no SQE start / WPTR publication in G-1
+    for(ULONG i=0;i<7;++i) if(p==GmuCfgReg(g1Dwords[i])) {
+        assert(allowG1Writes); g1Writes.push_back({g1Dwords[i],v});
+        if(g1Dwords[i]==failG1Dword) return;
+        break;
+    }
     if(p==GmuCfgReg(0x98D)) {
         assert(allowStageFWrite); stageFWrites.push_back(v);
         if(ignoreStageFWrite) return;
