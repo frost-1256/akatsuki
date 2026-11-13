@@ -4471,6 +4471,258 @@ v76（20.0.2.76、oem134）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuPro
 
 **次：** T-1（texture）。より細かい時間を測るなら、`KeQueryPerformanceCounter` を使う。
 
+#### 9.21.47 T-1 の提案：texture を貼った正方形を画面に描く（文章仕様、未実装）
+
+A-1 の後に、8×8 texel の texture を最近傍（NEAREST）で sample して、A-1 の角度 0 と同じ位置に正方形を描く。初めて TP（texture 処理部）を使う段階で、次の 4 つを確かめる。
+
+- texture 記述子（TEX_CONST）と sampler（TEX_SAMP）を `CP_LOAD_STATE6_FRAG` で読ませる。
+- FS の texture prefetch（`SP_FS_PREFETCH_CMD`）で sample する。
+- 線形の texture 配置（pitch を含む）を正しく読む。
+- 8 bit UNORM の値を、そのまま書き戻す。
+
+表示は D-1 / V-1 / A-1 と同じ band と 2 パス方式で行う。
+
+**手本：** Turnip の blit 経路（`tu_clear_blit.cc` の `r3d_src_common` / `r3d_src_buffer` と `build_blit_fs_shader`）。
+
+- blit の FS は「varying VAR0 の 2 成分で texture を 1 回 sample して、そのまま出力する」だけである。ir3 はこれを texture prefetch にして、shader 本体は `(sy)end` だけになる。
+- sampler は NEAREST、CLAMP_TO_EDGE、`UNNORM_COORDS`（座標を texel 単位で渡す）で、word0 に blob と同じ 0x60000 を足す。
+- 記述子と sampler は `SS6_INDIRECT` で読ませ、同じアドレスを `SP_FS_TEX_SAMP` / `SP_FS_TEX_CONST` にも書く。`SP_FS_TEX_COUNT` は 1。
+- T-1 はこの組み合わせを、そのまま固定値で書く。
+
+**前提の事実：**
+- 状態は V-1 の IB7 が設定したものを引き継ぐ。A-1 の IB8 は CACHE_INVALIDATE と pass ごとの register しか書いていない。
+  - VFD 2 属性（attr1 = r1.xyzw）、VPC の var0 を loc 0..3、HLSQ_CONTROL_3 の IJ_PERSP_PIXEL = r0.x、GRAS_CNTL / RB_RENDER_CONTROL0 の IJ、`SP_FS_OUTPUT_REG[0]` = r1.x、TRILIST をそのまま使う。
+  - V-1 では var0 に色 (B, G, R, 1) を入れていた。T-1 では同じ場所に texel 座標 (s, t, 0, 1) を入れる。
+- prefetch は var0 の 2 成分（loc 0, 1）を IJ r0.x で補間し、sample の結果を r1.xyzw に書いてから shader を始める。Turnip は「prefetch があるとき IJ_PERSP_PIXEL は r0.x でなければならない」としていて、V-1 の配置はこれを満たす。
+- 枠バッファの書き方は、MRT の x 成分がメモリの byte 0 に入る（V-1 で確認済み。x に B を入れると画面の青になる）。texture も FMT6_8_8_8_8_UNORM / WZYX で byte 0 を x として読む。したがって、**texel の dword がそのまま画素の dword になる**。UNORM8 → float → UNORM8 の往復は誤差なしなので、期待値は texel の値そのもの（許容 0）である。
+- ring は A-1 の後で WPTR 2278。T-1 の packet は 9 dw で、dword 2278..2286 を使い、WPTR は **2287** で終わる。折り返さない。
+
+**絵：**
+- 正方形は A-1 の角度 0 と同じで、view 座標で (460, 24)〜(620, 104)、実際の画素で列 460..619、行 1120..1279（v 24..103）。背景は描かない。箱の残りは、A-1 の復元後の内容がそのまま残る。
+- 三角形 2 枚 (0,1,2)、(0,2,3)。1 回の draw は 6 頂点。隅 0..3 は左上・右上・右下・左下で、texel 座標は (0,0)、(8,0)、(8,8)、(0,8)。`UNNORM_COORDS` なので、s / t は 0..8 の texel 単位になる。
+- 1 texel は、横 20 列 × 縦 10 view 行（実際は 20 行）になる。画素中心と texel 境界の距離は最小でも s 方向 0.025 texel、t 方向 0.05 texel である。補間と TP の座標精度（1/256 texel 程度）に比べて十分大きく、最近傍の結果は一意に決まる。
+- texel (i, j)（i が列、j が行、j = 0 が上）の値は `0xFF000000 | (32i+16)<<16 | (32j+16)<<8 | ((i+j)&1 ? 0xC0 : 0x40)` とする。R が列、G が行、B が市松模様になる。64 texel はすべて違う値で、左右・上下の反転や転置は値から分かる。
+- texture の 1 行は 64 B で、8 texel（32 B）の後の 8 dword を詰め物 `0xFFFF00FF` で埋める。pitch を 32 B と誤って読むと、詰め物の色（R = FF）が出るので見分けられる。
+
+**配置**（どれも ring の中で、A-1 までの走査で 0 であることを確認している範囲）：
+
+| 項目 | 場所 | 内容 |
+|---|---|---|
+| IB9 | 0x70016400（107 dw、32 packet） | 下表 |
+| FS4 | 0x70016880（32 dw = 128 B） | `00000000 13000000`（`(sy)end`）。残り 30 dw は 0（nop） |
+| VB C | 0x70016900（48 dw = 6 頂点 × 32 B） | パス A |
+| VB D | 0x700169C0（48 dw） | VB C の x を +8 したもの |
+| TEX_CONST | 0x70016A80（16 dw、64 B 境界） | `0C006880 00040008 20002000 0 70016C00 0` と、残り 10 dw は 0 |
+| TEX_SAMP | 0x70016AC0（4 dw、16 B 境界） | `00060920 00000060 0 0` |
+| 境界色表 | 0x70016B00（128 B、128 B 境界） | すべて 0。CLAMP_TO_EDGE では使わないが、`SP_TP_BORDER_COLOR_BASE_ADDR` / `SP_PS_TP_BORDER_COLOR_BASE_ADDR` に未 map のアドレスを残さないために置く |
+| texture | 0x70016C00（512 B = 8 行 × 64 B） | 上の texel と詰め物 |
+| data[26..27] | 0x70017068 / 6C | パス A / B の PC_CCU_FLUSH_COLOR_TS：0xCAFE0017 / 0xCAFE0018 |
+| data[28] | 0x70017070 | ring の CACHE_FLUSH_TS：0xCAFE0019 |
+
+- VB の 1 頂点は `x, v, 0, 1.0, s, t, 0, 1.0`。パス A の 6 頂点は、隅 0,1,2,0,2,3 の順に次の値を並べる。
+  - 隅 0：`43E60000 41C00000 0 3F800000 0 0 0 3F800000`
+  - 隅 1：`441B0000 41C00000 0 3F800000 41000000 0 0 3F800000`
+  - 隅 2：`441B0000 42D00000 0 3F800000 41000000 41000000 0 3F800000`
+  - 隅 3：`43E60000 42D00000 0 3F800000 0 41000000 0 3F800000`
+- パス B は x だけ +8 する（460 → 468 は `43EA0000`、620 → 628 は `441D0000`）。
+
+**記述子の中身：**
+- **TEX_CONST word0：** `0x0C006880`。内訳は FMT 0x30（FMT6_8_8_8_8_UNORM）、SWAP WZYX、SWIZ X/Y/Z/W、TILE6_LINEAR、MIPLVLS 0。
+- **TEX_CONST word1〜5：**
+  - word1 `0x00040008`：WIDTH 8、HEIGHT 8。
+  - word2 `0x20002000`：PITCH 64 B、TYPE A6XX_TEX_2D、PITCHALIGN 0。
+  - word3 は 0。
+  - word4 / 5 は BASE 0x70016C00 / 0。
+- **TEX_SAMP：**
+  - word0 `0x00060920`：XY_MAG / XY_MIN は NEAREST、WRAP_S/T/R は CLAMP_TO_EDGE、0x60000 は blob と同じ値。
+  - word1 `0x60`：UNNORM_COORDS、MIPFILTER_LINEAR_FAR。
+- **`SP_FS_PREFETCH_CMD[0]`：** `0x23C40000`（A6XX の bit 配置）。内訳は SRC = inloc 0、SAMP_ID 0、TEX_ID 0、DST = r1.x（regid 4）、WRMASK 0xF、HALF 0、BINDLESS 0、CMD = TEX_PREFETCH_SAM（1）。
+- **`SP_FS_PREFETCH_CNTL`：** 1（COUNT 1。IJ_WRITE_DISABLE は立てない）。
+- **`SP_FS_CONFIG`：** `0x20300`（ENABLED、NTEX 1、NSAMP 1）。INSTRLEN は 1。
+- **`SP_FS_CTRL_REG0`：** `0x85400100`。V-1 の 0x81400100 に PIXLODENABLE（bit26）を足す。Turnip は、暗黙の LOD を使う sample のとき `need_pixlod` でこの bit を立てる。T-1 は mip が 1 段なので LOD は結果に影響しないが、手本に合わせる。
+- **`CP_LOAD_STATE6_FRAG`：** sampler は `0x00520000`（ST6_SHADER、SS6_INDIRECT、SB6_FS_TEX、1 unit）、texture は `0x00524000`（ST6_CONSTANTS）。FS 本体の `0x00720000` と同じ並びで、STATE_BLOCK を 0xC から 0x4 に変えたものである。
+
+**IB9：**
+
+| # | 群 | dw | packet | header | 値 | 内容 |
+|---|---|---|---|---|---|---|
+| 1 | S | 0 | pkt7 0x46 ×1 | 0x70460001 | 0x31 | CP_EVENT_WRITE CACHE_INVALIDATE (texture, descriptors and VB were written by the CPU) |
+| 2 | S | 2 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 3 | S | 3 | pkt4 0xBB08 ×1 | 0x40BB0801 | 0xBF | HLSQ_INVALIDATE_CMD |
+| 4 | S | 5 | pkt4 0xAB04 ×2 | 0x48AB0402 | 0x20300、1 | SP_FS_CONFIG (ENABLED, NTEX=1, NSAMP=1), SP_FS_INSTRLEN=1 |
+| 5 | S | 8 | pkt4 0xA980 ×1 | 0x40A98001 | 0x85400100 | SP_FS_CTRL_REG0 (V-1 value + PIXLODENABLE) |
+| 6 | S | 10 | pkt4 0xA982 ×7 | 0x48A98207 | 0、0x70016880、0、0、0、0、0 | SP_FS_OBJ_FIRST_EXEC_OFFSET, OBJ_START lo/hi, PVT_MEM_* |
+| 7 | S | 18 | pkt7 0x34 ×3 | 0x70348003 | 0x720000、0x70016880、0 | CP_LOAD_STATE6_FRAG (SB6_FS_SHADER, 1 unit, FS4) |
+| 8 | S | 22 | pkt4 0xB302 ×2 | 0x48B30202 | 0x70016B00、0 | SP_TP_BORDER_COLOR_BASE_ADDR (zeroed 128 B; never used by CLAMP_TO_EDGE) |
+| 9 | S | 25 | pkt4 0xB180 ×2 | 0x40B18002 | 0x70016B00、0 | SP_PS_TP_BORDER_COLOR_BASE_ADDR |
+| 10 | S | 28 | pkt7 0x34 ×3 | 0x70348003 | 0x520000、0x70016AC0、0 | CP_LOAD_STATE6_FRAG (ST6_SHADER = sampler, SS6_INDIRECT, SB6_FS_TEX, 1 unit) |
+| 11 | S | 32 | pkt4 0xA9E0 ×2 | 0x40A9E002 | 0x70016AC0、0 | SP_FS_TEX_SAMP lo/hi |
+| 12 | S | 35 | pkt7 0x34 ×3 | 0x70348003 | 0x524000、0x70016A80、0 | CP_LOAD_STATE6_FRAG (ST6_CONSTANTS = texture, SS6_INDIRECT, SB6_FS_TEX, 1 unit) |
+| 13 | S | 39 | pkt4 0xA9E4 ×2 | 0x48A9E402 | 0x70016A80、0 | SP_FS_TEX_CONST lo/hi |
+| 14 | S | 42 | pkt4 0xA9A7 ×1 | 0x40A9A701 | 1 | SP_FS_TEX_COUNT |
+| 15 | S | 44 | pkt4 0xA99E ×2 | 0x40A99E02 | 1、0x23C40000 | SP_FS_PREFETCH_CNTL (COUNT=1, IJ write enabled), SP_FS_PREFETCH_CMD[0] |
+| 16 | S | 47 | pkt4 0xA9A3 ×1 | 0x48A9A301 | 0 | SP_FS_BINDLESS_PREFETCH_CMD[0] |
+| 17 | A | 49 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x19C、0x7F029B | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 18 | A | 52 | pkt4 0x840A ×2 | 0x48840A02 | 0x19C、0x7F029B | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 19 | A | 55 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x19C、0x7F029B | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 20 | A | 58 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70016900、0、0xC0、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 21 | A | 63 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71008A00、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 22 | A | 68 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、6 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 6 vertices) |
+| 23 | A | 72 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017068、0、0xCAFE0017 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[26] |
+| 24 | A | 77 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 25 | B | 78 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x1A4、0x7F02A3 | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 26 | B | 81 | pkt4 0x840A ×2 | 0x48840A02 | 0x1A4、0x7F02A3 | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 27 | B | 84 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x1A4、0x7F02A3 | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 28 | B | 87 | pkt4 0xA010 ×4 | 0x40A01004 | 0x700169C0、0、0xC0、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 29 | B | 92 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71009AC0、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 30 | B | 97 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、6 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 6 vertices) |
+| 31 | B | 101 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x7001706C、0、0xCAFE0018 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[27] |
+| 32 | B | 106 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+- 32 packet の register はすべて、`prot.py` で CP_PROTECT の範囲外であることを確認した。
+- ring packet は `70BF8003 70016400 00000000 0000006B 70460004 00000004 70017070 00000000 CAFE0019`。
+
+**手順（A-1 の復元の後、OOB 解除前）：**
+1. 前段：次がすべて成り立つことを確かめる。不成立なら Reason 8 / 12 / 15 で未投入とする。
+   - A-1 の Status が成功、Reason 0、Checks 0x3F、FramesDone 241。
+   - WPTR / RPTR / shadow 2278、data[23..25] = CAFE0015 / CAFE0016 / A10000F0、MASK 0。
+   - ring[0..2277] と既存の IB / シェーダ / 頂点 / data[0..25] が照合で一致する。
+   - **ring[2278..2286] と T-1 の置き場所（0x6400..0x6800、0x6880..0x6E00）がすべて 0**。
+2. band の map と退避は A-1 と同じ。A-1 の復元後の band を改めて退避する。
+3. 準備：IB9、FS4、VB C/D、TEX_CONST、TEX_SAMP、境界色表、texture を書く。data[26..28] は 0xFFFFFFFF にする。どれも読み返して照合する。
+4. バリアを置き、ring[2278..2286] に packet を書き、もう一度バリアを置いて、WPTR = 2287 を書く。
+5. data[28] == 0xCAFE0019 かつ RPTR == WPTR == shadow == 2287、RBBM / CX_BUSY が idle になるまで待つ。上限は A-1 の 1 フレームと同じ 100 ms。
+6. 判定して、**5 秒保持**してから復元する。保持中の画面には、市松模様のグラデーションの正方形が出る。左上が暗い青緑、右へ行くほど赤、下へ行くほど緑が強くなる。
+7. 復元と照合は D-1 と同じ。途中で止まった場合も、band を map できていれば必ず復元する。
+
+**期待画像（整数だけで計算）：**
+- 各パリティ（偶数行・奇数行）を次の 2 つに分ける。辺の上に来る画素はない。正方形の辺は整数座標で、画素中心は .5 なので、どちらかに必ず入る。
+  - **正方形：** `460 ≤ 列 ≤ 619` かつ `24 ≤ v ≤ 103` の **12800** 画素。期待値は `texel((列−460)/20, (v−24)/10)`（整数除算）で、許容 **0**（完全一致）。
+  - **箱の残り：** 箱（列 412..667、v 0..127）のうち正方形の外の **19968** 画素。退避値と同じであること。
+- 箱の外の band も、退避値と同じであること。
+- 標本（偶数行・奇数行の両方を読む）：
+
+| 列 | v | 行 | texel | 期待値 |
+|---|---|---|---|---|
+| 470 | 29 | 1130 | (0,0) | 0xFF101040 |
+| 610 | 29 | 1130 | (7,0) | 0xFFF010C0 |
+| 610 | 99 | 1270 | (7,7) | 0xFFF0F040 |
+| 470 | 99 | 1270 | (0,7) | 0xFF10F0C0 |
+| 530 | 59 | 1190 | (3,3) | 0xFF707040 |
+| 550 | 74 | 1220 | (4,5) | 0xFF90B0C0 |
+| 479 | 33 | 1138 | (0,0) | 0xFF101040（texel 境界の直前） |
+| 480 | 34 | 1140 | (1,1) | 0xFF303040（texel 境界の直後） |
+| 414 | 2 | 1076 | — | 退避値（箱の中、正方形の外） |
+| 665 | 125 | 1322 | — | 退避値 |
+
+**probe：** `EpiGpuProbe2` の bit4 を T-1 とする。T-1 は bit0..3 を必要とし、実行値は Probe 0xBFFFFE80 + Probe2 **31**。許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15, 31} だけ（0 以外は Probe 0xBFFFFE80 のときだけ）。それ以外は status 6。
+
+**判定（Checks）：**
+- bit0：A-1 成功（前段の条件すべて）。
+- bit1：data[28] = 0xCAFE0019、idle、RPTR / WPTR / shadow 2287、エラー割り込みなし、IB1 の残り 0。
+- bit2：data[26] = 0xCAFE0017、data[27] = 0xCAFE0018。
+- bit3：正方形が偶数行・奇数行とも 12800 画素すべて期待値と完全に一致する。
+- bit4：箱の残りが両パリティとも 19968 画素すべて退避値と同じで、かつ箱の外の band も退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**診断 `GpuGmuT1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`AChecks`、`AReason`。
+- 照合結果：`IbBadCount / IbFirstBad / IbBadValue`、`DescBad`（TEX_CONST / TEX_SAMP / FS4 / VB / texture の読み返しの不一致数）。
+- 正方形：`SqGoodEven / SqGoodOdd / SqBad / SqFirst / SqValue / SqExpected`、`MaxErr[3]`。
+- `TexelBad[2]`：64 texel ごとの不一致の bit 表（bit = j*8+i）。
+- `SqZero`：値が 0x00000000 / 0xFF000000 だった画素の数。prefetch が何も書かない場合の目印にする。
+- `SqPad`：値が詰め物 0xFFFF00FF だった画素の数。pitch の誤りの目印にする。
+- 箱の残りと箱の外：`BoxGoodEven / BoxGoodOdd / BoxBad / BoxFirst / BoxValue / BoxOld`、`OutsideChanged / OutsideFirst / OutsideOld / OutsideNew`。
+- `Sample[20]`：上の 10 標本の偶数行と奇数行の値（標本ごとに偶数、奇数の順）。
+- レジスタと状態：`DataAfter[3]`（data[26..28]）、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`、`FenceUs`。
+- `ScanCount / ScanFirst / ScanDwords`：A-1 と同じ走査。除外に、ring packet `off < 2287×4`、`[0x6400, 0x6800)`、`[0x6880, 0x6E00)`、data `[0x7000, 0x7074)` を加える。
+- 後始末：`RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- breadcrumb は 0x1C00 番台。
+
+**失敗したときの見分け方と次の手：**
+- **SMMU fault が出て、FAR が T-1 の範囲外の場合：** TP がどこを読みに行ったかを FAR で見る。境界色表のアドレスなら、境界色表の大きさや置き場所を見直す。
+- **正方形が全部 0 / 0xFF000000（SqZero）の場合：** prefetch が動いていない。
+  - 第 1 案：`SP_FS_CTRL_REG0` の PIXLODENABLE を外す。
+  - 第 2 案：FS を `bary.f` 2 回 + cat5 `sam` + `(sy)end` にした T-1b に切り替える（cat5 の encoding は ir3-cat5.xml で別に確かめる）。
+- **一部の texel だけ違う、または値が転置・反転している場合：** TexelBad と SqValue から、座標の割り当て（s / t、j の向き）を直す。
+- **SqPad が出る場合：** PITCH の単位を見直す。
+- **色の順が入れ替わっている（R と B など）場合：** TEX_CONST の SWAP / SWIZ を直す。
+
+**危険と対策：**
+- 時間：StartDevice の中で、D-1 の 5 秒、V-1 の 5 秒、A-1 の約 10 秒に、T-1 の 5 秒が加わり、約 25 秒になる。start の失敗や bugcheck 0x9F の兆候が出たら、T-1 の保持を 2 秒にするか、A-1 の FRAMES を減らす。
+- TP が読むのは、ring の中の T-1 の領域（記述子、sampler、境界色表、texture）だけである。どれも既存の SMMU map の中にある。追加の region はない。
+- 書き込み先は、これまでと同じく scissor で箱に限られる。
+
+**生成器：** scratchpad の `tools/t1ib.py`。IB9 の dword 一覧は `t1_ib9.txt` にある。VB / TEX_CONST / TEX_SAMP / texture の値も、同じ生成器が出力する。
+
+**この後：** T-1 が通れば、A-1 の回転と組み合わせて、texture を貼った正方形を回せる。その後は、GMEM（tile 描画）か、ring の折り返しと IB の ring 外への移動に進む。
+
+
+#### 9.21.48 T-1 の実装（実機未実行）
+
+§9.21.47 を実装した。実行値は `EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=31`。Probe2 は 0 / 1 / 3 / 7 / 15 / 31 だけを許し、0以外は Probe が上記と完全一致する必要がある。T-1 は A-1 までの全段を必須とし、同じ OOB の中、A-1 の復元後に実行する。
+
+A-1 の成功、Reason 0、Checks 3F、FramesDone 241、WPTR 2278、data[23..25] と復元成功を確認する。さらに native RPTR / WPTR / shadow 2278、MASK 0、既存 ring / IB / shader / 頂点 / data、D-0 と外部 band の情報を照合する。ring[2278..2286] と 6400..6800 / 6880..6E00 の未使用領域は全語0を要求する。親の失敗は Reason 8、状態不一致は12、MASK 不一致は15で未投入になる。
+
+band を改めて CPU map・退避し、IB9、FS4、VB C/D、TEX_CONST、TEX_SAMP、ゼロの境界色表128 B、texture と詰め物、data[26..28]、ring packet を準備する。すべて読み返して照合し、IB の不一致は専用3項目、FS / VB / descriptor / sampler / 境界色表 / texture の不一致は DescBad に語数を記録する。どれかが違えば投入しない。領域は既存 ring 内だけで、SMMU の追加 region はない。
+
+WPTR=2287 を投入し、従来の AHB fenced write 再送と、その投入から合計100 msの完了待ちを行う。固有の data[28]、native RPTR / WPTR / shadow、RBBM / CX_BUSY の idle、IB1 残り0を要求し、GX・MASK・エラー割り込みも待ちの間に確認する。Reason 16 は100 ms時間切れ、10はAHBの2 ms時間切れである。FenceUs は KeQueryInterruptTime で測り、AHB 再送も含む。
+
+判定は整数だけで、正方形内を64 texelの期待値と完全一致で比べる。許容誤差は0で、MaxErr は診断にだけ使う。箱の残りと箱の外は退避値との完全一致を要求する。完了後に5秒保持し、全域を復元・照合する。待ちや後続の診断に失敗した場合は保持を省略して復元へ進む。退避済みなら breadcrumb / GX 確認の失敗時も復元と CPU unmap を省略しない。trace は GMU_BOOT_TRACES のプールメンバとしてポインタで初期化し、cleanup / keep の両方で保存する。
+
+`GpuGmuT1` は **REG_BINARY、468 B（117 DWORD）**。Status は NTSTATUS、ほかは ULONG。順序は以下。
+
+```text
+Cp (140 B、G2 形式), AChecks, AReason, IbBadCount, IbFirstBad, IbBadValue, DescBad
+SqGoodEven, SqGoodOdd, SqBad, SqFirst, SqValue, SqExpected, MaxErr[3], TexelBad[2], SqZero, SqPad
+BoxGoodEven, BoxGoodOdd, BoxBad, BoxFirst, BoxValue, BoxOld
+OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[20], DataAfter[3]
+CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, FenceUs
+ScanCount, ScanFirst, ScanDwords, RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared
+BackupStatus, HoldStatus, RestoreStatus
+```
+
+Checks は仕様の6ビットで期待値3F。SqGoodEven / Odd は各12800、BoxGoodEven / Odd は各19968が目標。MaxErr は B/G/R 順で、±1のずれでも SqBad に数える。TexelBad は bit=j*8+i、低い32 bitと高い32 bitの2語。SqZero は0またはFF000000、SqPad はFFFF00FFだった正方形内の画素数。Sample は仕様の10標本ごとに偶数行、奇数行の順。最後の2標本の期待値は退避値であり、BoxGood によって変化がないことを確かめる。
+
+SqFirst / BoxFirst / OutsideFirst / RestoreFirst は band 内バイト位置、IbFirstBad は IB 内 DWORD 位置、ScanFirst は ring 内バイト位置。走査は仕様の範囲を除く **3407 DWORD**。未記録・該当なしは FFFFFFFF、未実行 Status は NOT_FOUND、HoldMs / Checks / Prepared は0で始める。IB9やtextureの全内容は trace に重複保存しない。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1C00 / 0x1C01 | CP診断用2ページ map / 前段・空き領域・MASK |
+| 0x1C02 / 0x1C08 / 0x1C03 | 元の global fault / CPU map・退避 / 準備と全読み返し照合 |
+| 0x1C04 | MASK再確認、WPTR=2287、AHB fence と100 ms上限の完了待ち（待ち中の registry 書き込みなし） |
+| 0x1C10〜0x1C1B / 0x1C20 | 従来と同じCP診断12項目 / 後の global fault |
+| 0x1C30 / 0x1C31 / 0x1C32 | 保持前の診断保存・flushと5秒待機 / 必須復元 / 復元後の全域照合 |
+
+IB9 の107語は文書の表から組み立て、提示された t1_ib9.txt と一致することを静的に確認した。32 packet / 37 register と CP_PROTECT 範囲外、header parity、descriptor / prefetch の bit 値、64個の異なるtexel、各texelの200画素／パリティ、正方形12800と箱の残り19968、標本8点の色、468 B の ABI、3407語の走査も確認した。
+
+shim は用意したtextureを読む NEAREST の peer と、ゼロ／黒／詰め物／転置／反転／texel単位の誤り、待ちの遅延・時間切れを追加した。peer は TP や shader ISA を実行するものではない。試験ケースには成功、誤差±0、TexelBadの下位／上位語、DescBad、境界色表の読み返し、未使用領域・前段・MASK・map・退避・IB照合の失敗、fence再送・100 ms時間切れ・IB残り・エラー割り込み、breadcrumb / 保存 / 復元の失敗、旧モード、親の失敗時の未実行、KeepCx を追加した。PIXLODENABLE を外す変更や T-1b への自動切り替えはしない。
+
+ドライバ／ホスト試験のビルド・実行、版番号変更、署名、配置、実機実行、コミットは行っていない。
+
+#### 9.21.49 v77 の結果（T-1、2026-11-14）：texture を貼った正方形が画面に出た
+
+v77（20.0.2.77、oem135）。reboot 後、`EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=31` で restart-device を 1 回実行した。D-0 は `E1000000 / 1080x2400 / 4320 / 22`。GpuProbeStatus 0、EpiGpuProbeStep 0xFFFF、デバイスは OK。スタックは GpuStackAtCx 0x11F60、GpuStackMin 0x11448。D-1・V-1・A-1 のあとに T-1 まで、StartDevice の中で続けて通った。机上試験の修正はない。
+
+**GpuGmuT1：**
+- Status 0、Reason 0、**Checks 0x3F**、AChecks 0x3F（A-1 も成功）、Prepared 1、IbBadCount 0、DescBad 0。
+- RPTR / WPTR / shadow 2278 → **2287**、WptrWrites 1、Polls 1。RBBM 1、CX_BUSY bit23 0、割り込み・HW_FAULT・CP_INT・PROTECT・STATUS_1 すべて 0。IB1_BASE 0x70016400（残り 0）、MASK 0 / 0。global fault は前後とも 0。CB の FSR 0x400 / FSYNR は V-1 / A-1 と同じ古い値で、新しい fault はない（TP の読み出しはすべて map 内）。
+- data[26..28] = CAFE0017 / CAFE0018 / **CAFE0019**。
+- 正方形：偶数行・奇数行とも **12800 画素すべて完全一致**。MaxErr 0 / 0 / 0、TexelBad 0 / 0、SqZero 0、SqPad 0。
+- 箱の残り：両パリティとも 19968 画素が退避値と同じ。箱の外の変化 0。
+- 標本 8 点は期待値どおり（偶数行・奇数行とも）：FF101040、FFF010C0、FFF0F040、FF10F0C0、FF707040、FF90B0C0、FF101040（境界の直前）、FF303040（境界の直後）。箱の中の背景 2 点は退避値の 0。
+- ring 走査 3407 dw で該当 0。保持 5000 ms、復元の不一致 0、Backup / Hold / Restore の Status はすべて 0。FenceUs 0（1 tick 未満）。
+
+**分かったこと：**
+- `CP_LOAD_STATE6_FRAG`（SS6_INDIRECT、SB6_FS_TEX）での sampler / texture 記述子の読み込み、`SP_FS_TEX_SAMP` / `SP_FS_TEX_CONST` / `SP_FS_TEX_COUNT`、`SP_FS_CONFIG` の NTEX / NSAMP が、Turnip の blit と同じ固定値で動いた。
+- FS 本体が `(sy)end` だけでも、`SP_FS_PREFETCH_CMD` の TEX_PREFETCH_SAM が var0 の (s, t) で sample し、結果を r1.xyzw に入れた。
+- linear 配置、pitch 64 B（詰め物は読まれない）、`UNNORM_COORDS` の最近傍、texel 境界の前後 1 画素まで、すべて期待どおり。FMT6_8_8_8_8_UNORM / WZYX で読んだ texel の dword が、そのまま画素の dword になった（誤差 0）。
+- StartDevice の中で約 30 秒かかったが、start の失敗や bugcheck は出なかった。
+
+**次：** texture を貼った正方形を A-1 の回転と組み合わせる、または GMEM（tile 描画）や ring の折り返しに進む。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

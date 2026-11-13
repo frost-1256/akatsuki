@@ -839,7 +839,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags
                                                (Flags2 & EPI_GMU_PROBE2_R1) ? TRUE : FALSE,
                                                (Flags2 & EPI_GMU_PROBE2_D1) ? TRUE : FALSE,Disp,
                                                (Flags2 & EPI_GMU_PROBE2_V1) ? TRUE : FALSE,
-                                               (Flags2 & EPI_GMU_PROBE2_A1) ? TRUE : FALSE);
+                                               (Flags2 & EPI_GMU_PROBE2_A1) ? TRUE : FALSE,
+                                               (Flags2 & EPI_GMU_PROBE2_T1) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.

@@ -31,9 +31,10 @@
 #define EPI_GMU_PROBE2_D1      0x2UL // requires R1; Probe2=3, external framebuffer band with backup/restore
 #define EPI_GMU_PROBE2_V1      0x4UL // requires R1/D1; Probe2=7, interpolated two-pass triangle
 #define EPI_GMU_PROBE2_A1      0x8UL // requires R1/D1/V1; Probe2=15, 241-frame rotating square
+#define EPI_GMU_PROBE2_T1      0x10UL // requires A1; Probe2=31, texture prefetch quad
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -367,6 +368,28 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // Breadcrumbs: 1B00/01 map/prior, 1B02 global, 1B08 backup, 1B03 prepare; 1B40..1B4F every 16 frames;
 // 1B10..1B1B diagnostics, 1B20 global, 1B30 hold, 1B31 restore, 1B32 verify. No per-frame registry flush.
 
+// GpuGmuT1: 468 bytes, all ULONG / NTSTATUS fields in this exact order:
+// Cp (140-byte G2), AChecks, AReason, IbBadCount, IbFirstBad, IbBadValue, DescBad,
+// SqGoodEven, SqGoodOdd, SqBad, SqFirst, SqValue, SqExpected, MaxErr[3], TexelBad[2], SqZero, SqPad,
+// BoxGoodEven, BoxGoodOdd, BoxBad, BoxFirst, BoxValue, BoxOld, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew,
+// Sample[20], DataAfter[3], CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter, FenceUs, ScanCount, ScanFirst, ScanDwords,
+// RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus.
+// Checks: 1 A1 succeeded/restored, 2 data28=CAFE0019 + idle/endpoints=2287 + IB remaining 0/no errors,
+// 4 data26/27=CAFE0017/18, 8 square 12800 exact pixels per parity, 16 box rest 19968 each + outside unchanged,
+// 32 exact band restore. Require 3F. Acceptance is exact; MaxErr B/G/R is diagnostic only.
+// TexelBad bits j*8+i (low word bits 0..31, high word 32..63); SqZero counts 0 or FF000000, SqPad FFFF00FF.
+// DescBad counts mismatching words in FS4, both VBs, descriptor, sampler, zero border color, and texture/padding.
+// Samples (column,view): (470,29),(610,29),(610,99),(470,99),(530,59),(550,74),(479,33),(480,34),(414,2),(665,125),
+// each even then odd. SqFirst/BoxFirst/OutsideFirst/RestoreFirst are band byte offsets; IbFirstBad is an IB
+// DWORD index; ScanFirst is a ring byte offset. ScanDwords=3407, A1 predicate. Unrecorded values are FFFFFFFF.
+// HoldMs/Checks/Prepared start at 0; unexecuted statuses NOT_FOUND. FenceUs covers publication through
+// unique data28 + native/shadow RPTR + idle/IB remaining, including AHB retries, in KeQueryInterruptTime units / 10.
+// Reason 16 is the 100-ms completion timeout; 10 remains the 2-ms AHB fence timeout.
+// Breadcrumbs: 1C00/01 map/prior, 1C02 global, 1C08 backup, 1C03 prepare, 1C04 publish + bounded wait,
+// 1C10..1C1B diagnostics, 1C20 global, 1C30 save/flush + 5-second hold, 1C31 restore, 1C32 verify.
+// Transport/diagnostic failure skips the hold; CPU band restore/unmap always runs after successful backup.
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -402,6 +425,7 @@ ULONG EpiGmuStackMinimum();
 // D1: Probe2 bit1 with R1; external display band map, two draws, 5-second hold and mandatory CPU restore.
 // V1: Probe2=7 after successful D1 restore; integer-checked varying triangle under the same OOB.
 // A1: Probe2=15 after V1 restore; 241 sequential frames, no ring wrap, final 2-second hold and restore.
+// T1: Probe2=31 after A1 restore; nearest texture prefetch quad, exact pixels, 5-second hold and restore.
 // Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -413,4 +437,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE);

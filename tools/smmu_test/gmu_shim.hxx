@@ -15,10 +15,13 @@ using PCWSTR=const wchar_t*;
 #define MmNonCached 0
 #define NT_ASSERT(x) assert(x)
 #define REG_BINARY 3
+static void* t1CopyTrigger=nullptr;
+static ULONG* t1CorruptTarget=nullptr;
 static void* r1CopyTarget=nullptr;
 static ULONG r1CopyBadDword=0xFFFFFFFF;
 inline void RtlCopyMemory(void* a,const void* b,SIZE_T n) {
     std::memcpy(a,b,n);
+    if(a==t1CopyTrigger && t1CorruptTarget) *t1CorruptTarget^=1;
     if(a==r1CopyTarget && r1CopyBadDword<n/4) static_cast<ULONG*>(a)[r1CopyBadDword]^=1;
 }
 inline void RtlFillMemory(void* a,SIZE_T n,UCHAR value) { std::memset(a,value,n); }
@@ -166,6 +169,28 @@ inline void A1PeerComplete(ULONG f) {
     g2Ring[0x7064/4]=0xA1000000|(f==a1WrongFrame ? 0xFFFF : f);
     *g2Shadow=109+9*(f+1); *GmuCfgReg(0x806)=*g2Shadow; *GmuCfgReg(0x92A)=0;
 }
+static bool allowT1Writes=false,t1Completes=true,t1Zero=false,t1Black=false,t1Pad=false,t1Transpose=false,t1FlipX=false,t1FlipY=false;
+static bool t1Outside=false,t1BoxDamage=false,t1Odd=true,t1FenceForever=false,t1BadRemaining=false,t1SaveFails=false,t1Pending=false;
+static ULONG t1Fences=7,t1FenceDrops=0,t1ErrorBits=0,t1DelayUs=0,t1BadTexel=0xFFFFFFFF;
+static ULONGLONG t1Due=0;
+static std::vector<ULONG> t1Writes;
+inline void T1PeerComplete() {
+    t1Pending=false;
+    for(ULONG y=1120;y<1280;++y) if(t1Odd || !(y&1)) for(ULONG x=460;x<620;++x) {
+        ULONG i=(x-460)/20,j=((y-1072)/2-24)/10;
+        if(t1FlipX) i=7-i; if(t1FlipY) j=7-j; if(t1Transpose) {const ULONG temp=i; i=j; j=temp;}
+        ULONG color=g2Ring[0x6C00/4+j*16+i];
+        if(j*8+i==t1BadTexel) color^=1;
+        if(t1Zero) color=0; if(t1Black) color=0xFF000000; if(t1Pad) color=0xFFFF00FF;
+        d1Band[(y*4320+x*4-0x462000)/4]=color;
+    }
+    if(t1BoxDamage) d1Band[(1076*4320+414*4-0x462000)/4]^=1;
+    if(t1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+    if(t1Fences&1) g2Ring[0x7068/4]=0xCAFE0017;
+    if(t1Fences&2) g2Ring[0x706C/4]=0xCAFE0018;
+    if(t1Fences&4) g2Ring[0x7070/4]=0xCAFE0019;
+    *g2Shadow=2287; *GmuCfgReg(0x806)=2287; *GmuCfgReg(0x92A)=t1BadRemaining ? 1 : 0;
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -214,7 +239,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert((allowD1Writes || allowV1Writes || allowA1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
         ++d1Maps; d1Restoring=false; return d1Band.data();
     }
@@ -235,6 +260,7 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
 inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(D1BandPointer(p)) return *p;
     if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
+    if(t1Pending && testInterruptTime>=t1Due) T1PeerComplete();
     if(g3cPolling && g3cPending) {
         if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
         if(p==GmuCfgReg(0x201) && g3cShowStatus && g3cSample>=g3cStatusDelay) *p|=1UL<<20;
@@ -251,6 +277,26 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v==2287) {
+        assert(allowG2Writes && allowT1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70BF8003,0x70016400,0,107,0x70460004,4,0x70017070,0,0xCAFE0019};
+        const ULONG desc[16]={0x0C006880,0x00040008,0x20002000,0,0x70016C00,0};
+        const ULONG sampler[]={0x60920,0x60,0,0};
+        assert(std::memcmp(g2Ring+2278,packet,sizeof(packet))==0 && std::memcmp(g2Ring+0x6A80/4,desc,sizeof(desc))==0);
+        assert(std::memcmp(g2Ring+0x6AC0/4,sampler,sizeof(sampler))==0 && g2Ring[0x6884/4]==0x13000000);
+        assert(g2Ring[0x6400/4+46]==0x23C40000 && g2Ring[0x6400/4+9]==0x85400100);
+        for(ULONG i=0;i<32;++i) assert(g2Ring[0x6B00/4+i]==0);
+        g2Writes.push_back({0x807,v}); t1Writes.push_back(v);
+        if(t1FenceForever || t1FenceDrops) {if(t1FenceDrops) --t1FenceDrops; gPages[2][0x313]=1; return;}
+        gPages[2][0x313]=0; *p=v;
+        *GmuCfgReg(0x928)=0x70016400; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=107;
+        gPages[8][0x210]=1; gPages[8][0x201]=t1ErrorBits; gPages[2][0x30C]=0;
+        if(t1Completes) {
+            if(t1DelayUs) {t1Pending=true; t1Due=testInterruptTime+t1DelayUs*10;}
+            else T1PeerComplete();
+        }
+        return;
+    }
     if(p==GmuCfgReg(0x807) && v>=118 && v<=2278 && (v-109)%9==0) {
         assert(allowG2Writes && allowA1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG f=(v-109)/9-1;
@@ -603,7 +649,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
         if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
-        if(v==0x1931 || v==0x1A31 || v==0x1B31) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -615,6 +661,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuT1")==0 && value && size && t1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuA1")==0 && value && size && a1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuV1")==0 && value && size && v1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuZapQuery")==0 && value && size) {
