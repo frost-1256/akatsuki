@@ -4064,6 +4064,154 @@ trace ブロックは通常の cleanup と keep の両方で、最後の診断�
 - 赤橙（R=FF、G=33）として表示された。BGRX の framebuffer に WZYX の RGBA8 で書くと、FS の x→B、z→R になる。
 - 次は varying（頂点ごとの色）と texture（R-1 の描画先を sampler で読む）。
 
+#### 9.21.41 V-1 の提案：varying で色を補間した三角形を画面に描く（文章仕様、未実装）
+
+D-1 と同じ band と 2 パス方式で、頂点ごとに色を持つ三角形を描く。VS から FS へ varying を渡し、FS の `bary.f` で補間する最初の段階である。同時に、初めて RECTLIST ではなく **TRILIST** を使う。
+
+**なぜ三角形か：** RECTLIST の varying は、Mesa の blit（`r3d_common`）で `VPC_VARYING_PS_REPL_MODE(0) = 2<<2 | 1` としているとおり、成分 0 を x 方向、成分 1 を y 方向に point sprite 式で補間する特殊な扱いになる。一般の varying 補間（重心座標）は、三角形でないと確かめられない。
+
+**変更する状態（Mesa `tu6_emit_vpc` / `tu6_emit_fs_inputs` / `tu6_emit_xs` に合わせる）：**
+- VFD：属性を 2 つにする。頂点は 32 B で、`pos(x, y, 0, 1)` のあとに `color(x, y, z, w)` が続く。`VFD_CONTROL_0` を 0x201（FETCH 1、DECODE 2）にし、`VFD_DECODE[1]` は OFFSET 16、形式は [0] と同じとする。`VFD_DEST_CNTL[1]` は r1.xyzw。
+- VS：R-1 の VS（`nop; end`）をそのまま使う。VFD が r0 に位置、r1 に色を置き、VS はそれを出力する。`SP_VS_CTRL_REG0` の FULLREGFOOTPRINT を 1 → 2 にする。
+- VS の出力と VPC の配置（Mesa と同じく、varying を先、位置を最後に置く）：
+  - var0 は r1.xyzw で loc 0..3、var1 は r0.xyzw（位置）で loc 4..7。
+  - `SP_VS_OUT_REG[0]` = 0x0F000F04、`SP_VS_VPC_DST_REG[0]` = 0x400、`SP_VS_PRIMITIVE_CNTL.OUT` = 2。
+  - `VPC_VS_PACK` = STRIDE 8 / POSITIONLOC 4 / PSIZELOC 0xFF。`PC_VS_OUT_CNTL.STRIDE_IN_VPC` = 8。
+- VPC から FS への入力：`VPC_VAR_DISABLE[0]` = ~0xF、`VPC_CNTL_0` = NUMNONPOSVAR 4 | VARYING | PRIMIDLOC / VIEWIDLOC 0xFF。INTERP_MODE と PS_REPL_MODE は R-1 の 0（smooth、置換なし）のままとする。
+- FS の入力：
+  - `HLSQ_CONTROL_3_REG.IJ_PERSP_PIXEL` を r0.x にする（r0.x / r0.y に i / j が入る）。
+  - `GRAS_CNTL` と `RB_RENDER_CONTROL0` に IJ_PERSP_PIXEL を立て、RB 側には UNK10（varying 有効）も立てる。
+  - `SP_FS_PREFETCH_CNTL` の IJ_WRITE_DISABLE を外す。`HLSQ_FS_CNTL_0.VARYINGS` と `SP_FS_CTRL_REG0.VARYING` を立てる。
+- FS3：
+  - 命令は `(rpt3)bary.f (ei)r1.x, (r)0, r0.x`、`(rpt5)nop`、`end`。loc 0..3 を r1.x..w に補間し、`SP_FS_OUTPUT_REG[0]` を r1.x にする。FULLREGFOOTPRINT は 2。
+  - bary.f の符号化は ir3-cat2.xml（`#instruction-cat2-2src-input`、opc 53..58 = 111001、bit50 = 0）による。生成器は disasm.c の既知例 `47308a02_00002000 = (rpt2)bary.f (ei)r0.z, (r)0, r0.x` と一致することを assert で確かめている。
+  - dword は `00002000 47308B04 00000000 00000500 00000000 03000000`、残り 0（32 dw）。
+- 描画：`CP_DRAW_INDX_OFFSET` を TRILIST（0x84）、3 頂点にする。`GRAS_SU_CNTL` = 0 なので cull しない。位置は R-1 と同じく viewport 変換なしの画素座標。
+
+**三角形（パス A の view 座標。パス B は x を +8 する）：**
+
+| 頂点 | 位置 (x, v) | 色 | VB の color (x, y, z, w) |
+|---|---|---|---|
+| 0 | (540, 0) | 赤 | (0, 0, 1, 1) |
+| 1 | (412, 128) | 緑 | (0, 1, 0, 1) |
+| 2 | (668, 128) | 青 | (1, 0, 0, 1) |
+
+- R-1 / D-1 で確かめた成分順（x が最下位バイト = B）に合わせ、color は (B, G, R, A) の順に置く。
+- 画面上では、行 1072..1327、列 412..667 の箱に、高さ 256 の三角形として出る（v の 1 行が実際の 2 行になる）。頂点は上が赤、左下が緑、右下が青。
+
+**配置：**
+
+| 項目 | 場所 | 内容 |
+|---|---|---|
+| IB7 | 0x70015100（115 dw、37 packet） | 下表 |
+| FS3 | 0x70015400（32 dw） | 上記 |
+| 頂点 A | 0x70015480（24 dw） | `44070000 0 0 3F800000 0 0 3F800000 3F800000  43CE0000 43000000 0 3F800000 0 3F800000 0 3F800000  44270000 43000000 0 3F800000 3F800000 0 0 3F800000` |
+| 頂点 B | 0x70015500（24 dw） | 頂点 A の x を +8 したもの：先頭は `44090000`、`43D20000`、`44290000` |
+| data[20..22] | 0x70017050 / 54 / 58 | 0xCAFE0012 / 0xCAFE0013 / 0xCAFE0014 |
+
+**IB7：** R-1 と D-1 の状態はそのまま残る。D-1 と同じ OOB 内で続けて実行し、CP は reset しない。IB7 は差分だけを書く。44 個の pkt4 register はすべて CP_PROTECT の範囲外（prot.py で確認）。
+
+| # | 群 | dw | packet | header | 値 | 内容 |
+|---|---|---|---|---|---|---|
+| 1 | S | 0 | pkt4 0xBB08 ×1 | 0x40BB0801 | 0xBF | HLSQ_INVALIDATE_CMD |
+| 2 | S | 2 | pkt4 0xA800 ×1 | 0x40A80001 | 0x100100 | SP_VS_CTRL_REG0 (FULLREGFOOTPRINT=2, MERGEDREGS) |
+| 3 | S | 4 | pkt7 0x32 ×3 | 0x70328003 | 0x620000、0x70014800、0 | CP_LOAD_STATE6_GEOM (SB6_VS_SHADER, 1 unit, R-1 VS) |
+| 4 | S | 8 | pkt4 0xA980 ×1 | 0x40A98001 | 0x81400100 | SP_FS_CTRL_REG0 (FULLREGFOOTPRINT=2, VARYING, UNK24, b31) |
+| 5 | S | 10 | pkt4 0xA982 ×7 | 0x48A98207 | 0、0x70015400、0、0、0、0、0 | SP_FS_OBJ_FIRST_EXEC_OFFSET, OBJ_START lo/hi, PVT_MEM_* |
+| 6 | S | 18 | pkt7 0x34 ×3 | 0x70348003 | 0x720000、0x70015400、0 | CP_LOAD_STATE6_FRAG (SB6_FS_SHADER, 1 unit) |
+| 7 | S | 22 | pkt4 0xA000 ×1 | 0x48A00001 | 0x201 | VFD_CONTROL_0 (FETCH_CNT=1, DECODE_CNT=2) |
+| 8 | S | 24 | pkt4 0xA092 ×2 | 0x40A09202 | 0xC8200200、1 | VFD_DECODE[1] INSTR (IDX0, OFFSET 16, R32G32B32A32_FLOAT), STEP_RATE |
+| 9 | S | 27 | pkt4 0xA0D1 ×1 | 0x48A0D101 | 0x4F | VFD_DEST_CNTL_INSTR[1] (r1.xyzw) |
+| 10 | S | 29 | pkt4 0xA802 ×2 | 0x48A80202 | 2、0xF000F04 | SP_VS_PRIMITIVE_CNTL (OUT=2), SP_VS_OUT_REG[0] (A=r1 xyzw, B=r0 xyzw) |
+| 11 | S | 32 | pkt4 0xA813 ×1 | 0x48A81301 | 0x400 | SP_VS_VPC_DST_REG[0] (OUTLOC0=0, OUTLOC1=4) |
+| 12 | S | 34 | pkt4 0x9301 ×1 | 0x40930101 | 0xFF0408 | VPC_VS_PACK (STRIDE=8, POSITIONLOC=4, PSIZELOC=0xFF) |
+| 13 | S | 36 | pkt4 0x9B01 ×1 | 0x489B0101 | 8 | PC_VS_OUT_CNTL (STRIDE_IN_VPC=8) |
+| 14 | S | 38 | pkt4 0x9212 ×4 | 0x40921204 | 0xFFFFFFF0、0xFFFFFFFF、0xFFFFFFFF、0xFFFFFFFF | VPC_VAR_DISABLE[0..3] (loc 0..3 enabled) |
+| 15 | S | 43 | pkt4 0x9304 ×1 | 0x40930401 | 0xFF01FF04 | VPC_CNTL_0 (NUMNONPOSVAR=4, VARYING, PRIMIDLOC/VIEWIDLOC=0xFF) |
+| 16 | S | 45 | pkt4 0xA99E ×1 | 0x40A99E01 | 0 | SP_FS_PREFETCH_CNTL (COUNT=0, IJ write enabled) |
+| 17 | S | 47 | pkt4 0xB980 ×1 | 0x48B98001 | 2 | HLSQ_FS_CNTL_0 (THREAD64, VARYINGS) |
+| 18 | S | 49 | pkt4 0xB984 ×1 | 0x40B98401 | 0xFCFCFC00 | HLSQ_CONTROL_3_REG (IJ_PERSP_PIXEL=r0.x) |
+| 19 | S | 51 | pkt4 0x8005 ×1 | 0x40800501 | 1 | GRAS_CNTL (IJ_PERSP_PIXEL) |
+| 20 | S | 53 | pkt4 0x8809 ×1 | 0x48880901 | 0x401 | RB_RENDER_CONTROL0 (IJ_PERSP_PIXEL, UNK10) |
+| 21 | S | 55 | pkt4 0xA98E ×1 | 0x48A98E01 | 4 | SP_FS_OUTPUT_REG[0] (REGID=r1.x) |
+| 22 | A | 57 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x19C、0x7F029B | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 23 | A | 60 | pkt4 0x840A ×2 | 0x48840A02 | 0x19C、0x7F029B | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 24 | A | 63 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x19C、0x7F029B | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 25 | A | 66 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70015480、0、0x60、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 26 | A | 71 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71008A00、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 27 | A | 76 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、3 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 3 vertices) |
+| 28 | A | 80 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017050、0、0xCAFE0012 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[20] |
+| 29 | A | 85 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 30 | B | 86 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x1A4、0x7F02A3 | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 31 | B | 89 | pkt4 0x840A ×2 | 0x48840A02 | 0x1A4、0x7F02A3 | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 32 | B | 92 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x1A4、0x7F02A3 | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 33 | B | 95 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70015500、0、0x60、0x20 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 34 | B | 100 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71009AC0、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 35 | B | 105 | pkt7 0x38 ×3 | 0x70388003 | 0x84、1、3 | CP_DRAW_INDX_OFFSET (TRILIST, AUTO_INDEX, 1 instance, 3 vertices) |
+| 36 | B | 109 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017054、0、0xCAFE0013 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[21] |
+| 37 | B | 114 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+ring[100..108] = `70BF8003 70015100 00000000 00000073 70460004 00000004 70017058 00000000 CAFE0014`、WPTR 100 → **109**。生成器は scratchpad の `tools/v1ib.py`、dword 一覧は `v1_ib7.txt`。
+
+**期待画像（カーネルでは整数だけで計算する。浮動小数は使わない）：**
+- 座標を 2 倍して整数にする。画素（列 c、view 行 v）の中心は (2c+1, 2v+1)。頂点は P0 = (1080, 0)、P1 = (824, 256)、P2 = (1336, 256)。
+- 辺関数は `E(a, b, p) = (b.x−a.x)(p.y−a.y) − (b.y−a.y)(p.x−a.x)` とする。重みは w0 = E(P1, P2, p)、w1 = E(P2, P0, p)、w2 = E(P0, P1, p)。符号は面積 E(P1, P2, P0) が正になる向きにそろえ、面積 AREA = **131072**。
+- 期待色：R = (510·w0 + AREA) / (2·AREA)、G は w1、B は w2 で同じ式（切り捨て除算）。X は 0xFF。期待 dword は `0xFF000000 | R<<16 | G<<8 | B`。
+- 画素の分類：画素の正方形を 1 画素ずつ広げた 4 隅 (2c−2, 2v−2)、(2c+4, 2v−2)、(2c−2, 2v+4)、(2c+4, 2v+4) で重みを調べる。
+  - core-in：4 隅すべてで w0, w1, w2 ≥ 0。
+  - core-out：ある 1 辺について 4 隅すべてが負。
+  - edge：それ以外。辺上の画素は塗るかどうかが規則次第なので、判定に使わない。
+- 箱の中（列 412..667、v 0..127）の数は、各パリティで core-in **15500**、edge 1768、core-out 15500。偶数行（パス A）と奇数行（パス B）は同じ期待値になる（行 Y0+2v と Y0+2v+1 が同じ v）。
+- 許容誤差：core-in の画素は、B / G / R の各成分が期待値から ±2 以内、X バイトが 0xFF であること。
+- 標本（偶数行。奇数行は +1 行で同じ値）：
+
+| 列 | v | 行 | 期待値 |
+|---|---|---|---|
+| 540 | 85 | 1242 | 0xFF555556（重心付近） |
+| 540 | 6 | 1084 | 0xFFF20607（赤の頂点付近） |
+| 420 | 124 | 1320 | 0xFF07F305（緑の頂点付近） |
+| 660 | 124 | 1320 | 0xFF0704F4（青の頂点付近） |
+| 540 | 124 | 1320 | 0xFF077C7D（底辺の中点付近） |
+| 476 | 100 | 1272 | 0xFF37A325 |
+
+**probe：** `EpiGpuProbe2` の bit2 を V-1 とする。V-1 は bit0（R-1）と bit1（D-1）を必要とし、実行値は Probe 0xBFFFFE80 + Probe2 **7**。許す組み合わせは Probe2 ∈ {0, 1, 3, 7} だけ（1 / 3 / 7 は Probe 0xBFFFFE80 のときだけ）。それ以外は status 6。D-0 の Disp 照合は D-1 と共通。
+
+**手順（D-1 の復元の後、OOB 解除前）：**
+1. 前段：D-1 の Status 成功、Reason 0、Checks 0x3F、WPTR 100、data[17..19] 正しい、RestoreMismatch 0。RPTR / WPTR / shadow 100、ring[0..99] と既存 IB / シェーダ / 頂点 / data[0..19] の照合、MASK 0。不成立なら Reason 8 / 12 / 15 で未投入とする。
+2. band：D-1 の map をそのまま使う（D-1 の終わりで unmap する実装なら、同じ手順で map し直す）。D-1 の復元後の band 全体を、改めて退避する。
+3. 準備：FS3、頂点 A/B、IB7、data[20..22] = 0xFFFFFFFF、ring[100..108] を書いてバリアを置き、読み返して照合する。不一致なら投入しない。
+4. MASK を再確認し、WPTR=109 を書く。fence / idle の待ちは D-1 と同じ。
+5. 判定のあと **5 秒保持**する。画面中央に、上が赤、左下が緑、右下が青の三角形が出るはずなので、写真を撮る。
+6. 復元と照合は D-1 と同じ。GPU の失敗時も、band を map できていれば必ず復元する。
+
+**判定（Checks）：**
+- bit0：D-1 成功（前段の条件すべて）。
+- bit1：idle、RPTR / WPTR / shadow 109、エラー割り込みなし。
+- bit2：data[20..22] が 3 つとも正しい。
+- bit3：core-in が偶数行・奇数行とも 15500 画素すべて許容内。
+- bit4：band 内で、箱の外の dword と箱の中の core-out の dword が、すべて退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**診断 `GpuGmuV1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`DChecks`、`DReason`、`Packet[9]`、`Fs[32]`、`VertA[24]`、`VertB[24]`、`IbBadCount / IbFirstBad / IbBadValue`。
+- `CoreEven`、`CoreOdd`（許容内の core-in 画素数）、`CoreBad`、`CoreFirst`（band 内バイト位置）、`CoreValue`、`CoreExpected`、`MaxErr[3]`（core-in 全体での B / G / R の最大誤差の絶対値）。
+- `EdgeChanged`、`EdgeSame`：edge 画素のうち、退避値から変わった数と変わらない数（情報のみ）。
+- `OutsideChanged`、`OutsideFirst`、`OutsideOld`、`OutsideNew`。
+- `Sample[12]`：上の 6 標本の偶数行と奇数行の値（標本ごとに偶数、奇数の順）。
+- `DataBefore[3]`、`DataAfter[3]`、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`。
+- `GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / AtSubmit / After`。
+- `ScanCount`、`ScanFirst`、`ScanDwords`：ring の走査で、上位バイトが 0xFF で 0xFFFFFFFF でない dword（RB の書き込みに見えるもの）を数える。除外は D-1 の除外に `[0x5100, 0x52CC)`、`[0x5400, 0x5560)` を加え、ring packet は `off < 109×4`、data は `[0x7000, 0x705C)` とする。期待値は 0。
+- `RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- breadcrumb は 0x1A00 番台（D-1 の 0x1900 番台と同じ割り振り）。
+
+**危険と対策：**
+- 初めて三角形を描く。RECTLIST では使わなかった setup（辺の計算・重心座標）の state が不足している場合、何も描かれないか、hang する。その場合は bit1 / bit2 と data の値で分かる。書き込み先は D-1 と同じく scissor で箱に限られ、band の外は GPU から見えない。
+- varying の配置が誤っていると、色が違う（成分の入れ替わり、0 や 1 に張り付く）か、位置まで壊れる。`Sample` と `MaxErr` で、どの成分がどうずれたかが分かる。
+- bary.f の結果が出る前に `end` に達する時間関係の問題に備えて、R-1 と同じ `(rpt5)nop` を残す。
+
+**この後：** V-1 が通れば T-1（texture）である。R-1 の描画先（0x70014C00、16 × 16）を texture として、`SP_FS_PREFETCH`（または `sam`）で読み、同じ band に拡大して出す。varying で texcoord を渡すので、V-1 の配置をそのまま使う。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
