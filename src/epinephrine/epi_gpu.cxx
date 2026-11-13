@@ -717,8 +717,9 @@ out:
 // GpuCxStatus: 0 done (GMU read), 10 CX GDSC did not power on, 11 a needed branch stayed off (GMU not read),
 //              12 map failed, 13 CX GDSC did not collapse again on restore,
 //              14 SMMU/CM3 boot/RSCC write test needs initially collapsed CX, 15 post-collapse SMMU read cycle failed,
-//              16 GMU boot test failed (GpuGmuStatus contains the reason), 17 RSCC write test failed
-static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags2, volatile ULONG* Cc, PWCHAR Text,
+//              16 GMU boot test failed (GpuGmuStatus contains the reason), 17 RSCC write test failed,
+//              18 stack expansion failed (CX test not entered)
+static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags2, const ULONG* Disp, volatile ULONG* Cc, PWCHAR Text,
                           const EPI_GMU_FW* Fw, PULONG FwStatus, BOOLEAN* KeepCx)
 {
     *KeepCx = FALSE;
@@ -835,7 +836,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags
                                                (Flags & EPI_GMU_PROBE_G5B) ? TRUE : FALSE,
                                                (Flags & EPI_GMU_PROBE_Z1) ? TRUE : FALSE,Fw->Zap,Fw->ZapLen,
                                                (Flags & EPI_GMU_PROBE_S1) ? TRUE : FALSE,
-                                               (Flags2 & EPI_GMU_PROBE2_R1) ? TRUE : FALSE);
+                                               (Flags2 & EPI_GMU_PROBE2_R1) ? TRUE : FALSE,
+                                               (Flags2 & EPI_GMU_PROBE2_D1) ? TRUE : FALSE,Disp);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -921,6 +923,26 @@ static NTSTATUS EpiGpuClearProbes(HANDLE Params)
     if (!NT_SUCCESS(second)) { return second; }
     return ZwFlushKey(Params);
 }
+struct EPI_GPU_CX_CALLOUT_CONTEXT {
+    HANDLE Params,Diag;
+    ULONG Flags,Flags2;
+    const ULONG* Disp;
+    volatile ULONG* Cc;
+    PWCHAR Text;
+    const EPI_GMU_FW* Fw;
+    ULONG CxStatus,FwStatus;
+    BOOLEAN KeepCx;
+};
+_Function_class_(EXPAND_STACK_CALLOUT)
+static VOID NTAPI EpiGpuCxCallout(PVOID Context)
+{
+    EPI_GPU_CX_CALLOUT_CONTEXT* ctx=static_cast<EPI_GPU_CX_CALLOUT_CONTEXT*>(Context);
+    const ULONG remaining=static_cast<ULONG>(IoGetRemainingStackSize());
+    EpiSetDword(ctx->Diag,L"GpuStackAtCx",remaining);
+    ctx->CxStatus=EpiGpuCxTest(ctx->Params,ctx->Diag,ctx->Flags,ctx->Flags2,ctx->Disp,
+                              ctx->Cc,ctx->Text,ctx->Fw,&ctx->FwStatus,&ctx->KeepCx);
+}
+
 VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 {
     PAGED_CODE();
@@ -931,7 +953,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     // GpuProbeStatus: 0 done, 1 not enabled, 2 GPU_CC not in _CRS, 3 no memory, 4 map failed,
     //                 5 GCC_GPU_CFG_AHB_CLK off (GPU_CC not read), 6 incompatible probe flags,
     //                 7 one-shot persistence failed (no hardware access), 8 firmware source load failed,
-    //                 9 Z-1b query persistence/transport/retry limit failure (raw SCM replies are diagnostic only)
+    //                 9 Z-1b query persistence/transport/retry limit failure, 10 D-1 display metadata mismatch
     ULONG status = 0;
     ULONG n = 0;
     PULONG pairs = NULL;
@@ -941,6 +963,7 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
     ULONG flags = 0;
     ULONG flags2 = 0;
     BOOLEAN probesCleared = FALSE;
+    ULONG disp[6]={0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
     ULONG cxStatus = 0xFFFFFFFF;
     PWCHAR cxText = NULL;
     EPI_GMU_FW fw = {};
@@ -1042,6 +1065,17 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
         { status = 6; goto done; }
     }
     else { EpiSetDword(hParams,L"EpiGpuProbe",0); EpiSetDword(hParams,L"EpiGpuProbe2",0); }
+    if (flags2 & EPI_GMU_PROBE2_D1)
+    {
+        const PCWSTR names[]={L"DispPhysLow",L"DispPhysHigh",L"DispWidth",L"DispHeight",L"DispPitch",L"DispFormat"};
+        for (ULONG i=0;i<6;++i) { disp[i]=EpiQueryDword(hDiag,names[i],0xFFFFFFFF); }
+        const BOOLEAN match=EpiGmuD1DisplayMatches(disp) && EpiQueryDword(hDiag,L"DispSnapshotStatus",0xFFFFFFFF)==0;
+        NTSTATUS saved=EpiSetValue(hDiag,L"GpuD1Display",REG_BINARY,disp,sizeof(disp));
+        if (NT_SUCCESS(saved)) { saved=EpiSetDword(hDiag,L"GpuD1Precondition",match ? 0UL : 1UL); }
+        if (NT_SUCCESS(saved)) { saved=ZwFlushKey(hDiag); }
+        if (!NT_SUCCESS(saved)) { status=7; goto done; }
+        if (!match) { status=10; goto done; }
+    }
     EpiGpuStep(hParams, 1);
     if (!pRes->GpuCcFound) { status = 2; goto done; }
 
@@ -1116,7 +1150,17 @@ VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
             RtlStringCchPrintfW(line, RTL_NUMBER_OF(line), L"%s=%08X; ", g_EpiGpuCcRegs[i].Name, v);
             RtlStringCchCatW(text, EPI_GPU_TEXT_CCH, line);
         }
-        if (flags & EPI_GPU_CX_FLAGS) { cxStatus = EpiGpuCxTest(hParams, hDiag, flags, flags2, c, cxText, &fw, &fwStatus, &keepCx); }
+        if (flags & EPI_GPU_CX_FLAGS)
+        {
+            EPI_GPU_CX_CALLOUT_CONTEXT ctx={hParams,hDiag,flags,flags2,disp,c,cxText,&fw,18,fwStatus,FALSE};
+            EpiGmuStackReset();
+            EpiSetDword(hDiag,L"GpuStackAtCx",0xFFFFFFFF);
+            const NTSTATUS expanded=KeExpandKernelStackAndCalloutEx(EpiGpuCxCallout,&ctx,MAXIMUM_EXPANSION_SIZE,TRUE,NULL);
+            EpiSetDword(hDiag,L"GpuStackExpandStatus",static_cast<ULONG>(expanded));
+            cxStatus=NT_SUCCESS(expanded) ? ctx.CxStatus : 18;
+            fwStatus=ctx.FwStatus; keepCx=ctx.KeepCx;
+            EpiSetDword(hDiag,L"GpuStackMin",EpiGmuStackMinimum());
+        }
     }
 
 done:

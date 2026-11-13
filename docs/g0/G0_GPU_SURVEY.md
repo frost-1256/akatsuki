@@ -3860,6 +3860,210 @@ v72（20.0.2.72、oem130）。ビルド修正はなかった。机上試験（SM
 - RGBA8 の成分順は R が最下位バイトである（0xFF330000 ではなく 0x000033FF）。
 - RECTLIST の端の規則では (4,4)–(12,12) が 8×8 = 64 画素になる。
 
+#### 9.21.37 D-1 の提案：画面の framebuffer に四角形を描く（文章仕様、未実装）
+
+R-1 の描画を、DPU が実際に表示している framebuffer に向ける。GPU の描いた画素が初めて画面に出る段階。この段階で決めるのは、framebuffer の場所・形式、pitch の制約の回避、画面を元に戻す手順、試験の判定方法である。
+
+**framebuffer の事実：**
+- Silicium の SimpleFbDxe は、base を MemoryMap の "Display Reserved"（0xE1000000、0x2400000）に置く。`PixelsPerScanLine = Width`、形式は `PixelBlueGreenRedReserved8BitPerColor` である。spacewarPkg の PCD は 1080 × 2400 × 32 bpp。
+- したがって pitch は **4320 B**（1080 × 4）、1 画素はメモリ順に B, G, R, X になる。
+- Epinephrine の DOD は `DxgkCbAcquirePostDisplayOwnership` で同じ buffer を受け取り、CPU でコピーしている。表示が更新されるので、DPU はこの buffer を読み続けている（パネルは DSI コマンドモードで、UEFI が autorefresh を有効にしている前提）。
+- GPU の probe（bdd.cxx:90）は `AcquirePostDisplayOwnership`（bdd.cxx:105）より前に走る。そのため probe の時点では DispInfo がない。
+
+**pitch の制約：** RB_MRT[n].PITCH と RB_A2D_DEST_BUFFER_PITCH はどちらも `shr="6"` で、BASE は `align="64"` である。4320 は 64 の倍数でない（67.5）ため、framebuffer をそのまま描画先にはできない。
+
+**回避策：** 2 行分の 8640 B（= 135 × 64）を pitch として、2 回描く。
+- パス A（偶数行）：base は行 Y0 の先頭。Y0 を偶数にすると 64 B に揃う。
+- パス B（奇数行）：行 Y0+1 の先頭は 32 B ずれる。そこで base をその 32 B 手前（= 8 画素手前）にし、x を +8 して描く。
+- どちらのパスも、view の行 v が実際の行 Y0+2v（A）または Y0+1+2v（B）に対応する。
+- window・screen の scissor を四角形にちょうど合わせる。こうすれば、端の規則がずれても四角形の外には書かれない。
+
+**D-0（前提、GPU に触らない）：** StartDevice の `AcquirePostDisplayOwnership` 成功後に、DispInfo を EpiDiag に記録する。
+- 値は DWORD の `DispPhysLow / DispPhysHigh / DispWidth / DispHeight / DispPitch / DispFormat` とする。
+- EpiDiag は volatile なので、同じ boot 内の次の restart-device まで残る。
+- D-1 はこれを読んで、次の値と完全に一致するときだけ実行する：PhysLow `0xE1000000`、High 0、1080、2400、4320、Format 21（A8R8G8B8）または 22（X8R8G8B8）。
+- 一致しない、または値がない場合は、GPU に触る前に止める。つまり D-1 は「reboot 後に一度 driver が普通に start した状態」から、restart-device で実行する。
+
+**probe：** `EpiGpuProbe2` の bit1 を D-1 とする。D-1 は bit0（R-1）を必要とし、実行値は Probe 0xBFFFFE80 + Probe2 **3** である。許す組み合わせは Probe2 ∈ {0, 1, 3} だけ（1 と 3 は Probe 0xBFFFFE80 のときだけ）。それ以外は status 6。ワンショット解除は R-1 と同じ。
+
+**配置：**
+
+| 項目 | 場所 | 内容 |
+|---|---|---|
+| framebuffer band | PA 0xE1462000–0xE1582000（0x120000 B、288 page）→ IOVA **0x71000000** | 行 1064..1335 を含む page 範囲。D-1 を要求したときだけ、region 作成時（SMMU enable 前）に map する。Flags は ring と同じ READ|WRITE。**確保・ゼロ埋め・解放をしない外部メモリ**として扱う。 |
+| IB6 | 0x70014500（72 dw、19 packet） | 下表 |
+| FS2 | 0x70014A00（32 dw） | `mov r0.x=0.0, r0.y=0.2, r0.z=1.0, r0.w=1.0`、`(rpt5)nop`、`end`。dword：`00000000 204CC000 3E4CCCCD 204CC001 3F800000 204CC002 3F800000 204CC003 00000000 00000500 00000000 03000000`、残り 0 |
+| 頂点 A | 0x70014A80 | (412,0,0,1)、(668,128,0,1)：`43CE0000 0 0 3F800000 44270000 43000000 0 3F800000` |
+| 頂点 B | 0x70014AA0 | (420,0,0,1)、(676,128,0,1)：`43D20000 0 0 3F800000 44290000 43000000 0 3F800000` |
+| data[17..19] | 0x70017044 / 48 / 4C | 0xCAFE000F / 0xCAFE0010 / 0xCAFE0011 |
+
+- 四角形は列 412..667、行 1072..1327（256 × 256、画面中央）。
+- 行 r・列 x の IOVA は `0x71000000 + r×4320 + 4x − 0x462000`。
+- パス A の base は 0x71008A00（行 1072）。パス B の base は 0x71009AC0（行 1073 の 0x71009AE0 の 32 B 手前）。どちらも 64 B に揃い、RB_MRT PITCH の値は 135 である。
+- 期待画素は **0xFFFF3300**（B 0、G 0x33、R 0xFF、X 0xFF）。R-1 で確かめた成分順（x が最下位バイト）をそのまま使う。alpha を 1.0 にするのは、DPU の SSPP 形式が alpha を使う場合に透明にならないようにするため。R-1 の色 0x000033FF とも区別できる。
+
+**IB6：** R-1 の IB5 が設定した状態はそのまま残る。同じ OOB 内で続けて実行し、CP は reset しない。IB6 は FS の差し替えと、パスごとの差分だけを書く。22 個の pkt4 register はすべて CP_PROTECT の範囲外（prot.py で確認）。
+
+| # | 群 | dw | packet | header | 値 | 内容 |
+|---|---|---|---|---|---|---|
+| 1 | S | 0 | pkt4 0xBB08 ×1 | 0x40BB0801 | 0xBF | HLSQ_INVALIDATE_CMD |
+| 2 | S | 2 | pkt4 0xA982 ×7 | 0x48A98207 | 0、0x70014A00、0、0、0、0、0 | SP_FS_OBJ_FIRST_EXEC_OFFSET, OBJ_START lo/hi, PVT_MEM_PARAM, PVT_MEM_ADDR lo/hi, PVT_MEM_SIZE |
+| 3 | S | 10 | pkt7 0x34 ×3 | 0x70348003 | 0x720000、0x70014A00、0 | CP_LOAD_STATE6_FRAG (SB6_FS_SHADER, 1 unit) |
+| 4 | A | 14 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x19C、0x7F029B | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 5 | A | 17 | pkt4 0x840A ×2 | 0x48840A02 | 0x19C、0x7F029B | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 6 | A | 20 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x19C、0x7F029B | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 7 | A | 23 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70014A80、0、0x20、0x10 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 8 | A | 28 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71008A00、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 9 | A | 33 | pkt7 0x38 ×3 | 0x70388003 | 0x88、1、2 | CP_DRAW_INDX_OFFSET (RECTLIST, AUTO_INDEX, 1 instance, 2 vertices) |
+| 10 | A | 37 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017044、0、0xCAFE000F | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[17] |
+| 11 | A | 42 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+| 12 | B | 43 | pkt4 0x80F0 ×2 | 0x4080F002 | 0x1A4、0x7F02A3 | GRAS_SC_WINDOW_SCISSOR_TL/BR |
+| 13 | B | 46 | pkt4 0x840A ×2 | 0x48840A02 | 0x1A4、0x7F02A3 | GRAS_2D_RESOLVE_CNTL_1/2 |
+| 14 | B | 49 | pkt4 0x80B0 ×2 | 0x4880B002 | 0x1A4、0x7F02A3 | GRAS_SC_SCREEN_SCISSOR_TL/BR[0] |
+| 15 | B | 52 | pkt4 0xA010 ×4 | 0x40A01004 | 0x70014AA0、0、0x20、0x10 | VFD_FETCH[0] BASE lo/hi, SIZE, STRIDE |
+| 16 | B | 57 | pkt4 0x8823 ×4 | 0x40882304 | 0x87、0、0x71009AC0、0 | RB_MRT[0] PITCH, ARRAY_PITCH, BASE lo/hi |
+| 17 | B | 62 | pkt7 0x38 ×3 | 0x70388003 | 0x88、1、2 | CP_DRAW_INDX_OFFSET (RECTLIST, AUTO_INDEX, 1 instance, 2 vertices) |
+| 18 | B | 66 | pkt7 0x46 ×4 | 0x70460004 | 0x1D、0x70017048、0、0xCAFE0010 | CP_EVENT_WRITE PC_CCU_FLUSH_COLOR_TS -> data[18] |
+| 19 | B | 71 | pkt7 0x26 ×0 | 0x70268000 | — | CP_WAIT_FOR_IDLE |
+
+ring[91..99] = `70BF8003 70014500 00000000 00000048 70460004 00000004 7001704C 00000000 CAFE0011`、WPTR 91 → **100**。生成器は scratchpad の `tools/d1ib.py`、dword 一覧は `d1_ib6.txt`。
+
+**手順（R-1 の後、OOB 解除前）：**
+1. 前段：R-1 の Status 成功、Reason 0、Checks 0x1F、WPTR 91、data[15..16] 正しい、R-1 の描画先 64 画素が正しいこと。RPTR / WPTR / shadow 91、ring[0..90] と既存 IB / シェーダ / data[0..16] の照合、MASK 0。不成立なら Reason 8 / 12 / 15 で未投入とする。
+2. band の CPU 写像：PA 0xE1462000、0x120000 B を `MmMapIoSpaceEx(PAGE_READWRITE|PAGE_NOCACHE)` で map する。DOD の WC 写像はまだないので、属性は衝突しない。probe の最後までに unmap する。
+3. 退避：band 全体（0x120000 B）を非ページプールに CPU コピーする。
+4. 準備：FS2、頂点 A/B、IB6、data[17..19] = 0xFFFFFFFF、ring[91..99] を書いてバリアを置き、読み返して照合する。不一致なら投入しない。
+5. MASK を再確認し、WPTR=100 を書く。fence / idle の待ちは R-1 と同じ。
+6. 判定のあと、**5 秒保持**する（`KeDelayExecutionThread`、PASSIVE）。この間に画面中央へ赤橙の正方形が出るはずなので、写真を撮る。
+7. 復元：退避した band を CPU で書き戻し、読み返して一致を確かめる。GPU の失敗時も、band を map できていれば必ず復元する。
+8. 診断の読み取りと片付けは R-1 と同じ。
+
+**判定（Checks）：**
+- bit0：R-1 成功。
+- bit1：idle、RPTR / WPTR / shadow 100、エラー割り込みなし。
+- bit2：data[17..19] が 3 つとも正しい。
+- bit3：四角形内の 65536 画素がすべて 0xFFFF3300（偶数行 32768、奇数行 32768 を別々に数える）。
+- bit4：band 内で四角形の外にあるすべての dword が退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**診断 `GpuGmuD1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（140 B の G2 形式）、`RChecks`、`RReason`、`Packet[9]`、`Fs[32]`、`VertA[8]`、`VertB[8]`、`IbBadCount / IbFirstBad / IbBadValue`。
+- `Disp[6]`（EpiDiag から読んだ D-0 の値。順は PhysLow, PhysHigh, Width, Height, Pitch, Format）。
+- `InsideEven`、`InsideOdd`、`InsideOther`、`InsideFirst`（band 内バイト位置）、`InsideValue`。
+- `OutsideChanged`、`OutsideFirst`、`OutsideOld`、`OutsideNew`。
+- `Edge[12]`：(411,1072)、(412,1072)、(667,1072)、(668,1072)、(412,1071)、(412,1327)、(412,1328)、(667,1327)、(412,1073)、(667,1073)、(411,1073)、(668,1073) の画素値。
+- `DataBefore[3]`、`DataAfter[3]`、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`。
+- `GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / AtSubmit / After`。
+- `ScanCount`、`ScanFirst`、`ScanDwords`：ring 走査で 0xFFFF3300 を探す。除外は R-1 の除外に `[0x4500,0x4620)`、`[0x4A00,0x4AC0)` を加え、data は `[0x7000,0x7050)`。
+- `RestoreMismatch`、`RestoreFirst`、`BandMapped`、`HoldMs`、`Checks`、`Prepared`。
+- breadcrumb は 0x1900 番台（R-1 と同じ割り振り）。
+
+**危険と対策：**
+- GPU から 0xE1000000 帯への書き込みが、NoC / stage-2 で拒否される可能性がある。HLOS が普通に使う領域なので、たぶん通る。拒否された場合は、fault・hang・data の未書き込みとして判定に残る。band は CPU 側で復元する。
+- 書き込み先は scissor・pitch・base の 3 つで四角形に限られる。D-1 は band の 288 page しか map しないので、band の外は GPU からそもそも見えない。
+- 保持中に表示が更新されない場合（autorefresh が無効など）は、判定が 0x3F でも画面に出ない。そのときは DPU 側の問題として切り分ける。
+
+**この後：** D-1 が通れば、次は varying（頂点ごとの色を FS で補間）と、texture（R-1 の描画先を sampler で読む）である。結果は同じ band に出して目でも確かめる。
+
+
+#### 9.21.38 D-0 / D-1 の実装（v73・v74 で実行、§9.21.40）
+
+§9.21.37 を実装した。実行値は `EpiGpuProbe=0xBFFFFE80`、`EpiGpuProbe2=3`。Probe2 は 0 / 1 / 3 だけを許し、1 と 3 は Probe が上記の値と完全一致するときだけ有効。既存の Probe2=0 / 1 の手順はそのままである。両 probe を 0 に戻して flush してから処理する。
+
+D-0 は `bdd.cxx` の POST display ownership 取得成功後に6個の DWORD を保存する。`DispSnapshotStatus` は保存前に NOT_FOUND にし、6項目の保存がすべて成功したときだけ0にする。D-1 は成功印と6項目の期待値を最初に検査し、GPU_CC / GCC / GMU / SMMU に触る前に止める。検査値は `GpuD1Display`（REG_BINARY、24 B）、`GpuD1Precondition`（DWORD、0=一致、1=欠落・不一致）に残す。不成立は `GpuProbeStatus=10`、検査結果の保存・flush 失敗は7。StartDevice 自体は D-0 の記録失敗で失敗させない。
+
+band は外部所有 region とし、D-1 要求時だけ SMMU Enable 前に PA `0xE1462000` / 長さ `0x120000` を IOVA `0x71000000` に READ|WRITE で map する。通常の確保・ゼロ埋め・物理解放から除外し、成功時の SMMU unmap と KeepCx 時の保持には含める。CPU の一時 NC 写像は region の Va に入れない。退避用非ページプールを先に確保してから CPU map する。
+
+R-1 成功後、同じ OOB で前段の ring / IB / shader / data / 描画先、RPTR / WPTR / shadow、MASK、外部 region を検査する。IB6（72 dw / 19 packet）、FS2、頂点 A/B、ring[91..99]、data[17..19] を準備・読み返し照合し、WPTR=100 を投入する。fenced write と idle の待ち・再送・エラー判定は R-1 と同じ。親の失敗は Reason 8、状態不一致は12、MASK 不一致は15で未投入となる。
+
+band 全体を退避値と照合し、偶数・奇数行の画素数を別々に集計する。投入後は診断を保存・flush し、PASSIVE の `KeDelayExecutionThread` で5秒保持してから、CPU で全域を復元・読み返し照合する。GPU の失敗や後続の breadcrumb / GX 確認失敗でも、退避済みなら復元する。復元用 breadcrumb の失敗でも書き戻し・照合を省略しない。保持前の保存・flush が失敗した場合は待機を省略して復元へ進む。CPU map と退避プールは KeepCx 時も関数内で解除・解放する。その後は既存の OOB 解除、slumber、reset、rpmh_stop、GX OFF 確認、SMMU Disable へ進む。
+
+`GpuGmuD1` は **REG_BINARY、644 B（161 DWORD）**。順序は以下。Status は NTSTATUS、ほかは ULONG。
+
+```text
+Cp (140 B、G2 形式)
+RChecks, RReason, Packet[9], Fs[32], VertA[8], VertB[8]
+IbBadCount, IbFirstBad, IbBadValue, Disp[6]
+InsideEven, InsideOdd, InsideOther, InsideFirst, InsideValue
+OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Edge[12]
+DataBefore[3], DataAfter[3], CpInterrupt, CpProtect, CpStatus1
+IbBaseLow, IbBaseHigh, IbRemaining
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4]
+MaskBefore, MaskAtSubmit, MaskAfter, ScanCount, ScanFirst, ScanDwords
+RestoreMismatch, RestoreFirst, BandMapped, HoldMs, Checks, Prepared
+BackupStatus, HoldStatus, RestoreStatus
+```
+
+Checks は §9.21.37 の6ビットで期待値 `0x3F`。InsideFirst / OutsideFirst / RestoreFirst は band 内バイト位置、IbFirstBad は IB 内 DWORD 位置、ScanFirst は ring 内バイト位置。Edge の順は仕様どおり。未記録・該当なしは `0xFFFFFFFF`、未実行 Status は NOT_FOUND。BandMapped は一度でも CPU map が成功したかを表し、終了時も1のまま。HoldMs は5秒待機成功時だけ5000。BackupStatus はプール確保・CPU map・退避、RestoreStatus は復元・照合とその breadcrumb の結果を含む。最初の Reason は後続の診断失敗で上書きしない。
+
+ring の色走査は仕様の除外範囲と ring[0..99] を除く **6766 DWORD** が対象。`0xFFFF3300` の Count / First を残すが描画判定には使わない。診断は保持前に一度保存・flush し、復元結果を cleanup と keep の両方で再保存する。CP の失敗は既存の EPI_GMU_E_CP、GX OFF や teardown の失敗は既存どおり status 8 / KeepCx が優先する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1900 / 0x1901 | CP診断用の既存2ページ map / 前段と MASK |
+| 0x1902 | 元の global fault |
+| 0x1908 | 退避プール確保・band の CPU map・全域退避（0x1903 より先） |
+| 0x1903 | IB6・FS2・頂点・data・ring の準備と照合 |
+| 0x1904 / 0x1905 / 0x1906 | MASK 再確認・WPTR=100 / fence / idle |
+| 0x1910〜0x191B | RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0、IB1_BASE下位／上位、IB1_REM_SIZE、MASK |
+| 0x1920 | 後の global fault |
+| 0x1930 | 保持前の診断保存・flush、5秒待機 |
+| 0x1931 / 0x1932 | band の必須復元 / 復元後の全域照合 |
+
+ホスト shim に framebuffer の模擬領域と2パス描画の peer を追加した。ケースは成功、奇数行未描画、外側破壊、fence 未書き込み、idle / fence 時間切れ、エラー割り込み、復元時の breadcrumb 失敗、復元不一致、退避・map 失敗、前段失敗による未投入、KeepCx 時の外部 region 保持と CPU map 解除を含む。peer は GPU の shader / rasterizer を実行するものではない。IB6 は提示された dword 一覧と静的に照合し、2パスのアドレス対応・境界・画素数も計算で確認した。テスト・ビルド・版番号変更・配置・実機実行・コミットは行っていない。
+
+
+#### 9.21.39 カーネルスタック対策（v74 で実行、§9.21.40）
+
+D-1 を含む `EpiGmuBootTest` の大きなローカルを `GMU_BOOT_TRACES` にまとめた。23個の trace と setup / RSCC の可変表を非ページプールに置く。前提検査のあと、Diag・ハードウェアに触る前に確保し、確保失敗は EPI_GMU_E_NOMEM で終了する。表の初期値は読み取り専用の静的定数からコピーする。17個の trace 初期化関数は `VOID ...TraceInit(T*)` に変え、入れ子も同じ場所で初期化する。構造体の値返しや、戻り値用の大きな一時領域はカーネル側から除いた。診断 ABI は変えていない。
+
+trace ブロックは通常の cleanup と keep の両方で、最後の診断保存後に解放する。GMU_TEST の確保失敗時も解放する。`g_KeptGmu` が保持するのは引き続き GMU_TEST とハードウェア用メモリ・map だけで、trace を指すメンバはない。PAS の checkpoint は同期呼び出しであり、ZapOwner は印、ZapRetainedMetadata は別の専用メモリなので trace の保持を必要としない。
+
+`EpiGpuProbe` からの CX 試験は、引数・結果をまとめたコンテキストを `EpiGpuCxCallout` に渡し、`KeExpandKernelStackAndCalloutEx(..., MAXIMUM_EXPANSION_SIZE, TRUE, NULL)` の上で実行する。戻り値を必ず確認し、失敗時は CX 試験に入らず `GpuCxStatus=18` とする。GPU_CC の通常の map 解除へ進む。呼び出しの NTSTATUS は `GpuStackExpandStatus` に記録する。
+
+- `GpuStackAtCx`（DWORD、バイト数）：callout に入った直後の `IoGetRemainingStackSize()`。callout 未実行は FFFFFFFF。
+- `GpuStackMin`（DWORD、バイト数）：この CX 試験の GmuStep 入口で採った残量の最小値。原子的に更新し、試験の直前にリセットする。GmuStep 未実行は FFFFFFFF。NT 内部のすべての瞬間を測るものではない。
+
+ホスト shim はプールを従来どおり calloc でゼロにし、固定値を返す残量 API と、直接 callout を呼ぶ拡張スタック API（失敗注入可能）を用意した。trace 確保失敗で Diag・ハードウェアに触らないケース、残量の単調な最小値、拡張失敗時の未呼び出しを追加し、確保失敗の列挙は1回分増やした。既存の KeepCx 後の擬似再起動でも trace が漏れていれば allocations.empty() の確認で検出する。
+
+`tools/check_stack.ps1` を追加し、ビルドスクリプトの msbuild 成功直後に呼ぶ。EWDK の Hostx64/arm64 dumpbin でリンク済み sys を逆アセンブルし、名前付き関数の prologue の pre-index stp / str、即値 sub（lsl 対応）、x15 定数 → __chkstk → sub の確保量を合計する。2 KB 超を WARN、4 KB 超を FAIL / exit 1 とし、__chkstk を呼ぶ関数名は必ず表示する。解釈できない動的確保、prologue 外の確保、PDB 欠落、ツール失敗も通過させない。`stack_check=FAIL <関数名> <バイト数>` などを build.log に追記し、失敗時はビルドスクリプトを異常終了させる。
+
+既存 v73 の sys / PDB を読み取り専用で調べた結果は、`EpiGmuBootTest` の **16448 B** で FAIL / exit 1。他の243関数にはエラー・閾値超過がなかった。これは __chkstk 分 0x3FE×16 = 16352 B に、先頭の stp による96 Bを足した値である。テキスト入力による parser の7ケース（2 KB / 4 KB 境界、即値 lsl、__chkstk、未解決レジスタ、分割 prologue、シンボル欠落）も通った。再現は `powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_stack_test.ps1`。
+
+修正後のドライバのフレームサイズは、次のビルドと stack check で確認する必要がある。ドライバおよび SMMU / GMU ホスト試験のビルド・実行、署名、配置、実機実行、版番号変更、コミットは行っていない。
+
+#### 9.21.40 v73 / v74 の結果（D-1、2026-11-13）：GPU の描画が画面に出た
+
+**v73（20.0.2.73、oem131）：2回とも落ちた。** D-0 は実機で `E1000000 / 0 / 1080 / 2400 / 4320 / 22（X8R8G8B8）` を記録し、§9.21.37 の値と一致した。
+- 1回目は breadcrumb 0x958（stage D の書き込み #24）で止まった。bug check は **0x2B PANIC_STACK_SWITCH**（minidump 111326-10187-01）。この回は直前に、registry の書き込みミスで status 6 の空の restart が1回入っている。
+- 2回目は 0xA43（stage E の書き込み #3）で止まり、新しいダンプはなかった。どちらも画面は黒いままだった。
+- 原因はカーネルスタックのあふれである。ARM64 の `KERNEL_STACK_SIZE` は 0x8000。v73 の EpiGmuBootTest のフレームは `__chkstk` で 0x3FE×16 = 16352 B あった。その中身は trace のローカル 約 9.7 KB と、値で返す初期化関数の一時コピーである。そこへ StartDevice（1456 B）、EpiGpuProbe（1408 B）、GX の各段が重なっていた。
+- D-1 の GPU 処理には一度も到達していない。対策は §9.21.39 のとおり。
+
+**v74（20.0.2.74、oem132）：成功。** 机上試験の shim で `_Function_class_` が二重定義になっていたので `#ifndef` で囲んだ。それ以外のビルド修正はない。スタック検査は PASS で、最大のフレームは BddDdiStartDevice の 1456 B。
+- phone を 23:46 に再起動し、EpiGpuProbe=0xBFFFFE80、EpiGpuProbe2=3 で実行した。**GpuGmuStatus 0、NtStatus 0**。KeepCx、DisableStatus、FaultStatus は 0、Step は 0xFFFF。phone は落ちていない。
+- **画面中央に赤橙の正方形が約5秒出て、元に戻ったことを目で確認した。**
+- スタック：GpuStackExpandStatus 0、GpuStackAtCx 0x11F60、GpuStackMin 0x11478。拡張したスタックの上で、CX 試験全体の使用量は約 2.8 KB だった。
+
+**GpuGmuD1（644 B）：**
+- Cp：Attempted 1、Reason 0、WptrWrites 1。WPTR は 0x5B → 0x64（91 → 100）、RPTR と shadow も 100。RBBM_STATUS 1、INT_STATUS 0、CP_HW_FAULT 0。
+- RChecks 0x1F（同じ実行の R-1 も 64 画素で成功）。Packet は書いた値と一致した。IbBadCount 0。Disp は D-0 の値と同じ。
+- **InsideEven 32768、InsideOdd 32768、InsideOther 0**。つまり 65536 画素がすべて 0xFFFF3300。**OutsideChanged 0**（band 0x120000 B のうち、四角形の外は退避値と同じ）。
+- Edge：(411,1072) 0、(412,1072) FFFF3300、(667,1072) FFFF3300、(668,1072) 0、(412,1071) 0、(412,1327) FFFF3300、(412,1328) 0、(667,1327) FFFF3300、(412,1073) FFFF3300、(667,1073) FFFF3300、(411,1073) 0、(668,1073) 0。restart 中の画面は黒（0）だった。
+- data[17..19] = 0xCAFE000F / 10 / 11。
+- CP_INTERRUPT、CP_PROTECT、CP_STATUS_1 は 0。IB1_BASE は 0x70014500、REM 0。global fault は前後とも 0、MASK は 0 / 0 / 0。
+- ring の走査は 6766 dw で 0xFFFF3300 が 0 個。
+- BackupStatus、HoldStatus、RestoreStatus は 0。HoldMs 5000。**RestoreMismatch 0**。
+- **Checks 0x3F**、Prepared 1。
+- context bank の FSR 0x400 / FSYNR 0x000F001B は、これまでと同じ古い記録である。
+
+**結論：** GPU の 3D パイプラインで描いた画素を、DPU が表示している framebuffer（PA 0xE1000000、pitch 4320）に書けた。画面にも出た。
+- pitch 4320 は 64 B に揃わないが、pitch 8640 の 2 パス（偶数行と、8 画素ずらした奇数行）で正確に描けた。
+- GPU から Display Reserved 領域への書き込みは、NoC / stage-2 で拒否されなかった。
+- 赤橙（R=FF、G=33）として表示された。BGRX の framebuffer に WZYX の RGBA8 で書くと、FS の x→B、z→R になる。
+- 次は varying（頂点ごとの色）と texture（R-1 の描画先を sampler で読む）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

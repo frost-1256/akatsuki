@@ -100,6 +100,19 @@ static bool allowR1Writes=false,r1Completes=true,r1Draw=true,r1Ccu=true,r1Event=
 static ULONG r1FenceDrops=0,r1ErrorBits=0,r1BadSentinel=0xFFFFFFFF,r1BadPixel=0xFFFFFFFF,r1Color=0x000033FF,r1Scatter=0xFFFFFFFF;
 static ULONG r1RectEnd=12;
 static std::vector<ULONG> r1Writes;
+// D-1 framebuffer peer: emulate two draws, not shader/graphics instruction execution.
+static bool allowD1Writes=false,d1Completes=true,d1Odd=true,d1Fences=true,d1Outside=false,d1FenceForever=false;
+static bool d1MapFails=false,d1Restoring=false;
+static ULONG d1RestoreDrop=0xFFFFFFFF,d1ErrorBits=0,d1FenceDrops=0,d1Maps=0,d1Unmaps=0;
+static std::vector<ULONG> d1Band(0x120000/4),d1Writes;
+inline bool D1BandPointer(volatile ULONG* p) {
+    const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
+    return address>=base && address<base+0x120000;
+}
+inline void GmuUnmap(void* p,SIZE_T n) {
+    if(p==d1Band.data()) {assert(n==0x120000); ++d1Unmaps;}
+    MmUnmapIoSpace(p,n);
+}
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -139,6 +152,11 @@ inline void GmuSeedGxRegs() {
 static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
+    if(a.QuadPart==0xE1462000) {
+        assert(allowD1Writes && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        if(d1MapFails) return nullptr;
+        ++d1Maps; return d1Band.data();
+    }
     if(a.QuadPart==0x8B110000) { assert(allowZ1Writes && size==0x1000 && protection==(PAGE_READWRITE|PAGE_NOCACHE)); return z1Reserved; }
     if(a.QuadPart==0x03D01000) return hwcgIsdbPage;
     if(a.QuadPart==0x03D6A000) return hwcgSpPage;
@@ -154,6 +172,7 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     assert(false); return nullptr;
 }
 inline ULONG GmuMmioRead(volatile ULONG* p) {
+    if(D1BandPointer(p)) return *p;
     if(g3cPolling && g3cPending) {
         if(p==gPages[2]+0x315 && g3cShowUnmasked && g3cSample>=g3cUnmaskedDelay) *p|=1UL<<20;
         if(p==GmuCfgReg(0x201) && g3cShowStatus && g3cSample>=g3cStatusDelay) *p|=1UL<<20;
@@ -163,8 +182,38 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
     return value;
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
+    if(D1BandPointer(p)) {
+        assert(d1Restoring);
+        if(static_cast<ULONG>(p-d1Band.data())!=d1RestoreDrop) *p=v;
+        return;
+    }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && v==100) {
+        assert(allowG2Writes && allowD1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
+        const ULONG packet[]={0x70BF8003,0x70014500,0,72,0x70460004,4,0x7001704C,0,0xCAFE0011};
+        const ULONG fs[32]={0,0x204CC000,0x3E4CCCCD,0x204CC001,0x3F800000,0x204CC002,
+                            0x3F800000,0x204CC003,0,0x500,0,0x03000000};
+        assert(std::memcmp(g2Ring+91,packet,sizeof(packet))==0 && std::memcmp(g2Ring+0x4A00/4,fs,sizeof(fs))==0);
+        assert(g2Ring[0x4500/4+29]==135 && g2Ring[0x4500/4+31]==0x71008A00 && g2Ring[0x4500/4+60]==0x71009AC0);
+        assert(g2Ring[0x4500/4+33]==0x70388003 && g2Ring[0x4500/4+62]==0x70388003);
+        g2Writes.push_back({0x807,v}); d1Writes.push_back(v);
+        if(d1FenceForever || d1FenceDrops) {
+            if(d1FenceDrops) --d1FenceDrops;
+            gPages[2][0x313]=1; return;
+        }
+        gPages[2][0x313]=0;
+        *GmuCfgReg(0x928)=0x70014500; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=72;
+        if(d1Completes) {
+            for(ULONG y=1072;y<1328;++y) if(d1Odd || !(y&1)) for(ULONG x=412;x<668;++x)
+                d1Band[(y*4320+x*4-0x462000)/4]=0xFFFF3300;
+            if(d1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+            if(d1Fences) {g2Ring[0x7044/4]=0xCAFE000F; g2Ring[0x7048/4]=0xCAFE0010; g2Ring[0x704C/4]=0xCAFE0011;}
+            *g2Shadow=100; *GmuCfgReg(0x806)=100; *GmuCfgReg(0x92A)=0;
+        }
+        gPages[8][0x210]=g2RbbmBusy ? 2 : 1; gPages[8][0x201]=d1ErrorBits|(g2Hang ? (1UL<<23) : 0);
+        gPages[2][0x30C]=g2GmuBusy ? (1UL<<23) : 0; *p=v; return;
+    }
     if(p==GmuCfgReg(0x807) && v==91) {
         assert(allowG2Writes && allowR1Writes && z1Authorized && *GmuCfgReg(0x38)==0);
         const ULONG packet[]={0x70BF8003,0x70014000,0,314,0x70460004,4,0x70017040,0,0xCAFE000E};
@@ -439,6 +488,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
+        if(v==0x1931) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -462,6 +512,7 @@ inline void* GmuAlloc(SIZE_T n,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRES
 }
 inline void GmuFree(void* p,SIZE_T,int) { assert(allocations.erase(p)==1); _aligned_free(p); }
 #define MmMapIoSpaceEx GmuMap
+#define MmUnmapIoSpace GmuUnmap
 #define WRITE_REGISTER_ULONG GmuMmioWrite
 #define READ_REGISTER_ULONG GmuMmioRead
 #define EpiSetDword GmuDword

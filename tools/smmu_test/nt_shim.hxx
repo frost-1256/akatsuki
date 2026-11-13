@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdio>
 #include <malloc.h>
+using LONG = std::int32_t;
 using ULONG = std::uint32_t;
 using ULONGLONG = std::uint64_t;
 using SIZE_T = std::size_t;
@@ -72,6 +73,27 @@ inline void WRITE_REGISTER_ULONG(volatile ULONG* p, ULONG v) {
 }
 inline void* MmMapIoSpaceEx(PHYSICAL_ADDRESS, SIZE_T, ULONG) { return mmio; }
 inline void MmUnmapIoSpace(void*, SIZE_T) {}
+inline LONG InterlockedCompareExchange(volatile LONG* p,LONG v,LONG c) {
+    const LONG old=*p; if(old==c) *p=v; return old;
+}
+inline LONG InterlockedExchange(volatile LONG* p,LONG v) {const LONG old=*p; *p=v; return old;}
+static ULONG testRemainingStack=72*1024;
+inline ULONG IoGetRemainingStackSize() {return testRemainingStack;}
+#ifndef NTAPI
+#define NTAPI
+#endif
+#ifndef _Function_class_
+#define _Function_class_(x)
+#endif
+#define MAXIMUM_EXPANSION_SIZE (72*1024-2048)
+using PEXPAND_STACK_CALLOUT=VOID (NTAPI *)(PVOID);
+static NTSTATUS testExpandStatus=STATUS_SUCCESS;
+static ULONG testExpandCalls=0;
+inline NTSTATUS KeExpandKernelStackAndCalloutEx(PEXPAND_STACK_CALLOUT callout,PVOID parameter,SIZE_T size,BOOLEAN wait,PVOID context) {
+    assert(size==MAXIMUM_EXPANSION_SIZE && wait && !context); ++testExpandCalls;
+    if(!NT_SUCCESS(testExpandStatus)) return testExpandStatus;
+    callout(parameter); return STATUS_SUCCESS;
+}
 inline void* InterlockedCompareExchangePointer(void* volatile* p, void* v, void* c) {
     void* old=*p; if (old==c) *p=v; return old;
 }

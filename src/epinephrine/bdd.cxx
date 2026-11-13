@@ -109,6 +109,23 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
         // after a pre-WDDM 1.2 driver. Since we can't draw anything, we should fail to start.
         return STATUS_UNSUCCESSFUL;
     }
+    // D-0: retain the actual POST framebuffer description for a later same-boot D-1 restart.
+    // The GPU probe above intentionally runs before acquiring ownership and before any DOD framebuffer map.
+    {
+        HANDLE params=NULL,diag=NULL;
+        if (NT_SUCCESS(EpiOpenDiag(m_DeviceInfo.PhysicalDeviceObject,&params,&diag)))
+        {
+            const DXGK_DISPLAY_INFORMATION& d=m_CurrentModes[0].DispInfo;
+            const PCWSTR names[]={L"DispPhysLow",L"DispPhysHigh",L"DispWidth",L"DispHeight",L"DispPitch",L"DispFormat"};
+            const ULONG values[]={d.PhysicAddress.LowPart,static_cast<ULONG>(d.PhysicAddress.HighPart),
+                                  d.Width,d.Height,d.Pitch,static_cast<ULONG>(d.ColorFormat)};
+            NTSTATUS saved=EpiSetDword(diag,L"DispSnapshotStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
+            for (ULONG i=0;i<RTL_NUMBER_OF(names);++i)
+            { const NTSTATUS st=EpiSetDword(diag,names[i],values[i]); if (!NT_SUCCESS(st) && NT_SUCCESS(saved)) { saved=st; } }
+            EpiSetDword(diag,L"DispSnapshotStatus",static_cast<ULONG>(saved)); ZwFlushKey(diag);
+            ZwClose(diag); ZwClose(params);
+        }
+    }
     // Epinephrine (WP2b-3b): software VSync from the INTF1 frame counter (read-only). If it cannot start,
     // ControlInterrupt fails and no VSync is reported (dxgkrnl was told at DriverEntry that we have VSync control).
     if (g_EpiSoftVsync)

@@ -28,9 +28,14 @@
 #define EPI_GMU_PROBE_Z1        0x20000000UL // Z-1c: requires G5b (0x3FFFFE80 total), direct PAS zap; IS_SUPPORTED x1 is advisory
 #define EPI_GMU_PROBE_S1        0x80000000UL // requires Z-1c (0xBFFFFE80 total); one compute invocation/global store
 #define EPI_GMU_PROBE2_R1      0x1UL // EpiGpuProbe2 bit0, valid only with EpiGpuProbe exactly BFFFFE80
+#define EPI_GMU_PROBE2_D1      0x2UL // requires R1; Probe2=3, external framebuffer band with backup/restore
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || (Probe2==EPI_GMU_PROBE2_R1 && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3) && Probe==0xBFFFFE80UL);
+}
+inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
+{
+    return D!=NULL && D[0]==0xE1000000 && D[1]==0 && D[2]==1080 && D[3]==2400 && D[4]==4320 && (D[5]==21 || D[5]==22);
 }
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
@@ -295,6 +300,34 @@ inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 // Breadcrumbs 1800 map, 1801 prior state/MASK, 1802 global, 1803 prepare/readback, 1804 publish,
 // 1805 fence, 1806 idle, 1810..181B and 1820 are the same diagnostics as S1. Parent failure: Reason=8.
 
+// D-0: after acquiring POST display ownership, EpiDiag DWORDs DispPhysLow/High, DispWidth/Height,
+// DispPitch, DispFormat and DispSnapshotStatus (NTSTATUS; 0 only after all six saves succeeded).
+// D-1 requires a successful snapshot matching {E1000000,0,1080,2400,4320,21 or 22} before GPU access.
+// GpuD1Display is the six-DWORD preflight copy; GpuD1Precondition is 0=matched, 1=missing/mismatched.
+// GpuProbeStatus=10 denotes this preflight rejection (7 if saving the preflight result failed).
+// GpuGmuD1: 644 bytes, all fields are DWORDs (NTSTATUS where named Status), in this order:
+// Cp (140-byte G2 layout), RChecks, RReason, Packet[9], Fs[32], VertA[8], VertB[8],
+// IbBadCount, IbFirstBad, IbBadValue, Disp[6], InsideEven, InsideOdd, InsideOther, InsideFirst, InsideValue,
+// OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Edge[12], DataBefore[3], DataAfter[3],
+// CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining, GlobalStatus[2],
+// GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAtSubmit, MaskAfter, ScanCount, ScanFirst, ScanDwords,
+// RestoreMismatch, RestoreFirst, BandMapped, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus.
+// Checks: 1 parent R1, 2 idle/endpoints=100/no errors, 4 data[17..19]=CAFE000F/10/11,
+// 8 all 65536 pixels FFFF3300 (32768 even/odd each), 16 outside unchanged, 32 exact restore. Require 3F.
+// First offsets refer to bytes within the 120000-byte framebuffer band; IbFirstBad is an IB DWORD index,
+// ScanFirst is a ring byte offset. ScanDwords=6766; only FFFF3300 is scanned. Unrecorded values are FFFFFFFF.
+// BandMapped records whether CPU mapping ever succeeded; it is always unmapped before return, even on KeepCx.
+// BackupStatus covers pool allocation + CPU map/backup; HoldStatus is NOT_FOUND if no WPTR publication;
+// RestoreStatus covers mandatory restore/verify, including breadcrumb failures. RestoreMismatch=0 means exact match.
+// Breadcrumbs: 1900 map, 1901 prior/MASK, 1902 global, 1908 CPU backup, 1903 prepare/readback,
+// 1904 submit, 1905 fence, 1906 idle, 1910..191B diagnostics, 1920 global, 1930 hold/save+flush,
+// 1931 restore, 1932 verify. Restore/verify run even if their breadcrumbs cannot be saved.
+
+// Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
+// Minimum is FFFFFFFF until the first sample. Both values are byte counts.
+VOID EpiGmuStackReset();
+ULONG EpiGmuStackMinimum();
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off
@@ -322,6 +355,8 @@ inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 // Z1: requires G5b Checks=B and blank pixels; direct PAS zap then SET_SECURE_MODE and repeat fill (0x3FFFFE80).
 // S1: requires successful Z-1c; one compute invocation/global store under the same OOB (0xBFFFFE80).
 // R1: EpiGpuProbe2 bit0 with exactly 0xBFFFFE80, after successful S1; private target VS/FS RECTLIST draw.
+// D1: Probe2=3 after R1; external display band map, two draws, 5-second hold and mandatory CPU restore.
+// Disp supplies the six preflight D-0 DWORDs; external display RAM is never allocated/zeroed/freed by GMU.
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -331,4 +366,5 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
-                     BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE);
+                     BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL);

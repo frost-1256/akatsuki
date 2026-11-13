@@ -32,5 +32,10 @@ $code = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 "msbuild_exit=$code" | Out-File $log -Append -Encoding utf8
 if ($code -ne 0) { throw "build failed ($code), see $log" }
+# A failed/unsupported stack inspection blocks the successful-build path, including later signing.
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'check_stack.ps1') `
+    -ImagePath (Join-Path $out 'Epinephrine.sys') -EwdkRoot $ewdk -LogPath $log
+$stackCode = $LASTEXITCODE
+if ($stackCode -ne 0) { throw "stack check failed ($stackCode), see $log; do not sign this build" }
 Get-ChildItem $out -Recurse -File | Where-Object Extension -in '.sys', '.inf', '.cat', '.pdb' |
   ForEach-Object { "$($_.FullName.Substring($out.Length + 1))  $((Get-FileHash $_.FullName).Hash)" } | Tee-Object -FilePath $log -Append

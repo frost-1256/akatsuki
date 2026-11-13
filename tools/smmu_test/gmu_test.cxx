@@ -5,7 +5,7 @@
 #include <fstream>
 #include <iterator>
 struct EPI_SMMU { bool enabled, gpuStreams; };
-struct TEST_MAP { ULONGLONG Iova; SIZE_T Size; ULONG Flags; };
+struct TEST_MAP { ULONGLONG Iova; SIZE_T Size; ULONG Flags; ULONGLONG Pa; };
 static std::vector<TEST_MAP> testMaps;
 static ULONGLONG failMapIova=~0ULL;
 NTSTATUS EpiSmmuConfigureGpuStreams(EPI_SMMU* c) { assert(!c->enabled); c->gpuStreams=true; return 0; }
@@ -18,7 +18,7 @@ NTSTATUS EpiSmmuCreate(HANDLE,EPI_SMMU** c) {
 }
 NTSTATUS EpiSmmuMap(EPI_SMMU*,ULONGLONG iova,PHYSICAL_ADDRESS pa,SIZE_T size,ULONG flags) {
     if(iova==failMapIova) return STATUS_INSUFFICIENT_RESOURCES;
-    testMaps.push_back({iova,size,flags});
+    testMaps.push_back({iova,size,flags,static_cast<ULONGLONG>(pa.QuadPart)});
     if(iova==0x70010000 || iova==0x70020000) {
         for(const auto& a:allocations) if(a.second==static_cast<ULONGLONG>(pa.QuadPart)) {
             if(iova==0x70010000) g2Ring=static_cast<ULONG*>(a.first);
@@ -126,6 +126,12 @@ extern "C" VOID EpiSmcInvoke(EPI_SMC_REGS* r) {
     if(cmd==5) z1Authorized=true;
 }
 static void Reset() {
+    EpiGmuStackReset(); testRemainingStack=72*1024; testExpandStatus=STATUS_SUCCESS; testExpandCalls=0;
+    allowD1Writes=false; d1Completes=true; d1Odd=true; d1Fences=true; d1Outside=false; d1FenceForever=false;
+    d1MapFails=false; d1Restoring=false; d1RestoreDrop=0xFFFFFFFF; d1ErrorBits=0; d1FenceDrops=0;
+    d1Maps=0; d1Unmaps=0; d1Writes.clear();
+    for(ULONG i=0;i<d1Band.size();++i) d1Band[i]=0xAB000000+i;
+
     r1CopyTarget=nullptr; r1CopyBadDword=0xFFFFFFFF;
     r1RectEnd=12;
     allowR1Writes=false; r1Completes=true; r1Draw=true; r1Ccu=true; r1Event=true; r1FenceForever=false; r1BadRptr=false;
@@ -187,7 +193,7 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false,BOOLEAN z1=false,BOOLEAN s1=false,BOOLEAN r1=false,BOOLEAN d1=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
     allowG4Writes=g4;
@@ -195,16 +201,17 @@ static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
     allowG5bWrites=g5b;
     allowZ1Writes=z1; const auto zap=ZapImage();
     allowS1Writes=s1;
-    allowR1Writes=r1;
+    allowR1Writes=r1; allowD1Writes=d1;
+    const ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b,z1,zap.data(),static_cast<ULONG>(zap.size()),s1,r1,d1,d1 ? disp : nullptr);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
     GMU_TEST* s=g_KeptGmu; assert(s);
     if(s->Smmu) {s->Smmu->enabled=false; EpiSmmuDestroy(s->Smmu);}
-    for(ULONG i=0;i<s->Count;++i) if(s->Regions[i].Va) GmuFree(s->Regions[i].Va,s->Regions[i].Size,0);
+    for(ULONG i=0;i<s->Count;++i) if(!s->Regions[i].External && s->Regions[i].Va) GmuFree(s->Regions[i].Va,s->Regions[i].Size,0);
     ExFreePoolWithTag(s,EPI_GMU_TAG); g_KeptGmu=nullptr;
 }
 int main(int argc,char** argv) {
@@ -212,7 +219,14 @@ int main(int argc,char** argv) {
     // Probe2 is optional, but R-1 must have exactly the full S-1 value and no unknown bits.
     assert(EpiGmuProbe2Valid(0,0) && EpiGmuProbe2Valid(0x80,0) && EpiGmuProbe2Valid(0xBFFFFE80,1));
     for(ULONG invalid:{0UL,0x3FFFFE80UL,0x80000000UL,0xFFFFFF80UL}) assert(!EpiGmuProbe2Valid(invalid,1));
-    for(ULONG invalid:{2UL,3UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{2UL,4UL,0x80000000UL,0xFFFFFFFFUL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    assert(EpiGmuProbe2Valid(0xBFFFFE80,3) && !EpiGmuProbe2Valid(0x3FFFFE80,3));
+    {
+        ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
+        assert(EpiGmuD1DisplayMatches(disp)); disp[5]=22; assert(EpiGmuD1DisplayMatches(disp));
+        for(ULONG i=0;i<6;++i) {const ULONG v=disp[i]; disp[i]=0xFFFFFFFF; assert(!EpiGmuD1DisplayMatches(disp)); disp[i]=v;}
+        assert(!EpiGmuD1DisplayMatches(nullptr));
+    }
     // Z-1b: only read-only SMCs; independent of ZapOnce and every GPU power/memory prerequisite.
     {
         EPI_ZAP_QUERY_TRACE q;
@@ -350,7 +364,7 @@ int main(int argc,char** argv) {
             r->Va=GmuAlloc(r->Size,{0},{0xFFFFFFFFFLL},{0},0); assert(r->Va);
             std::memset(r->Va,0,r->Size);
         }
-        GMU_G1_TRACE trace=GmuG1Trace();
+        GMU_G1_TRACE trace; GmuG1TraceInit(&trace);
         assert(GmuG1Copy(&mem,reinterpret_cast<HANDLE>(1),sqe.data(),&trace)==0);
         assert(trace.SqeBytes==40492 && trace.SqeFirst==0x016DC094 && trace.SqeLast==0x12345678);
         for(ULONG i=0;i<3;++i) {
@@ -398,7 +412,7 @@ int main(int argc,char** argv) {
         assert(halt.FinalCx[0]==0 && halt.FinalCx[1]==3 && halt.CxPolls==0);
         // Stage A: all originals precede ordered writes; stage B slots stay unread.
         for(ULONG i=0;i<4;++i) secvidPage[i]=0x10+i;
-        GMU_GX_INIT_TRACE init=GmuGxInitTrace();
+        GMU_GX_INIT_TRACE init; GmuGxInitTraceInit(&init);
         assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
         assert(init.Reason==0 && init.Attempted==1 && init.Count==4);
         const ULONG order[]={3,0,1,2};
@@ -410,22 +424,22 @@ int main(int argc,char** argv) {
         assert(addrWrites.empty()); // stage A alone never writes an ADDR_MODE register
         // Failure at the second write breadcrumb leaves the remaining registers untouched.
         secvidWrites.clear(); for(ULONG i=0;i<4;++i) secvidPage[i]=0x10+i;
-        init=GmuGxInitTrace(); failGmuStep=0x811;
+        GmuGxInitTraceInit(&init); failGmuStep=0x811;
         assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
         assert(init.Reason==6 && init.Count==1 && secvidWrites.size()==1 && secvidPage[0]==0x10);
         // A failed original-read breadcrumb prevents every write.
-        secvidWrites.clear(); init=GmuGxInitTrace(); failGmuStep=0x802;
+        secvidWrites.clear(); GmuGxInitTraceInit(&init); failGmuStep=0x802;
         assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
         assert(init.Reason==6 && init.Count==0 && init.Attempted==0 && secvidWrites.empty());
         // Readback mismatch at BASE low stops before BASE high and SIZE.
         failGmuStep=0xFFFFFFFF; failSecvidOffset=0;
-        init=GmuGxInitTrace();
+        GmuGxInitTraceInit(&init);
         assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
         assert(init.Reason==7 && init.Count==2 && secvidWrites.size()==2);
         assert(init.After[1]==0x10 && init.After[2]==0xFFFFFFFF && secvidPage[1]==0x11);
         failSecvidOffset=0xFFFFFFFF;
         // Stage B follows A, saves all originals, and writes exactly the documented order.
-        init=GmuGxInitTrace();
+        GmuGxInitTraceInit(&init);
         assert(GmuGxSecvid(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
         for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
         assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==0);
@@ -433,12 +447,12 @@ int main(int argc,char** argv) {
         for(ULONG i=0;i<12;++i)
             assert(addrWrites[i]==addrDwords[i] && init.Before[4+i]==0x100+i && init.After[4+i]==1);
         // No stage B accesses after a failed/incomplete stage A.
-        addrWrites.clear(); init=GmuGxInitTrace();
+        addrWrites.clear(); GmuGxInitTraceInit(&init);
         assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_INVALID_DEVICE_STATE);
         assert(init.Reason==8 && addrWrites.empty());
         // Fail each stage B write breadcrumb: only earlier writes may complete.
         for(ULONG fail=0;fail<12;++fail) {
-            init=GmuGxInitTrace(); init.Reason=0; init.Count=4; init.Attempted=1;
+            GmuGxInitTraceInit(&init); init.Reason=0; init.Count=4; init.Attempted=1;
             addrWrites.clear(); for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
             failGmuStep=0x830+fail;
             assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
@@ -447,17 +461,17 @@ int main(int argc,char** argv) {
             for(ULONG i=fail;i<12;++i) assert(init.After[4+i]==0xFFFFFFFF && *GmuAddrReg(i)==0x100+i);
         }
         // A failed original read or map must prevent every stage B write.
-        init=GmuGxInitTrace(); init.Reason=0; init.Count=4;
+        GmuGxInitTraceInit(&init); init.Reason=0; init.Count=4;
         addrWrites.clear(); failGmuStep=0x825;
         assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
         assert(init.Reason==6 && init.Count==4 && addrWrites.empty());
-        init=GmuGxInitTrace(); init.Reason=0; init.Count=4;
+        GmuGxInitTraceInit(&init); init.Reason=0; init.Count=4;
         failGmuStep=0xFFFFFFFF; failAddrMap=3;
         assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_INSUFFICIENT_RESOURCES);
         assert(init.Reason==5 && init.Count==4 && addrWrites.empty()); failAddrMap=0xFFFFFFFF;
         // A readback mismatch includes that write in Count and stops the remainder.
         for(ULONG fail=0;fail<12;++fail) {
-            init=GmuGxInitTrace(); init.Reason=0; init.Count=4; init.Attempted=1;
+            GmuGxInitTraceInit(&init); init.Reason=0; init.Count=4; init.Attempted=1;
             addrWrites.clear(); for(ULONG i=0;i<12;++i) *GmuAddrReg(i)=0x100+i;
             failAddrWrite=fail;
             assert(GmuGxAddrMode(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&init)==STATUS_IO_DEVICE_ERROR);
@@ -476,7 +490,7 @@ int main(int argc,char** argv) {
                 (off>=0x400 ? hwcgIsdbPage : gPages[8])[off&0x3FF]=0xA000+i;
             }
         };
-        seedHwcg(); GMU_GX_HWCG_TRACE hw=GmuGxHwcgTrace();
+        seedHwcg(); GMU_GX_HWCG_TRACE hw; GmuGxHwcgTraceInit(&hw);
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
         assert(hw.Attempted==1 && hw.Reason==0 && hw.Count==53 && hw.Skipped==0);
         assert(hwcgWrites.size()==55 && hw.SptpracBefore==0xA5 && hw.SptpracAfterClear==0xA4 && hw.SptpracAfterSet==0xA5);
@@ -490,50 +504,50 @@ int main(int argc,char** argv) {
         assert(hwcgWrites[54].first==0xAE && hwcgWrites[54].second==0x8AA8AA82);
         assert(GmuGxHwcgRestore(&probe,reinterpret_cast<HANDLE>(1),&hw)==0);
         for(ULONG i=0;i<3;++i) assert(hw.CgcRestored[i]==0x10+i && gPages[2][0x309+i]==0x10+i);
-        seedHwcg(); hw=GmuGxHwcgTrace(); gPages[8][0xAE]=0x8AA8AA82;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); gPages[8][0xAE]=0x8AA8AA82;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
         assert(hw.Skipped==1 && hw.Count==0 && hw.Attempted==0 && hwcgWrites.empty());
         // Every table breadcrumb failure must still re-enable SP, and must skip CLOCK_CNTL.
         for(ULONG fail=0;fail<49;++fail) {
-            seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x890+fail;
+            seedHwcg(); GmuGxHwcgTraceInit(&hw); failGmuStep=0x890+fail;
             assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
             assert(hw.Reason==6 && hw.Count==3+fail && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
             for(ULONG i=fail;i<49;++i) assert(hw.After[i]==0xFFFFFFFF);
         }
         // v55: an ignored write at any table position is recorded, but all later writes complete.
         for(ULONG fail=0;fail<49;++fail) {
-            seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=GmuHwcgTable[fail][0];
+            seedHwcg(); GmuGxHwcgTraceInit(&hw); failHwcgDword=GmuHwcgTable[fail][0];
             assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
             assert(hw.Reason==0 && hw.Count==53 && hw.After[fail]==0xA000+fail && hw.SptpracAfterSet==0xA5);
             for(ULONG i=0;i<49;++i) assert(hw.After[i]==(i==fail ? 0xA000+i : GmuHwcgTable[i][1]));
             assert(gPages[8][0xAE]==0x8AA8AA82 && hwcgWrites.size()==55);
         }
         // Even a failed re-enable breadcrumb must not suppress the actual recovery write.
-        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x8C1;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failGmuStep=0x8C1;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Reason==6 && hw.SptpracAfterSet==0xA5 && gPages[8][0xAE]==0);
-        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgSpSet=true;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failHwcgSpSet=true;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
         assert(hw.Reason==0 && hw.Count==53 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0x8AA8AA82);
         // Both SP writes ignored: diagnostic values differ, but the table and CLOCK_CNTL still complete.
-        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0x1A880;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failHwcgDword=0x1A880;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
         assert(hw.Reason==0 && hw.Count==53 && hw.SptpracAfterClear==0xA5 && hw.SptpracAfterSet==0xA5);
         // A later SP readback mismatch cannot replace an earlier breadcrumb failure.
-        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x895; failHwcgSpSet=true;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failGmuStep=0x895; failHwcgSpSet=true;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Reason==6 && hw.Count==8 && hw.SptpracAfterSet==0xA4 && gPages[8][0xAE]==0);
         // CGC and final CLOCK_CNTL comparisons remain strict.
-        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0x23B09;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failHwcgDword=0x23B09;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Reason==7 && hw.Count==1 && hw.SptpracAfterClear==0xFFFFFFFF);
-        seedHwcg(); hw=GmuGxHwcgTrace(); failHwcgDword=0xAE;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failHwcgDword=0xAE;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Reason==7 && hw.Count==53 && hw.ClockCntlAfter==0);
-        seedHwcg(); hw=GmuGxHwcgTrace(); failGmuStep=0x845;
+        seedHwcg(); GmuGxHwcgTraceInit(&hw); failGmuStep=0x845;
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==STATUS_IO_DEVICE_ERROR);
         assert(hw.Count==0 && hw.Attempted==0 && hwcgWrites.empty());
-        seedHwcg(); hw=GmuGxHwcgTrace();
+        seedHwcg(); GmuGxHwcgTraceInit(&hw);
         assert(GmuGxHwcg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&hw)==0);
         failHwcgDword=0x23B09;
         assert(GmuGxHwcgRestore(&probe,reinterpret_cast<HANDLE>(1),&hw)==STATUS_IO_DEVICE_ERROR);
@@ -546,7 +560,7 @@ int main(int argc,char** argv) {
             for(ULONG i=0;i<30;++i) *GmuCfgReg(cfgDwords[i])=0x100+i;
             *GmuCfgReg(0x1F841)=0xABCDEFAA; *GmuCfgReg(0x1F840)=0;
         };
-        seedCfg(); GMU_GX_CFG_TRACE cfg=GmuGxCfgTrace();
+        seedCfg(); GMU_GX_CFG_TRACE cfg; GmuGxCfgTraceInit(&cfg);
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
         assert(cfg.Reason==0 && cfg.Count==30 && cfg.Attempted==1 && cfg.CxWritten==7 && cfgWrites.size()==30);
         assert(cfg.Writes[0].Before==0x11C && cfg.Writes[28].Before==0x11C);
@@ -561,34 +575,34 @@ int main(int argc,char** argv) {
         assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==0);
         assert(cfgWrites.size()==2 && cfg.CxRestored[2]==0);
         for(ULONG i=0;i<3;++i) assert(cfg.CxRestored[i]==cfg.CxBefore[i]);
-        seedCfg(); cfg=GmuGxCfgTrace(); *GmuCfgReg(0x1F840)=5;
+        seedCfg(); GmuGxCfgTraceInit(&cfg); *GmuCfgReg(0x1F840)=5;
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
         *GmuCfgReg(0x1F840)=0;
         assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==0);
         assert(cfg.CxBefore[2]==5 && cfg.CxRestored[2]==5 && *GmuCfgReg(0x1F840)==5);
         for(ULONG fail=0;fail<30;++fail) {
-            seedCfg(); cfg=GmuGxCfgTrace(); failCfgDword=cfgDwords[fail];
+            seedCfg(); GmuGxCfgTraceInit(&cfg); failCfgDword=cfgDwords[fail];
             assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
             assert(cfg.Reason==0 && cfg.Count==30 && cfgWrites.size()==30);
         }
         // Every write breadcrumb failure stops later writes, leaving unread After fields untouched.
         for(ULONG fail=0;fail<30;++fail) {
-            seedCfg(); cfg=GmuGxCfgTrace(); failGmuStep=0x940+fail;
+            seedCfg(); GmuGxCfgTraceInit(&cfg); failGmuStep=0x940+fail;
             assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_IO_DEVICE_ERROR);
             assert(cfg.Reason==6 && cfg.Count==fail && cfgWrites.size()==fail);
             for(ULONG i=fail;i<30;++i) assert(cfg.Writes[i].After==0xFFFFFFFF);
             assert(cfg.CxWritten==static_cast<ULONG>((fail>24 ? 1 : 0)|(fail>25 ? 2 : 0)|(fail>26 ? 4 : 0)));
         }
-        seedCfg(); cfg=GmuGxCfgTrace(); failGmuStep=0x919;
+        seedCfg(); GmuGxCfgTraceInit(&cfg); failGmuStep=0x919;
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_IO_DEVICE_ERROR);
         assert(cfg.Count==0 && cfg.CxWritten==0 && cfgWrites.empty());
-        seedCfg(); cfg=GmuGxCfgTrace(); failAddrMap=0;
+        seedCfg(); GmuGxCfgTraceInit(&cfg); failAddrMap=0;
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_INSUFFICIENT_RESOURCES);
         assert(cfg.Reason==5 && cfgWrites.empty());
-        seedCfg(); cfg=GmuGxCfgTrace(); gPages[1][0xD0]=0xC0;
+        seedCfg(); GmuGxCfgTraceInit(&cfg); gPages[1][0xD0]=0xC0;
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==STATUS_INVALID_DEVICE_STATE);
         assert(cfg.Reason==GX_REG_HM_OFF && cfg.Count==0 && cfgWrites.empty()); gPages[1][0xD0]=0;
-        seedCfg(); cfg=GmuGxCfgTrace();
+        seedCfg(); GmuGxCfgTraceInit(&cfg);
         assert(GmuGxCfg(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cfg)==0);
         failCfgDword=0x23B0E;
         assert(GmuGxCfgRestore(&probe,reinterpret_cast<HANDLE>(1),&cfg,&oob)==STATUS_IO_DEVICE_ERROR);
@@ -601,7 +615,7 @@ int main(int argc,char** argv) {
             for(ULONG i=0;i<47;++i) *GmuCfgReg(GmuStageEReg(i))=0x200+i;
             for(ULONG reg=0x878;reg<=0x87E;++reg) *GmuCfgReg(reg)=0xCAFE;
         };
-        seedStageE(); GMU_GX_STAGE_E_TRACE stageE=GmuGxStageETrace();
+        seedStageE(); GMU_GX_STAGE_E_TRACE stageE; GmuGxStageETraceInit(&stageE);
         assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==0);
         assert(stageE.Reason==0 && stageE.Count==47 && stageE.Attempted==1 && stageEWrites.size()==47);
         for(ULONG i=0;i<47;++i) {
@@ -613,25 +627,25 @@ int main(int argc,char** argv) {
         for(ULONG reg=0x878;reg<=0x87E;++reg) assert(*GmuCfgReg(reg)==0xCAFE);
         // Any single ignored write must be recorded without suppressing later writes.
         for(ULONG fail=0;fail<47;++fail) {
-            seedStageE(); stageE=GmuGxStageETrace(); failStageEDword=GmuStageEReg(fail);
+            seedStageE(); GmuGxStageETraceInit(&stageE); failStageEDword=GmuStageEReg(fail);
             assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==0);
             assert(stageE.Reason==0 && stageE.Count==47 && stageEWrites.size()==47);
             assert(stageE.Writes[fail].After==0x200+fail);
         }
         for(ULONG fail=0;fail<47;++fail) {
-            seedStageE(); stageE=GmuGxStageETrace(); failGmuStep=0xA40+fail;
+            seedStageE(); GmuGxStageETraceInit(&stageE); failGmuStep=0xA40+fail;
             assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==STATUS_IO_DEVICE_ERROR);
             assert(stageE.Reason==6 && stageE.Count==fail && stageEWrites.size()==fail);
             for(ULONG i=0;i<47;++i) assert(stageE.Writes[i].Before==0x200+i);
             for(ULONG i=fail;i<47;++i) assert(stageE.Writes[i].After==0xFFFFFFFF);
         }
-        seedStageE(); stageE=GmuGxStageETrace(); failGmuStep=0xA10;
+        seedStageE(); GmuGxStageETraceInit(&stageE); failGmuStep=0xA10;
         assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==STATUS_IO_DEVICE_ERROR);
         assert(stageE.Count==0 && stageE.Attempted==0 && stageEWrites.empty());
-        seedStageE(); stageE=GmuGxStageETrace(); failAddrMap=0;
+        seedStageE(); GmuGxStageETraceInit(&stageE); failAddrMap=0;
         assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==STATUS_INSUFFICIENT_RESOURCES);
         assert(stageE.Reason==5 && stageEWrites.empty());
-        seedStageE(); stageE=GmuGxStageETrace(); gPages[1][0xD0]=0xC0;
+        seedStageE(); GmuGxStageETraceInit(&stageE); gPages[1][0xD0]=0xC0;
         assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==STATUS_INVALID_DEVICE_STATE);
         assert(stageE.Reason==GX_REG_HM_OFF && stageEWrites.empty()); gPages[1][0xD0]=0;
         // Stage F: one opt-in write, then four ordered diagnostic reads without comparisons.
@@ -643,39 +657,39 @@ int main(int argc,char** argv) {
             *GmuCfgReg(0x98D)=7;
             for(ULONG i=0;i<4;++i) *GmuCfgReg(checkRegs[i])=checkValues[i];
         };
-        seedStageF(); GMU_GX_STAGE_F_TRACE stageF=GmuGxStageFTrace();
+        seedStageF(); GMU_GX_STAGE_F_TRACE stageF; GmuGxStageFTraceInit(&stageF);
         assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==0);
         assert(stageF.Attempted==1 && stageF.Reason==0 && stageF.Before==7 && stageF.After==1 && stageF.Count==4);
         assert(stageFWrites.size()==1 && stageFWrites[0]==1);
         for(ULONG i=0;i<4;++i) assert(stageF.Check[i]==checkValues[i]);
-        seedStageF(); stageF=GmuGxStageFTrace(); ignoreStageFWrite=true;
+        seedStageF(); GmuGxStageFTraceInit(&stageF); ignoreStageFWrite=true;
         for(ULONG i=0;i<4;++i) *GmuCfgReg(checkRegs[i])=0x100+i;
         assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==0);
         assert(stageF.Reason==0 && stageF.After==7 && stageF.Count==4);
         for(ULONG i=0;i<4;++i) assert(stageF.Check[i]==0x100+i);
         // Original/write breadcrumb failures must prevent CP_AHB_CNTL publication.
         for(ULONG step=0xB00;step<=0xB02;++step) {
-            seedStageF(); stageF=GmuGxStageFTrace(); failGmuStep=step;
+            seedStageF(); GmuGxStageFTraceInit(&stageF); failGmuStep=step;
             assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_IO_DEVICE_ERROR);
             assert(stageF.Reason==6 && stageF.Attempted==0 && stageF.Count==0 && stageFWrites.empty());
             assert(stageF.After==0xFFFFFFFF);
         }
         for(ULONG fail=0;fail<4;++fail) {
-            seedStageF(); stageF=GmuGxStageFTrace(); failGmuStep=0xB10+fail;
+            seedStageF(); GmuGxStageFTraceInit(&stageF); failGmuStep=0xB10+fail;
             assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_IO_DEVICE_ERROR);
             assert(stageF.Reason==6 && stageF.Attempted==1 && stageF.Count==fail && stageFWrites.size()==1);
             for(ULONG i=0;i<fail;++i) assert(stageF.Check[i]==checkValues[i]);
             for(ULONG i=fail;i<4;++i) assert(stageF.Check[i]==0xFFFFFFFF);
         }
-        seedStageF(); stageF=GmuGxStageFTrace(); failAddrMap=0;
+        seedStageF(); GmuGxStageFTraceInit(&stageF); failAddrMap=0;
         assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_INSUFFICIENT_RESOURCES);
         assert(stageF.Reason==5 && stageFWrites.empty());
-        seedStageF(); stageF=GmuGxStageFTrace(); dropGxAtStep=0xB12;
+        seedStageF(); GmuGxStageFTraceInit(&stageF); dropGxAtStep=0xB12;
         assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_INVALID_DEVICE_STATE);
         assert(stageF.Reason==GX_REG_HM_OFF && stageF.Count==2 && stageF.Check[2]==0xFFFFFFFF && stageF.Check[3]==0xFFFFFFFF);
         dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0; allowStageFWrite=false;
         // G-1 register setup: seven writes only, lo/hi order, diagnostic-only readbacks.
-        allowG1Writes=true; GMU_G1_TRACE g1=GmuG1Trace();
+        allowG1Writes=true; GMU_G1_TRACE g1; GmuG1TraceInit(&g1);
         g1Writes.clear(); failGmuStep=0xFFFFFFFF;
         for(ULONG i=0;i<7;++i) *GmuCfgReg(g1Dwords[i])=0x300+i;
         assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==0 && g1.Count==7 && g1Writes.size()==7);
@@ -684,14 +698,14 @@ int main(int argc,char** argv) {
             assert(g1Writes[i].first==g1Dwords[i] && g1Writes[i].second==g1.Value[i]);
         }
         for(ULONG fail=0;fail<7;++fail) {
-            g1=GmuG1Trace(); g1Writes.clear(); failG1Dword=g1Dwords[fail];
+            GmuG1TraceInit(&g1); g1Writes.clear(); failG1Dword=g1Dwords[fail];
             for(ULONG i=0;i<7;++i) *GmuCfgReg(g1Dwords[i])=0x300+i;
             assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==0 && g1.Count==7);
             assert(g1.After[fail]==0x300+fail);
         }
         failG1Dword=0xFFFFFFFF;
         for(ULONG fail=0;fail<7;++fail) {
-            g1=GmuG1Trace(); g1Writes.clear(); failGmuStep=0xC20+fail;
+            GmuG1TraceInit(&g1); g1Writes.clear(); failGmuStep=0xC20+fail;
             assert(GmuG1Registers(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g1)==STATUS_IO_DEVICE_ERROR);
             assert(g1.Reason==6 && g1.Count==fail && g1Writes.size()==fail);
             for(ULONG i=fail;i<7;++i) assert(g1.After[i]==0xFFFFFFFF);
@@ -714,7 +728,7 @@ int main(int argc,char** argv) {
                 gPages[8][0x210]=1; gPages[8][0x201]=0;
             };
             const ULONG expectedPacket[]={0x70C80008,0x2F,3,0x20000000,0,0,0,0,0};
-            seedG2(); GMU_G2_TRACE cp=GmuG2Trace();
+            seedG2(); GMU_G2_TRACE cp; GmuG2TraceInit(&cp);
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==0);
             assert(cp.Reason==0 && cp.Attempted==1 && cp.SqeWritten==1 && cp.WptrWrites==1 && cp.Polls==0);
             assert(cp.ShadowBefore==0 && cp.ShadowAfter==9 && cp.Rptr==9 && cp.WptrAfter==9 && cp.FenceStatus==0);
@@ -723,13 +737,13 @@ int main(int argc,char** argv) {
             assert(g2Writes[1].first==0x807 && g2Writes[1].second==9);
             assert(std::memcmp(cpRing.data(),expectedPacket,sizeof(expectedPacket))==0);
             assert(std::memcmp(cp.Packet,expectedPacket,sizeof(expectedPacket))==0);
-            seedG2(); cp=GmuG2Trace(); g2FenceDrops=3;
+            seedG2(); GmuG2TraceInit(&cp); g2FenceDrops=3;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==0 && cp.WptrWrites==4 && cp.ShadowAfter==9);
-            seedG2(); cp=GmuG2Trace(); g2FenceForever=true;
+            seedG2(); GmuG2TraceInit(&cp); g2FenceForever=true;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT);
             assert(cp.Reason==10 && cp.WptrWrites==201 && cp.FenceStatus==1 && cp.Polls==0xFFFFFFFF);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG2(); cp=GmuG2Trace();
+                seedG2(); GmuG2TraceInit(&cp);
                 if(predicate==0) g2Completes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -737,24 +751,24 @@ int main(int argc,char** argv) {
                 assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT);
                 assert(cp.Reason==9 && cp.Polls==10000 && cp.CpHwFault==0x55 && cp.FaultStatus==0 && cp.FarLow==0x4000);
             }
-            seedG2(); cp=GmuG2Trace(); g2Hang=true;
+            seedG2(); GmuG2TraceInit(&cp); g2Hang=true;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_DEVICE_ERROR);
             assert(cp.Reason==11 && cp.Polls==0 && (cp.IntStatus&(1UL<<23)));
             const ULONG steps[]={0xD00,0xD01,0xD02,0xD03,0xD04,0xD05,0xD06,0xD07};
             for(ULONG step:steps) {
-                seedG2(); cp=GmuG2Trace(); failGmuStep=step;
+                seedG2(); GmuG2TraceInit(&cp); failGmuStep=step;
                 assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_DEVICE_ERROR && cp.Reason==6);
                 assert(cp.Attempted==(step<=0xD02 ? 0UL : 1UL) && cp.WptrWrites==(step<=0xD04 ? 0UL : 1UL));
             }
-            seedG2(); cp=GmuG2Trace(); g2Completes=false; failGmuStep=0xD07;
+            seedG2(); GmuG2TraceInit(&cp); g2Completes=false; failGmuStep=0xD07;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_IO_TIMEOUT && cp.Reason==9);
-            seedG2(); cp=GmuG2Trace(); dropGxAtStep=0xD06;
+            seedG2(); GmuG2TraceInit(&cp); dropGxAtStep=0xD06;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_INVALID_DEVICE_STATE);
             assert(cp.Reason==GX_REG_HM_OFF && cp.WptrAfter==0xFFFFFFFF && cp.CpHwFault==0xFFFFFFFF);
-            seedG2(); cp=GmuG2Trace(); failAddrMap=0;
+            seedG2(); GmuG2TraceInit(&cp); failAddrMap=0;
             assert(GmuG2Start(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&cp)==STATUS_INSUFFICIENT_RESOURCES && g2Writes.empty());
             for(ULONG bad=0;bad<4;++bad) {
-                seedG2(); cp=GmuG2Trace();
+                seedG2(); GmuG2TraceInit(&cp);
                 if(bad==0) cpShadow[0]=1;
                 if(bad==1) cpRing[0]=1;
                 if(bad==2) *GmuCfgReg(0x807)=1;
@@ -773,7 +787,7 @@ int main(int argc,char** argv) {
             };
             const ULONG extraPacket[]={0x48088501,0xCAFE0001,0x703D8003,0x70017000,0,0xCAFE0002,
                                         0x703E8003,0x00040885,0x70017008,0,0x70268000};
-            seedG3(); GMU_G3_TRACE g3=GmuG3Trace(); const SIZE_T originalMaps=testMaps.size();
+            seedG3(); GMU_G3_TRACE g3; GmuG3TraceInit(&g3); const SIZE_T originalMaps=testMaps.size();
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==0);
             assert(g3.Cp.Reason==0 && g3.Cp.Attempted==1 && g3.Cp.SqeWritten==0 && g3.Prepared==1 && g3.Checks==0x1F);
             assert(g3.Cp.ShadowBefore==9 && g3.Cp.ShadowAfter==20 && g3.Cp.WptrBefore==9 && g3.Cp.WptrAfter==20);
@@ -788,7 +802,7 @@ int main(int argc,char** argv) {
             assert(g2Writes.size()==1 && g2Writes[0].first==0x807 && g2Writes[0].second==20 && testMaps.size()==originalMaps);
             const ULONG expectedChecks[]={0x1A,0x1D,0x1B,0x17,0x0F};
             for(ULONG bad=0;bad<5;++bad) {
-                seedG3(); g3=GmuG3Trace();
+                seedG3(); GmuG3TraceInit(&g3);
                 if(bad==0) g3Scratch=false;
                 if(bad==1) g3Mem=false;
                 if(bad==2) g3Reg=false;
@@ -797,13 +811,13 @@ int main(int argc,char** argv) {
                 assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_DEVICE_ERROR);
                 assert(g3.Cp.Reason==13 && g3.Checks==expectedChecks[bad] && g3.Cp.ShadowAfter==20);
             }
-            seedG3(); g3=GmuG3Trace(); g3FenceDrops=3;
+            seedG3(); GmuG3TraceInit(&g3); g3FenceDrops=3;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==0 && g3.Cp.WptrWrites==4 && g3Writes.size()==4);
-            seedG3(); g3=GmuG3Trace(); g3FenceForever=true;
+            seedG3(); GmuG3TraceInit(&g3); g3FenceForever=true;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_TIMEOUT);
             assert(g3.Cp.Reason==10 && g3.Cp.WptrWrites==201 && g3.Cp.WptrAfter==9 && g3.Checks==0x18);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG3(); g3=GmuG3Trace();
+                seedG3(); GmuG3TraceInit(&g3);
                 if(predicate==0) g3Completes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -812,29 +826,29 @@ int main(int argc,char** argv) {
             }
             const ULONG errorBits[]={1UL<<1,1UL<<9,1UL<<24};
             for(ULONG bit:errorBits) {
-                seedG3(); g3=GmuG3Trace(); g3ErrorBits=bit;
+                seedG3(); GmuG3TraceInit(&g3); g3ErrorBits=bit;
                 assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_DEVICE_ERROR);
                 assert(g3.Cp.Reason==14 && g3.Cp.IntStatus==bit && g3.Checks==0x1F);
             }
-            seedG3(); g3=GmuG3Trace(); g2Hang=true;
+            seedG3(); GmuG3TraceInit(&g3); g2Hang=true;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_DEVICE_ERROR && g3.Cp.Reason==11);
             for(ULONG step=0xE00;step<=0xE05;++step) {
-                seedG3(); g3=GmuG3Trace(); failGmuStep=step;
+                seedG3(); GmuG3TraceInit(&g3); failGmuStep=step;
                 assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_DEVICE_ERROR && g3.Cp.Reason==6);
                 assert(g3.Cp.Attempted==(step<=0xE03 ? 0UL : 1UL));
             }
             for(ULONG step=0xE10;step<=0xE18;++step) {
-                seedG3(); g3=GmuG3Trace(); failGmuStep=step;
+                seedG3(); GmuG3TraceInit(&g3); failGmuStep=step;
                 assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_DEVICE_ERROR && g3.Cp.Reason==6);
             }
-            seedG3(); g3=GmuG3Trace(); g3Completes=false; failGmuStep=0xE10;
+            seedG3(); GmuG3TraceInit(&g3); g3Completes=false; failGmuStep=0xE10;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_IO_TIMEOUT && g3.Cp.Reason==9);
-            seedG3(); g3=GmuG3Trace(); dropGxAtStep=0xE10;
+            seedG3(); GmuG3TraceInit(&g3); dropGxAtStep=0xE10;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_INVALID_DEVICE_STATE);
             assert(g3.Cp.Reason==GX_REG_HM_OFF && g3.ScratchAfter==0xFFFFFFFF && g3.Cp.CpHwFault==0xFFFFFFFF);
-            seedG3(); g3=GmuG3Trace(); failAddrMap=0;
+            seedG3(); GmuG3TraceInit(&g3); failAddrMap=0;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_INSUFFICIENT_RESOURCES && g3Writes.empty());
-            seedG3(); g3=GmuG3Trace(); cpShadow[0]=0;
+            seedG3(); GmuG3TraceInit(&g3); cpShadow[0]=0;
             assert(GmuG3Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3)==STATUS_INVALID_DEVICE_STATE && g3Writes.empty());
             // G-3b only appends the event and arms data[4..5], preserving commands and G-3's data[0..3].
             const auto seedG3b=[&]() {
@@ -846,7 +860,7 @@ int main(int argc,char** argv) {
                 cpRing[0x7008/4]=0xCAFE0001; cpRing[0x700C/4]=0xFFFFFFFF;
             };
             const ULONG eventPacket[]={0x70460004,4,0x70017010,0,0xCAFE0003};
-            seedG3b(); GMU_G3B_TRACE g3b=GmuG3bTrace();
+            seedG3b(); GMU_G3B_TRACE g3b; GmuG3bTraceInit(&g3b);
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==0);
             assert(g3b.Cp.Reason==0 && g3b.Prepared==1 && g3b.Checks==0x3F && g3b.Cp.SqeWritten==0);
             assert(g3b.Cp.ShadowBefore==20 && g3b.Cp.ShadowAfter==25 && g3b.Cp.WptrBefore==20 && g3b.Cp.WptrAfter==25);
@@ -861,20 +875,20 @@ int main(int argc,char** argv) {
             assert(g3b.DataAfter[4]==0xCAFE0003 && g3b.DataAfter[5]==0xFFFFFFFF && cpRing[25]==0 && cpRing[0x7018/4]==0);
             assert(g3b.CpInterrupt==0x123 && g3b.CpProtect==0x456 && g3b.CpStatus1==0x789 && g3b.Cp.Fsr==0x400);
             for(ULONG bad=0;bad<6;++bad) {
-                seedG3b(); g3b=GmuG3bTrace();
+                seedG3b(); GmuG3bTraceInit(&g3b);
                 if(bad<4) g3bDamage=1UL<<bad;
                 if(bad==4) g3bEvent=false;
                 if(bad==5) g3bBadGuard=true;
                 assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_DEVICE_ERROR);
                 assert(g3b.Cp.Reason==13 && g3b.Checks==(0x3FUL&~(1UL<<bad)) && g3b.Cp.ShadowAfter==25);
             }
-            seedG3b(); g3b=GmuG3bTrace(); g3bFenceDrops=3;
+            seedG3b(); GmuG3bTraceInit(&g3b); g3bFenceDrops=3;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==0 && g3b.Cp.WptrWrites==4 && g3bWrites.size()==4);
-            seedG3b(); g3b=GmuG3bTrace(); g3bFenceForever=true;
+            seedG3b(); GmuG3bTraceInit(&g3b); g3bFenceForever=true;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_TIMEOUT);
             assert(g3b.Cp.Reason==10 && g3b.Cp.WptrWrites==201 && g3b.Cp.WptrAfter==20 && g3b.Checks==0x2F);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG3b(); g3b=GmuG3bTrace();
+                seedG3b(); GmuG3bTraceInit(&g3b);
                 if(predicate==0) g3bCompletes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -882,30 +896,30 @@ int main(int argc,char** argv) {
                 assert(g3b.Cp.Reason==9 && g3b.Cp.Polls==10000);
             }
             for(ULONG bit:errorBits) {
-                seedG3b(); g3b=GmuG3bTrace(); g3bErrorBits=bit;
+                seedG3b(); GmuG3bTraceInit(&g3b); g3bErrorBits=bit;
                 assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_DEVICE_ERROR);
                 assert(g3b.Cp.Reason==14 && g3b.Cp.IntStatus==bit);
             }
-            seedG3b(); g3b=GmuG3bTrace(); g2Hang=true;
+            seedG3b(); GmuG3bTraceInit(&g3b); g2Hang=true;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_DEVICE_ERROR && g3b.Cp.Reason==11);
             for(ULONG step=0xF00;step<=0xF05;++step) {
-                seedG3b(); g3b=GmuG3bTrace(); failGmuStep=step;
+                seedG3b(); GmuG3bTraceInit(&g3b); failGmuStep=step;
                 assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_DEVICE_ERROR && g3b.Cp.Reason==6);
                 assert(g3b.Cp.Attempted==(step<=0xF03 ? 0UL : 1UL));
             }
             for(ULONG step=0xF10;step<=0xF18;++step) {
-                seedG3b(); g3b=GmuG3bTrace(); failGmuStep=step;
+                seedG3b(); GmuG3bTraceInit(&g3b); failGmuStep=step;
                 assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_DEVICE_ERROR && g3b.Cp.Reason==6);
             }
-            seedG3b(); g3b=GmuG3bTrace(); g3bCompletes=false; failGmuStep=0xF10;
+            seedG3b(); GmuG3bTraceInit(&g3b); g3bCompletes=false; failGmuStep=0xF10;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_IO_TIMEOUT && g3b.Cp.Reason==9);
-            seedG3b(); g3b=GmuG3bTrace(); dropGxAtStep=0xF10;
+            seedG3b(); GmuG3bTraceInit(&g3b); dropGxAtStep=0xF10;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_INVALID_DEVICE_STATE);
             assert(g3b.Cp.Reason==GX_REG_HM_OFF && g3b.ScratchAfter==0xFFFFFFFF && g3b.Cp.CpHwFault==0xFFFFFFFF);
-            seedG3b(); g3b=GmuG3bTrace(); failAddrMap=0;
+            seedG3b(); GmuG3bTraceInit(&g3b); failAddrMap=0;
             assert(GmuG3bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3b)==STATUS_INSUFFICIENT_RESOURCES && g3bWrites.empty());
             for(ULONG bad=0;bad<5;++bad) {
-                seedG3b(); g3b=GmuG3bTrace();
+                seedG3b(); GmuG3bTraceInit(&g3b);
                 if(bad==0) cpShadow[0]=9;
                 if(bad==1) *GmuCfgReg(0x807)=9;
                 if(bad==2) cpRing[0x7000/4]=0;
@@ -925,7 +939,7 @@ int main(int argc,char** argv) {
                 cpRing[0x7010/4]=0xCAFE0003; cpRing[0x7014/4]=0xFFFFFFFF;
             };
             const ULONG irqPacket[]={0x70460004,0x80000004,0x70017018,0,0xCAFE0004};
-            seedG3c(); GMU_G3C_TRACE g3c=GmuG3cTrace();
+            seedG3c(); GMU_G3C_TRACE g3c; GmuG3cTraceInit(&g3c);
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
             assert(g3c.Cp.Reason==0 && g3c.Prepared==1 && g3c.Checks==0xFF && g3c.Cp.SqeWritten==0);
             assert(g3c.Cp.ShadowBefore==25 && g3c.Cp.ShadowAfter==30 && g3c.Cp.WptrAfter==30);
@@ -943,13 +957,13 @@ int main(int argc,char** argv) {
             assert(g3c.DataBefore[6]==0xFFFFFFFF && g3c.DataAfter[6]==0xCAFE0004);
             assert(g3c.DataAfter[7]==0xFFFFFFFF && cpRing[0x7020/4]==0 && testMaps.size()==originalMaps);
             assert(g3c.CpInterrupt==0x123 && g3c.CpProtect==0x456 && g3c.CpStatus1==0x789 && g3c.Cp.Fsr==0x400);
-            seedG3c(); g3c=GmuG3cTrace(); *GmuCfgReg(0x38)=1;
+            seedG3c(); GmuG3cTraceInit(&g3c); *GmuCfgReg(0x38)=1;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
             assert(g3c.Cp.Reason==15 && g3c.Cp.Attempted==0 && g3c.Prepared==0 && g3c.ClearAttempted==0);
             assert(g3cWrites.empty() && g3cClearWrites.empty() && cpRing[0x7018/4]==0 && cpRing[25]==0);
             // Recheck MASK immediately before submission, and before every fenced retry.
             for(ULONG step=0x1006;step<=0x1007;++step) {
-                seedG3c(); g3c=GmuG3cTrace(); g3cMaskChangeStep=step;
+                seedG3c(); GmuG3cTraceInit(&g3c); g3cMaskChangeStep=step;
                 if(step==0x1007) g3cFenceDrops=1;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
                 assert(g3c.Cp.Reason==15 && g3c.Cp.WptrWrites==(step==0x1006 ? 0UL : 1UL));
@@ -957,36 +971,36 @@ int main(int argc,char** argv) {
             }
             // Both, either, or neither interrupt source may appear; data alone determines success.
             for(ULONG visible=0;visible<4;++visible) {
-                seedG3c(); g3c=GmuG3cTrace(); g3cShowStatus=(visible&1)!=0; g3cShowUnmasked=(visible&2)!=0;
+                seedG3c(); GmuG3cTraceInit(&g3c); g3cShowStatus=(visible&1)!=0; g3cShowUnmasked=(visible&2)!=0;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0 && g3c.Checks==0xFF);
                 assert(g3c.StatusFirst==(g3cShowStatus ? 0UL : 0xFFFFFFFF));
                 assert(g3c.UnmaskedFirst==(g3cShowUnmasked ? 0UL : 0xFFFFFFFF));
                 assert(g3c.IrqPolls==(visible==3 ? 0UL : 100UL));
             }
-            seedG3c(); g3c=GmuG3cTrace(); g3cStatusDelay=7; g3cUnmaskedDelay=3;
+            seedG3c(); GmuG3cTraceInit(&g3c); g3cStatusDelay=7; g3cUnmaskedDelay=3;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
             assert(g3c.StatusFirst==7 && g3c.UnmaskedFirst==3 && g3c.IrqPolls==7);
-            seedG3c(); g3c=GmuG3cTrace(); g3cIgnoreClear=true;
+            seedG3c(); GmuG3cTraceInit(&g3c); g3cIgnoreClear=true;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
             assert((g3c.StatusAfterClear&(1UL<<20)) && (g3c.UnmaskedAfterClear&(1UL<<20)));
-            seedG3c(); g3c=GmuG3cTrace(); *GmuCfgReg(0x201)=0x10; gPages[2][0x315]=0x80;
+            seedG3c(); GmuG3cTraceInit(&g3c); *GmuCfgReg(0x201)=0x10; gPages[2][0x315]=0x80;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0);
             assert(g3c.StatusAfterClear==0x10 && g3c.UnmaskedAfterClear==0x80);
             for(ULONG bad=0;bad<8;++bad) {
-                seedG3c(); g3c=GmuG3cTrace();
+                seedG3c(); GmuG3cTraceInit(&g3c);
                 if(bad<6) g3cDamage=1UL<<bad;
                 if(bad==6) g3cEvent=false;
                 if(bad==7) g3cBadGuard=true;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR);
                 assert(g3c.Cp.Reason==13 && g3c.Checks==(0xFFUL&~(1UL<<bad)) && g3c.ClearAttempted==1);
             }
-            seedG3c(); g3c=GmuG3cTrace(); g3cFenceDrops=3;
+            seedG3c(); GmuG3cTraceInit(&g3c); g3cFenceDrops=3;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==0 && g3c.Cp.WptrWrites==4);
-            seedG3c(); g3c=GmuG3cTrace(); g3cFenceForever=true;
+            seedG3c(); GmuG3cTraceInit(&g3c); g3cFenceForever=true;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_TIMEOUT);
             assert(g3c.Cp.Reason==10 && g3c.Cp.WptrWrites==201 && g3c.ClearAttempted==1);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG3c(); g3c=GmuG3cTrace();
+                seedG3c(); GmuG3cTraceInit(&g3c);
                 if(predicate==0) g3cCompletes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -994,32 +1008,32 @@ int main(int argc,char** argv) {
                 assert(g3c.Cp.Reason==9 && g3c.Cp.Polls==10000 && g3c.ClearAttempted==1);
             }
             for(ULONG bit:errorBits) {
-                seedG3c(); g3c=GmuG3cTrace(); g3cErrorBits=bit;
+                seedG3c(); GmuG3cTraceInit(&g3c); g3cErrorBits=bit;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR);
                 assert(g3c.Cp.Reason==14 && (g3c.Cp.IntStatus&bit) && g3c.ClearAttempted==1);
             }
-            seedG3c(); g3c=GmuG3cTrace(); g2Hang=true;
+            seedG3c(); GmuG3cTraceInit(&g3c); g2Hang=true;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==11);
             for(ULONG step=0x1000;step<=0x100D;++step) {
-                seedG3c(); g3c=GmuG3cTrace(); failGmuStep=step;
+                seedG3c(); GmuG3cTraceInit(&g3c); failGmuStep=step;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==6);
                 assert(g3c.Cp.Attempted==(step<=0x1006 ? 0UL : 1UL));
                 assert(g3c.ClearAttempted==(step<=0x1006 ? 0UL : 1UL));
             }
             for(ULONG step=0x1010;step<=0x1018;++step) {
-                seedG3c(); g3c=GmuG3cTrace(); failGmuStep=step;
+                seedG3c(); GmuG3cTraceInit(&g3c); failGmuStep=step;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_DEVICE_ERROR && g3c.Cp.Reason==6);
             }
-            seedG3c(); g3c=GmuG3cTrace(); g3cCompletes=false; failGmuStep=0x100A;
+            seedG3c(); GmuG3cTraceInit(&g3c); g3cCompletes=false; failGmuStep=0x100A;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_IO_TIMEOUT);
             assert(g3c.Cp.Reason==9 && g3c.ClearAttempted==1); // first failure survives cleanup failure
-            seedG3c(); g3c=GmuG3cTrace(); dropGxAtStep=0x100A;
+            seedG3c(); GmuG3cTraceInit(&g3c); dropGxAtStep=0x100A;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE);
             assert(g3c.Cp.Reason==GX_REG_HM_OFF && g3c.ClearAttempted==0 && g3c.StatusAfterClear==0xFFFFFFFF);
-            seedG3c(); g3c=GmuG3cTrace(); failAddrMap=0;
+            seedG3c(); GmuG3cTraceInit(&g3c); failAddrMap=0;
             assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INSUFFICIENT_RESOURCES && g3cWrites.empty());
             for(ULONG bad=0;bad<5;++bad) {
-                seedG3c(); g3c=GmuG3cTrace();
+                seedG3c(); GmuG3cTraceInit(&g3c);
                 if(bad==0) cpShadow[0]=20;
                 if(bad==1) *GmuCfgReg(0x807)=20;
                 if(bad==2) cpRing[0x7010/4]=0;
@@ -1039,7 +1053,7 @@ int main(int argc,char** argv) {
             };
             const ULONG ibPacket[]={0x48088601,0xCAFE0005,0x703D8003,0x70017020,0,0xCAFE0006};
             const ULONG callPacket[]={0x70BF8003,0x70016000,0,6,0x70460004,4,0x70017024,0,0xCAFE0007};
-            seedG4(); GMU_G4_TRACE g4=GmuG4Trace();
+            seedG4(); GMU_G4_TRACE g4; GmuG4TraceInit(&g4);
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==0);
             assert(g4.Cp.Reason==0 && g4.Prepared==1 && g4.Checks==0x1F && g4.Cp.SqeWritten==0);
             assert(g4.Cp.ShadowBefore==30 && g4.Cp.ShadowAfter==39 && g4.Cp.WptrBefore==30 && g4.Cp.WptrAfter==39);
@@ -1060,7 +1074,7 @@ int main(int argc,char** argv) {
             assert(g4.DataAfter[8]==0xCAFE0006 && g4.DataAfter[9]==0xCAFE0007 && cpRing[0x7030/4]==0);
             // Each success bit has an independent failure mode; both guards and all old data are checked.
             for(ULONG bad=0;bad<14;++bad) {
-                seedG4(); g4=GmuG4Trace(); ULONG lost=0;
+                seedG4(); GmuG4TraceInit(&g4); ULONG lost=0;
                 if(bad==0) {g4Scratch=false; lost=0;}
                 if(bad==1) {g4Mem=false; lost=1;}
                 if(bad==2) {g4Event=false; lost=2;}
@@ -1070,13 +1084,13 @@ int main(int argc,char** argv) {
                 assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR);
                 assert(g4.Cp.Reason==13 && g4.Checks==(0x1FUL&~(1UL<<lost)));
             }
-            seedG4(); g4=GmuG4Trace(); g4FenceDrops=3;
+            seedG4(); GmuG4TraceInit(&g4); g4FenceDrops=3;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==0 && g4.Cp.WptrWrites==4);
-            seedG4(); g4=GmuG4Trace(); g4FenceForever=true;
+            seedG4(); GmuG4TraceInit(&g4); g4FenceForever=true;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_TIMEOUT);
             assert(g4.Cp.Reason==10 && g4.Cp.WptrWrites==201 && g4.Cp.ShadowAfter==30);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG4(); g4=GmuG4Trace();
+                seedG4(); GmuG4TraceInit(&g4);
                 if(predicate==0) g4Completes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -1084,29 +1098,29 @@ int main(int argc,char** argv) {
                 if(predicate==0) assert(g4.IbBaseLow==0x70016000 && g4.IbRemaining==6);
             }
             for(ULONG bit:errorBits) {
-                seedG4(); g4=GmuG4Trace(); g4ErrorBits=bit;
+                seedG4(); GmuG4TraceInit(&g4); g4ErrorBits=bit;
                 assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==14);
             }
-            seedG4(); g4=GmuG4Trace(); g2Hang=true;
+            seedG4(); GmuG4TraceInit(&g4); g2Hang=true;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==11);
             for(ULONG step=0x1100;step<=0x1105;++step) {
-                seedG4(); g4=GmuG4Trace(); failGmuStep=step;
+                seedG4(); GmuG4TraceInit(&g4); failGmuStep=step;
                 assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==6);
                 assert(g4.Cp.Attempted==(step<=0x1103 ? 0UL : 1UL));
             }
             for(ULONG step=0x1110;step<=0x111D;++step) {
-                seedG4(); g4=GmuG4Trace(); failGmuStep=step;
+                seedG4(); GmuG4TraceInit(&g4); failGmuStep=step;
                 assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==6);
             }
-            seedG4(); g4=GmuG4Trace(); g4Completes=false; failGmuStep=0x1110;
+            seedG4(); GmuG4TraceInit(&g4); g4Completes=false; failGmuStep=0x1110;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_TIMEOUT && g4.Cp.Reason==9);
-            seedG4(); g4=GmuG4Trace(); dropGxAtStep=0x1110;
+            seedG4(); GmuG4TraceInit(&g4); dropGxAtStep=0x1110;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INVALID_DEVICE_STATE);
             assert(g4.Cp.Reason==GX_REG_HM_OFF && g4.ScratchAfter==0xFFFFFFFF && g4.IbRemaining==0xFFFFFFFF);
-            seedG4(); g4=GmuG4Trace(); failAddrMap=0;
+            seedG4(); GmuG4TraceInit(&g4); failAddrMap=0;
             assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INSUFFICIENT_RESOURCES && g4Writes.empty());
             for(ULONG bad=0;bad<9;++bad) {
-                seedG4(); g4=GmuG4Trace();
+                seedG4(); GmuG4TraceInit(&g4);
                 if(bad==0) cpShadow[0]=25;
                 if(bad==1) *GmuCfgReg(0x807)=25;
                 if(bad==2) cpRing[0x7018/4]=0;
@@ -1130,7 +1144,7 @@ int main(int argc,char** argv) {
                 cpRing[0x7020/4]=0xCAFE0006; cpRing[0x7024/4]=0xCAFE0007;
                 cpRing[0x7028/4]=0xFFFFFFFF; cpRing[0x702C/4]=0xFFFFFFFF;
             };
-            seedG5(); GMU_G5_TRACE g5=GmuG5Trace();
+            seedG5(); GMU_G5_TRACE g5; GmuG5TraceInit(&g5);
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==0);
             assert(g5.Cp.Reason==0 && g5.Prepared==1 && g5.Checks==0x1F && g5.Cp.SqeWritten==0);
             assert(g5.CcuBefore==0x12345678 && g5.CcuAfter==0x10000000);
@@ -1150,7 +1164,7 @@ int main(int argc,char** argv) {
             assert(std::memcmp(g5.Packet,cpRing.data()+39,sizeof(g5.Packet))==0 && cpRing[48]==0 && cpRing[0x7840/4]==0);
             // Each Checks bit can fail independently, including a hardware RPTR different from the shadow.
             for(ULONG bad=0;bad<5;++bad) {
-                seedG5(); g5=GmuG5Trace();
+                seedG5(); GmuG5TraceInit(&g5);
                 if(bad==0) g5BadRptr=true;
                 if(bad==1) g5Flush=false;
                 if(bad==2) g5Event=false;
@@ -1161,25 +1175,25 @@ int main(int argc,char** argv) {
             }
             const ULONG pixelIndices[]={0,15,16,255};
             for(ULONG index:pixelIndices) {
-                seedG5(); g5=GmuG5Trace(); g5BadPixel=index;
+                seedG5(); GmuG5TraceInit(&g5); g5BadPixel=index;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
                 assert(g5.PixelMatches==255 && g5.PixelFirstBad==index && g5.PixelBadValue==0);
             }
-            seedG5(); g5=GmuG5Trace(); g5Color=0x12345678;
+            seedG5(); GmuG5TraceInit(&g5); g5Color=0x12345678;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
             assert(g5.PixelMatches==0 && g5.PixelFirstBad==0 && g5.PixelBadValue==0x12345678 && g5.Pixels[3]==0x12345678);
             for(ULONG index=0;index<16;++index) {
-                seedG5(); g5=GmuG5Trace(); g5BadSentinel=index;
+                seedG5(); GmuG5TraceInit(&g5); g5BadSentinel=index;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR);
                 assert(g5.SentinelMatches==15 && g5.Sentinel[index]==0 && g5.Checks==0xF);
             }
-            seedG5(); g5=GmuG5Trace(); g5FenceDrops=3;
+            seedG5(); GmuG5TraceInit(&g5); g5FenceDrops=3;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==0 && g5.Cp.WptrWrites==4);
-            seedG5(); g5=GmuG5Trace(); g5FenceForever=true;
+            seedG5(); GmuG5TraceInit(&g5); g5FenceForever=true;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_TIMEOUT);
             assert(g5.Cp.Reason==10 && g5.Cp.WptrWrites==201 && g5.PixelMatches==0 && g5.SentinelMatches==16);
             for(ULONG predicate=0;predicate<3;++predicate) {
-                seedG5(); g5=GmuG5Trace();
+                seedG5(); GmuG5TraceInit(&g5);
                 if(predicate==0) g5Completes=false;
                 if(predicate==1) g2RbbmBusy=true;
                 if(predicate==2) g2GmuBusy=true;
@@ -1187,31 +1201,31 @@ int main(int argc,char** argv) {
                 if(predicate==0) assert(g5.IbBaseLow==0x70016100 && g5.IbRemaining==36);
             }
             for(ULONG bit:errorBits) {
-                seedG5(); g5=GmuG5Trace(); g5ErrorBits=bit;
+                seedG5(); GmuG5TraceInit(&g5); g5ErrorBits=bit;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==14);
             }
-            seedG5(); g5=GmuG5Trace(); g2Hang=true;
+            seedG5(); GmuG5TraceInit(&g5); g2Hang=true;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==11);
             for(ULONG step=0x1200;step<=0x1206;++step) {
-                seedG5(); g5=GmuG5Trace(); failGmuStep=step;
+                seedG5(); GmuG5TraceInit(&g5); failGmuStep=step;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==6);
                 assert(g5.Cp.Attempted==(step<=0x1204 ? 0UL : 1UL));
             }
             for(ULONG step=0x1210;step<=0x121C;++step) {
-                seedG5(); g5=GmuG5Trace(); failGmuStep=step;
+                seedG5(); GmuG5TraceInit(&g5); failGmuStep=step;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_DEVICE_ERROR && g5.Cp.Reason==6);
             }
-            seedG5(); g5=GmuG5Trace(); g5Completes=false; failGmuStep=0x1210;
+            seedG5(); GmuG5TraceInit(&g5); g5Completes=false; failGmuStep=0x1210;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_IO_TIMEOUT && g5.Cp.Reason==9);
-            seedG5(); g5=GmuG5Trace(); dropGxAtStep=0x1210;
+            seedG5(); GmuG5TraceInit(&g5); dropGxAtStep=0x1210;
             assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INVALID_DEVICE_STATE);
             assert(g5.Cp.Reason==GX_REG_HM_OFF && g5.CcuAfter==0xFFFFFFFF && g5.IbRemaining==0xFFFFFFFF);
             for(ULONG mapIndex:{0UL,3UL}) {
-                seedG5(); g5=GmuG5Trace(); failAddrMap=mapIndex;
+                seedG5(); GmuG5TraceInit(&g5); failAddrMap=mapIndex;
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INSUFFICIENT_RESOURCES && g5Writes.empty());
             }
             for(ULONG bad=0;bad<9;++bad) {
-                seedG5(); g5=GmuG5Trace();
+                seedG5(); GmuG5TraceInit(&g5);
                 if(bad==0) cpShadow[0]=30;
                 if(bad==1) *GmuCfgReg(0x807)=30;
                 if(bad==2) cpRing[0x7024/4]=0;
@@ -1235,7 +1249,7 @@ int main(int argc,char** argv) {
                 for(ULONG i=0;i<272;++i) cpRing[0x7400/4+i]=0xFFFFFFFF;
                 *GmuCfgReg(0x8E04)=0x10; *GmuCfgReg(0x8E01)=0x20; *GmuCfgReg(0xE12)=0x30; *GmuCfgReg(0xE19)=0x81;
             };
-            seedG5b(); GMU_G5B_TRACE g5b=GmuG5bTrace();
+            seedG5b(); GMU_G5B_TRACE g5b; GmuG5bTraceInit(&g5b);
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
             assert(g5b.Draw.Checks==0xF && g5b.Draw.Cp.Reason==0 && g5b.Draw.Cp.ShadowAfter==61);
             assert(g5b.Draw.Cp.Rptr==61 && g5b.Draw.Cp.WptrAfter==61 && g5b.Data12After==0xCAFE000A);
@@ -1248,15 +1262,15 @@ int main(int argc,char** argv) {
             // Scan boundaries: exclusions must not hide the first/last included DWORD next to each range.
             const ULONG included[]={0xF4,0x5FFC,0x6240,0x6FFC,0x7040,0x73FC,0x7840,0x7FFC};
             for(ULONG off:included) {
-                seedG5b(); g5b=GmuG5bTrace(); cpRing[off/4]=0x78563412;
+                seedG5b(); GmuG5bTraceInit(&g5b); cpRing[off/4]=0x78563412;
                 assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
                 assert(g5b.ScanCount[0]==1 && g5b.ScanFirst[0]==off);
             }
-            seedG5b(); g5b=GmuG5bTrace(); cpRing[0x200/4]=0x12345678; cpRing[0x204/4]=0x12;
+            seedG5b(); GmuG5bTraceInit(&g5b); cpRing[0x200/4]=0x12345678; cpRing[0x204/4]=0x12;
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
             assert(g5b.ScanCount[1]==1 && g5b.ScanFirst[1]==0x200 && g5b.ScanCount[2]==1 && g5b.ScanFirst[2]==0x204);
             for(ULONG bad=0;bad<4;++bad) {
-                seedG5b(); g5b=GmuG5bTrace();
+                seedG5b(); GmuG5bTraceInit(&g5b);
                 if(bad==0) g5bBadRptr=true;
                 if(bad==1) g5bEvent=false;
                 if(bad==2) g5bFill=false;
@@ -1264,25 +1278,25 @@ int main(int argc,char** argv) {
                 assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR);
                 assert(g5b.Draw.Checks==(0xFUL&~(1UL<<bad)) && g5b.Draw.Cp.Reason==13);
             }
-            seedG5b(); g5b=GmuG5bTrace(); g5bFenceDrops=3;
+            seedG5b(); GmuG5bTraceInit(&g5b); g5bFenceDrops=3;
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0 && g5b.Draw.Cp.WptrWrites==4);
-            seedG5b(); g5b=GmuG5bTrace(); g5bFenceForever=true;
+            seedG5b(); GmuG5bTraceInit(&g5b); g5bFenceForever=true;
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_TIMEOUT && g5b.Draw.Cp.Reason==10);
-            seedG5b(); g5b=GmuG5bTrace(); g5bCompletes=false; failGmuStep=0x1320;
+            seedG5b(); GmuG5bTraceInit(&g5b); g5bCompletes=false; failGmuStep=0x1320;
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_TIMEOUT && g5b.Draw.Cp.Reason==9);
             for(ULONG bit:errorBits) {
-                seedG5b(); g5b=GmuG5bTrace(); g5bErrorBits=bit;
+                seedG5b(); GmuG5bTraceInit(&g5b); g5bErrorBits=bit;
                 assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR && g5b.Draw.Cp.Reason==14);
             }
             for(ULONG step=0x1300;step<=0x130B;++step) {
-                seedG5b(); g5b=GmuG5bTrace(); failGmuStep=step;
+                seedG5b(); GmuG5bTraceInit(&g5b); failGmuStep=step;
                 assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR && g5b.Draw.Cp.Reason==6);
             }
-            seedG5b(); g5b=GmuG5bTrace(); testGlobalStatus=STATUS_INVALID_DEVICE_STATE;
+            seedG5b(); GmuG5bTraceInit(&g5b); testGlobalStatus=STATUS_INVALID_DEVICE_STATE;
             assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
             assert(g5b.GlobalStatus[0]==testGlobalStatus && g5b.GlobalBefore[0]==0xFFFFFFFF);
             for(ULONG bad=0;bad<6;++bad) {
-                seedG5b(); g5b=GmuG5bTrace();
+                seedG5b(); GmuG5bTraceInit(&g5b);
                 if(bad==0) cpRing[0x7400/4]=0;
                 if(bad==1) cpRing[0x7800/4]=0;
                 if(bad==2) cpRing[0x7028/4]=0;
@@ -1303,7 +1317,7 @@ int main(int argc,char** argv) {
                 cpRing[0x7030/4]=0xCAFE000A; cpRing[0x7034/4]=0xCAFE000B;
             };
             const auto s1Trace=[]() {
-                auto t=GmuS1Trace(); t.ZChecks=0x1F; t.ZReason=0; t.Checks=1; return t;
+                GMU_S1_TRACE t; GmuS1TraceInit(&t); t.ZChecks=0x1F; t.ZReason=0; t.Checks=1; return t;
             };
             seedS1(); auto s1=s1Trace();
             assert(GmuS1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&s1)==0);
@@ -1394,7 +1408,7 @@ int main(int argc,char** argv) {
                 cpRing[0x7038/4]=0xCAFE000C; cpRing[0x7C00/4]=0xC0DE5EED;
                 for(ULONG i=1;i<16;++i) cpRing[0x7C00/4+i]=0xFFFFFFFF;
             };
-            const auto r1Trace=[]() {auto t=GmuR1Trace(); t.SChecks=0x1F; t.SReason=0; t.Checks=1; return t;};
+            const auto r1Trace=[]() {GMU_R1_TRACE t; GmuR1TraceInit(&t); t.SChecks=0x1F; t.SReason=0; t.Checks=1; return t;};
             seedR1(); auto r1=r1Trace();
             assert(GmuR1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&r1)==0);
             assert(r1.Checks==0x1F && r1.Prepared==1 && r1.Cp.Reason==0 && r1.Cp.SqeWritten==0);
@@ -1497,6 +1511,67 @@ int main(int argc,char** argv) {
                 assert(GmuR1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&r1)==STATUS_INVALID_DEVICE_STATE);
                 assert(r1.Cp.Reason==(bad>=6 ? 15UL : 12UL) && r1.Cp.WptrWrites==(bad==8 ? 1UL : 0UL));
             }
+            // D-1: two-pass peer and mandatory CPU restore, including errors and quarantine prerequisites.
+            const ULONG disp[]={0xE1000000,0,1080,2400,4320,21};
+            const auto seedD1=[&]() {
+                probe.Count=3; seedR1();
+                assert(GmuD1Plan(&probe)); probe.Regions[3].Mapped=true;
+                allowD1Writes=true; d1Completes=true; d1Odd=true; d1Fences=true; d1Outside=false; d1FenceForever=false;
+                d1Restoring=false; d1MapFails=false; d1RestoreDrop=0xFFFFFFFF; d1ErrorBits=0; d1FenceDrops=0;
+                d1Maps=0; d1Unmaps=0; d1Writes.clear(); failAfter=-1;
+                std::memcpy(cpRing.data()+0x4000/4,GmuR1Ib,sizeof(GmuR1Ib));
+                std::memcpy(cpRing.data()+0x4800/4,GmuR1Vs,sizeof(GmuR1Vs));
+                std::memcpy(cpRing.data()+0x4880/4,GmuR1Fs,sizeof(GmuR1Fs));
+                std::memcpy(cpRing.data()+0x4900/4,GmuR1Vertices,sizeof(GmuR1Vertices));
+                std::memcpy(cpRing.data()+82,GmuR1Packet,sizeof(GmuR1Packet));
+                cpShadow[0]=91; *GmuCfgReg(0x806)=91; *GmuCfgReg(0x807)=91;
+                cpRing[0x703C/4]=0xCAFE000D; cpRing[0x7040/4]=0xCAFE000E;
+                for(ULONG i=0;i<256;++i) cpRing[0x4C00/4+i]=(i%16>=4 && i%16<12 && i/16>=4 && i/16<12) ? 0x000033FF : 0xFFFFFFFF;
+                for(ULONG i=0;i<d1Band.size();++i) d1Band[i]=0xAB000000+i;
+            };
+            const auto d1Trace=[&]() {GMU_D1_TRACE t; GmuD1TraceInit(&t, disp); t.RChecks=0x1F; t.RReason=0; t.Checks=1; return t;};
+            seedD1(); auto d1=d1Trace(); const auto bandBefore=d1Band; const auto poolBefore=allocations.size();
+            assert(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))==0);
+            assert(d1.Checks==0x3F && d1.Cp.Reason==0 && d1.Cp.WptrAfter==100 && d1.Cp.ShadowAfter==100);
+            assert(d1.InsideEven==32768 && d1.InsideOdd==32768 && d1.InsideOther==0 && d1.OutsideChanged==0);
+            assert(d1.HoldMs==5000 && d1.HoldStatus==0 && d1.RestoreMismatch==0 && d1.RestoreStatus==0);
+            assert(d1.BandMapped==1 && d1Maps==1 && d1Unmaps==1 && d1Band==bandBefore && allocations.size()==poolBefore);
+            assert(d1.ScanDwords==6766 && d1.ScanCount==0 && d1.IbBadCount==0);
+            assert(d1.Edge[1]==0xFFFF3300 && d1.Edge[2]==0xFFFF3300 && d1.Edge[8]==0xFFFF3300);
+            assert(d1.DataAfter[0]==0xCAFE000F && d1.DataAfter[1]==0xCAFE0010 && d1.DataAfter[2]==0xCAFE0011);
+            for(ULONG bad=0;bad<9;++bad) {
+                seedD1(); d1=d1Trace();
+                if(bad==0) d1Odd=false;
+                if(bad==1) d1Outside=true;
+                if(bad==2) d1Fences=false;
+                if(bad==3) d1Completes=false;
+                if(bad==4) failGmuStep=0x1931;
+                if(bad==5) failGmuStep=0x1932;
+                if(bad==6) failGmuStep=0x1930;
+                if(bad==7) {d1Completes=false; failGmuStep=0x1920;}
+                if(bad==8) d1ErrorBits=1UL<<9;
+                assert(!NT_SUCCESS(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))));
+                assert(d1.RestoreMismatch==0 && d1Band==bandBefore && d1Unmaps==1 && allocations.size()==poolBefore);
+                if(bad==3 || bad==7) assert(d1.Cp.Reason==9);
+                failGmuStep=0xFFFFFFFF;
+            }
+            seedD1(); d1=d1Trace(); d1RestoreDrop=(1072*4320+412*4-0x462000)/4;
+            assert(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))==STATUS_IO_DEVICE_ERROR);
+            assert(d1.RestoreMismatch==1 && d1.RestoreFirst==d1RestoreDrop*4 && !(d1.Checks&32) && d1Unmaps==1);
+            for(ULONG bad=0;bad<3;++bad) {
+                seedD1(); d1=d1Trace();
+                if(bad==0) d1MapFails=true;
+                if(bad==1) failAfter=0;
+                if(bad==2) {d1.Disp[4]=1;}
+                assert(!NT_SUCCESS(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))));
+                assert(d1Writes.empty() && d1Maps==0 && d1Band==bandBefore && allocations.size()==poolBefore);
+            }
+            seedD1(); d1=d1Trace(); d1FenceDrops=3;
+            assert(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))==0 && d1.Cp.WptrWrites==4);
+            seedD1(); d1=d1Trace(); d1FenceForever=true;
+            assert(GmuD1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&d1,reinterpret_cast<HANDLE>(2))==STATUS_IO_TIMEOUT);
+            assert(d1.Cp.Reason==10 && d1.Cp.WptrWrites==201 && d1Band==bandBefore && d1Unmaps==1);
+            allowD1Writes=false; failAfter=-1;
             r1CopyTarget=nullptr; r1CopyBadDword=0xFFFFFFFF; allowR1Writes=false;
             allowS1Writes=false;
             allowG5bWrites=false;
@@ -1533,8 +1608,25 @@ int main(int argc,char** argv) {
         Reset(); assert(Run(real,&keep)==0 && !keep && allocations.empty());
     }
     Reset(); auto bad=f; bad.pop_back(); assert(Run(bad,&keep)==EPI_GMU_E_FW && gmuWrites==0 && allocations.empty());
+    // The first allocation is CPU-only traces. Failure must not touch hardware or diagnostics.
+    Reset(); failAfter=0; keep=true;
+    assert(Run(f,&keep)==EPI_GMU_E_NOMEM && !keep && gmuWrites==0 && diagnostics.empty() && testMaps.empty() && allocations.empty());
+    Reset();
+    {
+        bool entered=false;
+        const auto callout=+[](PVOID p) { *static_cast<bool*>(p)=true; };
+        assert(KeExpandKernelStackAndCalloutEx(callout,&entered,MAXIMUM_EXPANSION_SIZE,TRUE,nullptr)==0 && entered);
+        entered=false; testExpandStatus=STATUS_INSUFFICIENT_RESOURCES;
+        assert(KeExpandKernelStackAndCalloutEx(callout,&entered,MAXIMUM_EXPANSION_SIZE,TRUE,nullptr)==STATUS_INSUFFICIENT_RESOURCES && !entered);
+        EpiGmuStackReset(); assert(EpiGmuStackMinimum()==0xFFFFFFFF);
+        testRemainingStack=32000; assert(GmuStep(nullptr,1)==0 && EpiGmuStackMinimum()==32000);
+        testRemainingStack=24000; assert(GmuStep(nullptr,2)==0 && EpiGmuStackMinimum()==24000);
+        testRemainingStack=30000; assert(GmuStep(nullptr,3)==0 && EpiGmuStackMinimum()==24000);
+        failGmuStep=4; testRemainingStack=16000;
+        assert(GmuStep(nullptr,4)==STATUS_IO_DEVICE_ERROR && EpiGmuStackMinimum()==16000);
+    }
     // Fail each region/context allocation; all already acquired buffers must be released.
-    for(int i=0;i<10;++i) {
+    for(int i=0;i<11;++i) {
         Reset(); failAfter=i; ULONG st=Run(f,&keep); failAfter=-1;
         assert((st==EPI_GMU_E_NOMEM || st==EPI_GMU_E_SMMU_MAP) && !keep && allocations.empty());
     }
@@ -1547,7 +1639,7 @@ int main(int argc,char** argv) {
     // G-1 failures before CM3 release release every GPU allocation, unless Disable itself fails.
     {
         const auto sqe=SqeImage();
-        for(int fail=0;fail<13;++fail) {
+        for(int fail=0;fail<14;++fail) {
             Reset(); failAfter=fail;
             const ULONG status=RunG1(f,sqe,&keep); failAfter=-1;
             assert((status==EPI_GMU_E_NOMEM || status==EPI_GMU_E_SMMU_MAP) && !keep && allocations.empty());
@@ -1792,6 +1884,23 @@ int main(int argc,char** argv) {
         Reset(); g5Fill=false; g5bFill=false; smmuDisableFails=true;
         assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         ClearQuarantine(); Reset();
+    }
+    // D-1 external physical RAM is never allocated/freed as a GMU buffer.
+    {
+        const auto sqe=SqeImage();
+        Reset(); g5Fill=false; g5bFill=false; const auto original=d1Band;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(testMaps.size()==12 && testMaps.back().Iova==0x71000000 && testMaps.back().Pa==0xE1462000);
+        assert(testMaps.back().Size==0x120000 && testMaps.back().Flags==(EPI_SMMU_READ|EPI_SMMU_WRITE));
+        assert(d1Writes.size()==1 && d1Maps==1 && d1Unmaps==1 && d1Band==original);
+        Reset(); g5Fill=false; g5bFill=false; r1Draw=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_CP && !keep);
+        assert(d1Writes.empty() && d1Maps==0);
+        Reset(); g5Fill=false; g5bFill=false; g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep);
+        GMU_REGION* ext=GmuFind(g_KeptGmu,0x71000000,0x120000);
+        assert(ext && ext->External && ext->Mapped && !ext->Va && ext->Pa.QuadPart==0xE1462000);
+        assert(d1Band==original && d1Unmaps==1); ClearQuarantine(); Reset();
     }
     std::puts("GMU tests passed: firmware regions, synthetic/real image load, allocation failures, boot timeout, reset and SMMU teardown quarantine.");
 }
