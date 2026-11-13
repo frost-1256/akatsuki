@@ -71,6 +71,8 @@ static std::vector<UCHAR> SqeImage() {
     return sqe;
 }
 static void Reset() {
+    allowG4Writes=false; g4Completes=true; g4Scratch=true; g4Mem=true; g4Event=true; g4FenceForever=false;
+    g4Scratch2Damage=false; g4FenceDrops=0; g4ErrorBits=0; g4Damage=0; g4BadGuards=0; g4Writes.clear();
     allowG3cWrites=false; g3cCompletes=true; g3cEvent=true; g3cBadGuard=false; g3cFenceForever=false;
     g3cShowStatus=true; g3cShowUnmasked=true; g3cIgnoreClear=false; g3cPending=false; g3cPolling=false;
     g3cFenceDrops=0; g3cErrorBits=0; g3cDamage=0; g3cStatusDelay=0; g3cUnmaskedDelay=0; g3cSample=0;
@@ -109,12 +111,13 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
+    allowG4Writes=g4;
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -817,6 +820,99 @@ int main(int argc,char** argv) {
                 if(bad==4) probe.Regions[1].Mapped=false;
                 assert(GmuG3cSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g3c)==STATUS_INVALID_DEVICE_STATE && g3cWrites.empty());
             }
+            const auto seedG4=[&]() {
+                seedG3c(); allowG4Writes=true; g4Writes.clear(); g4Completes=true;
+                g4Scratch=true; g4Mem=true; g4Event=true; g4FenceForever=false; g4Scratch2Damage=false;
+                g4FenceDrops=0; g4ErrorBits=0; g4Damage=0; g4BadGuards=0;
+                std::memcpy(cpRing.data()+25,irqPacket,sizeof(irqPacket));
+                cpShadow[0]=30; *GmuCfgReg(0x806)=30; *GmuCfgReg(0x807)=30;
+                cpRing[0x7018/4]=0xCAFE0004; cpRing[0x701C/4]=0xFFFFFFFF;
+                *GmuCfgReg(0x886)=0x12345678;
+                *GmuCfgReg(0x928)=0; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=0;
+            };
+            const ULONG ibPacket[]={0x48088601,0xCAFE0005,0x703D8003,0x70017020,0,0xCAFE0006};
+            const ULONG callPacket[]={0x70BF8003,0x70016000,0,6,0x70460004,4,0x70017024,0,0xCAFE0007};
+            seedG4(); GMU_G4_TRACE g4=GmuG4Trace();
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==0);
+            assert(g4.Cp.Reason==0 && g4.Prepared==1 && g4.Checks==0x1F && g4.Cp.SqeWritten==0);
+            assert(g4.Cp.ShadowBefore==30 && g4.Cp.ShadowAfter==39 && g4.Cp.WptrBefore==30 && g4.Cp.WptrAfter==39);
+            assert(g4.Cp.WptrWrites==1 && g4Writes.size()==1 && g2Writes.size()==1 && g2Writes[0].second==39);
+            assert(g4.ScratchBefore==0x12345678 && g4.ScratchAfter==0xCAFE0005);
+            assert(g4.Scratch2Before==0xCAFE0001 && g4.Scratch2After==0xCAFE0001);
+            assert(g4.IbBaseLow==0x70016000 && g4.IbBaseHigh==0 && g4.IbRemaining==0);
+            assert(g4.CpInterrupt==0x123 && g4.CpProtect==0x456 && g4.CpStatus1==0x789 && g4.Cp.Fsr==0x400);
+            assert(g4.MaskBefore==0 && g4.MaskAtSubmit==0 && g4.MaskAfter==0 && testMaps.size()==originalMaps);
+            assert(std::memcmp(cpRing.data(),expectedPacket,sizeof(expectedPacket))==0);
+            assert(std::memcmp(cpRing.data()+9,extraPacket,sizeof(extraPacket))==0);
+            assert(std::memcmp(cpRing.data()+20,eventPacket,sizeof(eventPacket))==0);
+            assert(std::memcmp(cpRing.data()+25,irqPacket,sizeof(irqPacket))==0);
+            assert(std::memcmp(g4.Ib,ibPacket,sizeof(ibPacket))==0 && std::memcmp(cpRing.data()+0x6000/4,ibPacket,sizeof(ibPacket))==0);
+            assert(std::memcmp(g4.Packet,callPacket,sizeof(callPacket))==0 && cpRing[39]==0 && cpRing[0x6018/4]==0);
+            for(ULONG i=0;i<8;++i) assert(g4.DataBefore[i]==g4.DataAfter[i]);
+            for(ULONG i=8;i<12;++i) assert(g4.DataBefore[i]==0xFFFFFFFF);
+            assert(g4.DataAfter[8]==0xCAFE0006 && g4.DataAfter[9]==0xCAFE0007 && cpRing[0x7030/4]==0);
+            // Each success bit has an independent failure mode; both guards and all old data are checked.
+            for(ULONG bad=0;bad<14;++bad) {
+                seedG4(); g4=GmuG4Trace(); ULONG lost=0;
+                if(bad==0) {g4Scratch=false; lost=0;}
+                if(bad==1) {g4Mem=false; lost=1;}
+                if(bad==2) {g4Event=false; lost=2;}
+                if(bad==3 || bad==4) {g4BadGuards=1UL<<(bad-3); lost=3;}
+                if(bad>=5 && bad<13) {g4Damage=1UL<<(bad-5); lost=4;}
+                if(bad==13) {g4Scratch2Damage=true; lost=4;}
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR);
+                assert(g4.Cp.Reason==13 && g4.Checks==(0x1FUL&~(1UL<<lost)));
+            }
+            seedG4(); g4=GmuG4Trace(); g4FenceDrops=3;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==0 && g4.Cp.WptrWrites==4);
+            seedG4(); g4=GmuG4Trace(); g4FenceForever=true;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_TIMEOUT);
+            assert(g4.Cp.Reason==10 && g4.Cp.WptrWrites==201 && g4.Cp.ShadowAfter==30);
+            for(ULONG predicate=0;predicate<3;++predicate) {
+                seedG4(); g4=GmuG4Trace();
+                if(predicate==0) g4Completes=false;
+                if(predicate==1) g2RbbmBusy=true;
+                if(predicate==2) g2GmuBusy=true;
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_TIMEOUT && g4.Cp.Reason==9);
+                if(predicate==0) assert(g4.IbBaseLow==0x70016000 && g4.IbRemaining==6);
+            }
+            for(ULONG bit:errorBits) {
+                seedG4(); g4=GmuG4Trace(); g4ErrorBits=bit;
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==14);
+            }
+            seedG4(); g4=GmuG4Trace(); g2Hang=true;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==11);
+            for(ULONG step=0x1100;step<=0x1105;++step) {
+                seedG4(); g4=GmuG4Trace(); failGmuStep=step;
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==6);
+                assert(g4.Cp.Attempted==(step<=0x1103 ? 0UL : 1UL));
+            }
+            for(ULONG step=0x1110;step<=0x111D;++step) {
+                seedG4(); g4=GmuG4Trace(); failGmuStep=step;
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_DEVICE_ERROR && g4.Cp.Reason==6);
+            }
+            seedG4(); g4=GmuG4Trace(); g4Completes=false; failGmuStep=0x1110;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_IO_TIMEOUT && g4.Cp.Reason==9);
+            seedG4(); g4=GmuG4Trace(); dropGxAtStep=0x1110;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INVALID_DEVICE_STATE);
+            assert(g4.Cp.Reason==GX_REG_HM_OFF && g4.ScratchAfter==0xFFFFFFFF && g4.IbRemaining==0xFFFFFFFF);
+            seedG4(); g4=GmuG4Trace(); failAddrMap=0;
+            assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INSUFFICIENT_RESOURCES && g4Writes.empty());
+            for(ULONG bad=0;bad<9;++bad) {
+                seedG4(); g4=GmuG4Trace();
+                if(bad==0) cpShadow[0]=25;
+                if(bad==1) *GmuCfgReg(0x807)=25;
+                if(bad==2) cpRing[0x7018/4]=0;
+                if(bad==3) cpRing[25]=0;
+                if(bad==4) *GmuCfgReg(0x885)=0;
+                if(bad==5) probe.Regions[1].Mapped=false;
+                if(bad==6) *GmuCfgReg(0x38)=1;
+                if(bad==7) g3cMaskChangeStep=0x1103;
+                if(bad==8) {g3cMaskChangeStep=0x1104; g4FenceDrops=1;}
+                assert(GmuG4Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g4)==STATUS_INVALID_DEVICE_STATE);
+                assert(g4.Cp.Reason==(bad>=6 ? 15UL : 12UL) && g4.Cp.WptrWrites==(bad==8 ? 1UL : 0UL));
+            }
+            allowG4Writes=false;
             allowG3cWrites=false; g3cPolling=false; g3cPending=false; g3cMaskChangeStep=0xFFFFFFFF; *GmuCfgReg(0x38)=0;
             allowG3bWrites=false; allowG3Writes=false; allowG2Writes=false; g2Ring=nullptr; g2Shadow=nullptr; probe.Count=0; probe.Smmu=nullptr;
             failGmuStep=0xFFFFFFFF; failAddrMap=0xFFFFFFFF; dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0;
@@ -965,6 +1061,29 @@ int main(int argc,char** argv) {
         ClearQuarantine();
         Reset(); smmuDisableFails=true;
         assert(RunG2(f,sqe,&keep,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
+        for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
+    // Full G-4 keeps the original allocation/SMMU layout and never runs after a failed parent.
+    {
+        const auto sqe=SqeImage();
+        Reset(); assert(RunG2(f,sqe,&keep,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(testMaps.size()==11 && g4Writes.size()==1 && g2Writes.size()==6 && g2Writes[5].second==39);
+        Reset(); assert(RunG2(f,sqe,&keep,true,true,true)==0 && g4Writes.empty());
+        Reset(); g3cEvent=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_CP && g4Writes.empty() && !keep && allocations.empty());
+        Reset(); g4Event=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g4Completes=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu->Smmu->enabled);
+        GMU_REGION* retained=GmuFind(g_KeptGmu,GmuG1Iova[1],GmuG1Size[1]);
+        assert(retained && retained->Va && static_cast<ULONG*>(retained->Va)[0x7024/4]==0xCAFE0007);
+        assert(std::memcmp(static_cast<UCHAR*>(retained->Va)+0x6000,GmuG4Ib,sizeof(GmuG4Ib))==0);
+        ClearQuarantine();
+        Reset(); smmuDisableFails=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
         ClearQuarantine(); Reset();
     }

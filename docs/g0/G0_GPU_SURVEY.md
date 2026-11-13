@@ -2502,6 +2502,134 @@ shim とホスト試験ケースには、正常完了、MASK 非0／投入・再
   1. GPU の割り込みが、3 本のうちどの vector かを確かめる（DSDT の `GPU0._CRS` の順番と、`Resources` の vector の対応）。
   2. ISR の設計。GX が OFF のときに GPU のレジスタを読まないこと。どの割り込みかは MessageNumber か、別の手段で見分けること。
 
+#### 9.21.13 G-4 の提案：IB 1 段（bit26、0x7FFFE80）
+
+**Linux の投入の形 [L]（`a6xx_submit`）**
+- `a6xx_set_pagetable` → 統計用の `CP_REG_TO_MEM` → `CP_EVENT_WRITE`（PC_CCU_INVALIDATE_DEPTH／COLOR）の順に出す。
+- コマンドの数だけ `CP_INDIRECT_BUFFER`（opcode 0x3F、本体 3 dword）を出す。
+  - 本体は {IB の IOVA の下位, 上位, `IB_SIZE`（dword 数、bit0〜19）}。
+- 最後に `PKT4 CP_SCRATCH(2)` = seqno と、`CP_EVENT_WRITE`（CACHE_FLUSH_TS | IRQ）→ fence を出す。
+- 今回は、ページテーブルの切り替え、統計、CCU の invalidate は入れない。IB を 1 つ呼ぶだけにする。
+
+**メモリ（新しい確保と SMMU の変更はしない）**
+- IB は ring の **オフセット 0x6000（IOVA 0x70016000）** に置く。
+- データは今までと同じ ring+0x7000 の [8]〜[11]（IOVA 0x70017020〜0x7001702C）を使う。
+
+**IB の中身（0x70016000 から 6 dword、CPU が書く）**
+| dword | 値 | 意味 |
+|---|---|---|
+| 0 | 0x48088601 | `PKT4`：0x886（CP_SCRATCH[3]）に 1 dword |
+| 1 | 0xCAFE0005 | 書く値 |
+| 2 | 0x703D8003 | `CP_MEM_WRITE`、本体 3 dword |
+| 3、4 | 0x70017020、0 | 書き込み先はデータ[8] |
+| 5 | 0xCAFE0006 | 書く値 |
+
+**ring の dword 30〜38**
+| dword | 値 | 意味 |
+|---|---|---|
+| 30 | **0x70BF8003** | `CP_INDIRECT_BUFFER`（0x3F）、本体 3 dword |
+| 31、32 | 0x70016000、0 | IB の IOVA |
+| 33 | 6 | IB_SIZE（dword） |
+| 34 | 0x70460004 | `CP_EVENT_WRITE`、本体 4 dword |
+| 35 | 0x00000004 | CACHE_FLUSH_TS。IRQ は付けない（MASK は 0 のまま） |
+| 36、37 | 0x70017024、0 | 書き込み先はデータ[9] |
+| 38 | 0xCAFE0007 | 書く値 |
+
+- ヘッダは §9.20.4 の式で計算した。PKT4 0x885 の値（0x48088501）が、G-3 で実機で動いた値と一致することも確かめた。
+- WPTR を 30 から **39** に進める。fenced write と、idle を待つ条件は G-3c と同じ（shadow が 39、上限 1 秒、エラー割り込みで止める）。
+- 準備：
+  - データ[8]〜[11] に目印として 0xFFFFFFFF を書く。
+  - IB を書いた後にメモリバリアを入れる。
+  - `CP_SCRATCH[3]`（0x886）の元の値を読む。
+  - 前の段階が終わった状態かを確かめる：shadow と WPTR が 30、ring[0..29] とデータ[0..7] が期待どおり。
+
+**成功の判定**
+| ビット | 条件 | わかること |
+|---|---|---|
+| 0 | `CP_SCRATCH[3]` = 0xCAFE0005 | IB の中の PKT4 が動いた |
+| 1 | データ[8] = 0xCAFE0006 | IB の中の MEM_WRITE が動いた |
+| 2 | データ[9] = 0xCAFE0007 | IB から ring に戻り、続きを処理した |
+| 3 | データ[10]、[11] = 0xFFFFFFFF | 余計な書き込みがない |
+| 4 | データ[0..7] と `CP_SCRATCH[2]`（0xCAFE0001）が変わらない | 前の結果を壊していない |
+
+- 全部そろえば 0x1F。
+
+**記録するもの**
+- G-3b と同じ項目。
+- 新しく `CP_IB1_BASE`（0x928/0x929）と `CP_IB1_REM_SIZE`（0x92A）。止まったときに、IB のどこで止まったかがわかる [L]。
+  - 0x928〜0x92A は CP_PROTECT[9]（0x8DE から 0xAE 個）の範囲に入る。ただしこれは書き込みの禁止（bit31 が 0）で、CPU からの読み出しは関係しない [P]。
+
+**結果の読み方**
+- 0x1F：Linux と同じ「IB で呼ぶ」形が動いた。次は描画の準備か、割り込みの準備に進める。
+- ビット 2 だけ落ちた場合：IB から戻れていない。`CP_IB1_REM_SIZE` で確かめる。
+- ビット 0 と 1 が落ちた場合：IB を読めていない。`CP_IB1_BASE`、FSR、FAR で確かめる。
+
+#### 9.21.14 G-4 の実装（実機未実行）
+
+- bit26（`EPI_GMU_PROBE_G4=0x4000000`、合計 `0x7FFFE80`）を追加した。G-3c と全前提を要求し、ワンショット解除にも含める。G-3c が成功した直後、同じ OOB の中で実行する。
+- 前提確認では WPTR / shadow=30、ring[0..29]、データ[0..7]、scratch[2]=`0xCAFE0001`、MASK=0 を確認する。MASK は投入直前と fence の再送直前にも読む。MASK への書き込み、ページテーブルの切り替え、統計、CCU invalidate は追加しない。
+- IB は既存 ring+0x6000 に仕様どおり6 dwordを配置する。ring[30..38] は IB 呼び出しと IRQ なしの CACHE_FLUSH_TS。データ[8..11] を `0xFFFFFFFF` で準備し、メモリバリアのあと WPTR=39 を書く。追加の確保や SMMU の変更はない。
+- 待ちは既存の fenced write（10 µs × 200、同じ WPTR の再送）と idle 待ち（100 µs × 10000）を使う。エラー割り込みと hang は停止する。成功には §9.21.13 の Checks=`0x1F` を要求する。
+- 各 GX アクセスの段階では breadcrumb を保存・flush し、OOB ACK / GDSCR / HM の前提を確認する。失敗時も安全に読める限り CP と IB の状態を記録し、最初の Reason を保持する。OOB 解除、slumber、reset と既存の後片付けへ進む。安全に片付いた CP 試験の失敗は GMU status=15、片付けの失敗は status=8 / KeepCx。KeepCx 時は IB とデータを含む既存メモリを保持する。
+
+`GpuGmuG4` は REG_BINARY、356バイト（ULONG 89個）。既存の診断 ABI は変更しない。
+
+```text
+{ Cp (既存 GpuGmuG2 と同じ140バイト),
+  ScratchBefore, ScratchAfter, Scratch2Before, Scratch2After,
+  DataBefore[12], DataAfter[12], Packet[9], Ib[6],
+  CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+  Checks, Prepared, MaskBefore, MaskAtSubmit, MaskAfter }
+```
+
+- ScratchBefore / After は scratch[3]、Scratch2Before / After は scratch[2]。IbBaseLow / High は CP_IB1_BASE（0x928 / 0x929）、IbRemaining は CP_IB1_REM_SIZE（0x92A）。Packet は ring[30..38]、Ib は ring+0x6000 の6 dword。
+- DataBefore[0..7] は G-3c の出力、[8..11] は CPU が準備した目印。Checks は §9.21.13 の5ビット。未記録は `0xFFFFFFFF`、Prepared / Checks の初期値は0。Cp.SqeWritten=0 で SQE は再起動しない（Cp の SQE 前後と Packet[9] は未使用）。
+- Reason / NtStatus は G-3c と同じ。Reason=8 は前段失敗で未実行、12 は旧状態／メモリの不整合、13 は結果不一致、15 は MASK 非0。MaskAtSubmit は最後の投入／再送前の読み取り値。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1100 | 前提確認、既存の2ページを map |
+| 0x1101 | MASK、旧コマンド・データ、scratch[2..3]、WPTR / shadow |
+| 0x1102 | 目印、IB、追加 ring パケットの準備 |
+| 0x1103 | MASK 再確認、WPTR=39 |
+| 0x1104 / 0x1105 | fence 待ち / idle 待ち |
+| 0x1110〜0x1119 | scratch[3]、scratch[2]、RPTR、WPTR、HW_FAULT、CP_INT、PROTECT、STATUS_1、RBBM、INT0 |
+| 0x111A〜0x111D | IB1_BASE 下位、上位、IB1_REM_SIZE、MASK |
+
+shim とホスト試験ケースを追加した。IB の内容と ring の呼び出しを検査し、scratch / メモリ / 復帰後のイベント、両方の目印、既存データ8個と scratch[2] の破壊を個別に模擬する。fence 再送と時間切れ、idle の時間切れ、エラー割り込み、breadcrumb / map / GX の失敗、MASK の変化、前段失敗、最初の Reason と KeepCx 時のメモリ保持も対象にした。テスト、ビルド、配置、実機実行はまだ行っていない。
+
+#### 9.21.15 v65 実機結果（2026-11-13、0x7FFFE80、G-4）
+
+- 実行条件：版 20.0.2.65（oem123）。端末を 13:07 に再起動してから実行した。
+- **結果：IB 1 段が動いた。Checks は 0x1F。**
+  - EpiGpuProbeStep は 0xFFFF。
+  - GpuGmuStatus、NtStatus、KeepCx、DisableStatus、CxStatus、FaultStatus はすべて 0。デバイスは Started。
+- `GpuGmuG4`（356 B）：
+  | 項目 | 値 |
+  |---|---|
+  | Cp：Attempted／Reason／Status | 1／0／0 |
+  | shadow／WPTR／RPTR | 30 → **39**／39／39 |
+  | Polls | 0 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT／CP_INT／PROTECT／STATUS_1 | 0x1／0／0／0／0／0 |
+  | CP_SCRATCH[3]：前 → 後 | 0 → **0xCAFE0005** |
+  | CP_SCRATCH[2]：前 → 後 | 0xCAFE0001 → 0xCAFE0001 |
+  | データ[8]／[9]／[10]／[11] | **0xCAFE0006**／**0xCAFE0007**／FFFFFFFF／FFFFFFFF |
+  | データ[0..7] | G-3c の後と同じ |
+  | `CP_IB1_BASE`／`CP_IB1_REM_SIZE` | **0x70016000**／0（IB を最後まで処理した） |
+  | MASK：前／投入時／後 | 0／0／0 |
+  | Packet と IB | 仕様と一致 |
+  - FSR は 0x400 で、フォルトはない。
+  - G-4 が始まる前の確認には、データ[6] = 0xCAFE0004 が含まれている。この確認を通ったので、G-3c も成功していたとわかる。
+- わかったこと：
+  - Linux の `a6xx_submit` と同じ「ring から IB を呼ぶ」形が、zap なしの secure mode で動いた。
+  - CP は IB を IOVA 0x70016000 から SMMU 経由で読んだ。
+  - IB の中の PKT4 と MEM_WRITE を処理し、ring に戻って fence のイベントまで進んだ。
+- ここまでの CP の段階（G-1〜G-4）で、コマンドの投入、メモリへの書き込み、fence の仕組みが一通りそろった。
+- 次の候補 [I]：
+  1. 割り込みを使えるようにする準備（GPU の vector を確かめる、ISR の設計）。
+  2. 描画やコンピュートの準備。必要なものが多いので、Linux の調査から始める。
+     - 例：シェーダの投入、`CP_SET_MARKER`、CCU の invalidate、ビンの設定。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
