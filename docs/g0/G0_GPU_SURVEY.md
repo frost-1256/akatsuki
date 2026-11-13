@@ -1823,6 +1823,166 @@ shim/ホスト試験に、47個の順序・値と全元値の保存、最後の�
   - 既定値の hbb_lo はすでに 1（highest bank bit 14）で、macrotile も有効になっていた。sm7325 向けの既定値と見られる [I]。
 - これで、`adreno_hw_init` の前の設定で残っているのは `CP_AHB_CNTL`（stage F）と、割り込みのマスクだけになった。
 
+#### 9.19.8 stage F の仕様（CP_AHB_CNTL）
+
+- **ビット：** bit20（0x100000）、`EpiGpuProbe=0x1FFE80`。stage E（bit19）が成功していることを前提にする。前提を満たさなければ、既存のとおり拒否する。
+- **場所：** stage E の直後で、OOB を解除する前。
+- **手順：**
+  1. breadcrumb を残し、GX の確認をする（ほかの段階と同じ）。
+  2. `CP_AHB_CNTL`（dword 0x98D、ページ 0x03D02000）の元の値を読む。
+  3. breadcrumb と GX の確認をしてから、0x1 を書き、すぐに読み戻す。
+  4. 書いた後の確認として、次の 4 個を 1 個ずつ読む。読む前には毎回 breadcrumb を残す。どれも v56／v57 で値が分かっているレジスタ：
+
+     | レジスタ | dword | 期待値（v56／v57） |
+     |---|---|---|
+     | `RBBM_GBIF_CLIENT_QOS_CNTL` | 0x011 | 0 |
+     | `RBBM_PERFCTR_CNTL` | 0x500 | 1 |
+     | `UCHE_CACHE_WAYS` | 0xE17 | 4 |
+     | `CP_PROTECT_CNTL` | 0x84F | 0xB |
+
+  5. 書いた後の読み出しで止まった場合は、breadcrumb で、どの読み出しで止まったかが分かるようにする。
+- **判定：** 読み戻しと 4 個の確認は、記録するだけにする。値が違っていても止めない。止めるのは、breadcrumb、GX の確認、map が失敗したときだけ。
+- **元の値：** GX 側なので戻さない（GX を切ると消える）[I]。
+- **記録（例 `GpuGmuGxStageF`）：** Attempted、Reason、Status、Count、Gdscr、GxHm、Before、After、Check[4]。
+- **breadcrumb の例：** 0xB00（開始）、0xB01（元の値を読む）、0xB02（書き込み）、0xB10〜0xB13（4 個の確認）。
+- **期待：** After=1、Check は表の値のとおり。SError やハングは起きない [U]。
+
+#### 9.19.9 stage F の実装（実機未実行）
+
+bit20 `EPI_GMU_PROBE_STAGE_F=0x100000` の拒否を解除し、bit19とその全前提を必要とする`0x1FFE80`を追加した。stage E成功直後、同じOOBの解除前にstage Fを実行する。前提不足はワンショット解除・flush後、ハードウェアアクセス前にstatus 6で拒否する。stage E未完了ならstage Fを呼ばずReason 8を残す。`0xFFE80`までの手順は変更していない。
+
+GPU窓の先頭4ページを一時的にRW・非キャッシュでmapする。0xB00を保存・flushしてGXを確認してからmapし、0xB01の保存・flushとGX再確認後にCP_AHB_CNTL（0x98D）の元値を読む。0xB02で同じ確認を行ってから1を書き、直後に同じレジスタを読み返す。続いて0xB10〜0xB13で1個ずつ保存・flushとGX確認を行い、QOS（0x011）、PERFCTR_CNTL（0x500）、CACHE_WAYS（0xE17）、CP_PROTECT_CNTL（0x84F）の順に読む。
+
+AfterとCheckは診断専用で、期待値との差によって止めない。map、breadcrumb、GX確認に失敗した場合だけ残りのstage Fアクセスを止める。取得したmapはすべて解除し、従来どおりOOB解除・slumber・resetと後片付けへ進む。CP_AHB_CNTLの元値復元はしない。安全な後片付けが成功すればstage Fの失敗はstatus 13、従来の安全確認や復元に失敗すればstatus 8 / KeepCx。stage DのCX設定やCGCの復元は維持する。割り込みマスク、SQE、リングバッファ、CPの起動は追加しない。
+
+`GpuGmuGxStageF` はREG_BINARY、48バイト（12 DWORD）：`{Attempted, Reason, Status, Count, Gdscr, GxHm, Before, After, Check[4]}`。Before/AfterはCP_AHB_CNTL、Checkは上記4個の順。Attemptedは1を書き込む直前に1、Countは書き込み後に読み終えたCheckの個数（0〜4、CP_AHB_CNTLの読み戻しは含めない）。Reasonは0=完了、1=未到達、2=OOB ACK失敗、3=GDSCR OFF、4=GX HM不成立、5=map失敗、6=breadcrumb失敗、8=前段未完了。StatusはNTSTATUS、未試行はSTATUS_NOT_FOUND、未読値は0xFFFFFFFF。cleanup/keepの両経路で保存する。SErrorなどで戻らない場合の位置は、各アクセスの直前にflushしたbreadcrumbで確認する。
+
+shim/ホスト試験に、stage FでだけCP_AHB_CNTL書き込みを許す仕組み、1回の書き込みと4個の確認、すべての読み戻し不一致を無視した続行、開始・元値・書き込み・各確認前のbreadcrumb失敗、map失敗、確認途中のGX状態不成立で残りを読まないことを追加した。試験・版番号変更・ビルド・署名・配置・実機実行は未実施。
+
+#### 9.19.10 結果（v58）
+
+**結果（2026-11-13、v34-akat、Epinephrine v58 / 20.0.2.58、`EpiGpuProbe=0x1FFE80`、09:58 の起動後）：成功** [P]。
+
+- 全体：`GpuGmuStatus=0`、NtStatus 0、KeepCx 0、`GpuCxStatus=0`。stage E は v57 と同じく Reason 0、Count 47。
+- `GpuGmuGxStageF`（48 B）：
+  - Attempted 1、Reason 0、Status 0、Count 4、Gdscr 0xF8222800、GxHm 0。
+  - **`CP_AHB_CNTL` は、元の値がすでに 1 だった。** 1 を書いた後の読み戻しも 1。値は変わっていない。
+  - 書いた後に読んだ 4 個は、期待どおりだった：QOS 0、PERFCTR_CNTL 1、CACHE_WAYS 4、CP_PROTECT_CNTL 0xB。
+  - SError やハングは起きなかった。
+- 解釈：この GPU では、リセット直後から AHB の既定の応答が ERROR になっていると見られる [I]。これまでの段階も、この設定のもとで問題なく動いていた。
+- これで、`adreno_hw_init` の前の設定は、割り込みのマスクを除いてすべて終えた。
+
+### 9.20 次の大きな段階：SQE、リングバッファ、CP の起動（調査）
+
+出典は Linux master の次のファイル。事実の確認だけに使った。
+
+- `a6xx_gpu.c`：`hw_init` の後半、`a6xx_ucode_load`、`a6xx_ucode_check_version`、`a6xx_cp_init`、`a6xx_flush`、`fenced_write`、`a6xx_idle`、`a6xx_get_rptr`、`a6xx_zap_shader_init`
+- `adreno_gpu.c`：`adreno_fw_create_bo`、`adreno_hw_init`、`adreno_idle`
+- `adreno_gpu.h`：`PKT7`、`PM4_PARITY`
+- `msm_gpu.h`、`msm_ringbuffer.h`
+- `registers/adreno/{a6xx.xml, adreno_common.xml, adreno_pm4.xml}`
+- `kodiak.dtsi`、`sm7325-nothing-spacewar.dts`
+
+#### 9.20.1 Linux の順番（割り込みマスクの後）
+
+1. `RBBM_INT_0_MASK` を書く（今は飛ばす）。
+2. `adreno_hw_init`：
+   - SCM で `qcom_scm_set_gpu_smmu_aperture(0)` を呼ぶ（使えるときだけ）[L]。CP が自分でページテーブルを切り替えるための設定で、今は要らないと見ている [I]。Windows には SCM の API がないので、どのみち呼べない。
+   - リングとメモリの中身を初期化する（ソフトウェア側だけ）。
+3. `CP_SQE_INSTR_BASE`（dword 0x830／0x831、64 ビット）に SQE の IOVA を書く。
+4. `CP_RB_BASE`（0x800／0x801）にリングバッファの IOVA を書く。
+5. `CP_RB_CNTL`（0x802）に `MSM_GPU_RB_CNTL_DEFAULT` を書く。hw_apriv なので `NO_UPDATE`（bit27）は立てない [L]。
+6. `CP_RB_RPTR_ADDR`（0x804／0x805）に、RPTR の影の IOVA を書く（hw_apriv のとき）[L]。
+7. `CP_SQE_CNTL`（0x808）= 1：SQE を動かす。
+8. `a6xx_cp_init`：リングに `CP_ME_INIT` を置き、WPTR を進め、空になるまで待つ。
+9. zap shader を読み込み、`CP_SET_SECURE_MODE 0` を送る。zap がなければ `RBBM_SECVID_TRUST_CNTL`（0xF400）= 0 を書く（§9.20.5）。
+10. OOB GPU_SET を解除する。
+
+#### 9.20.2 メモリに置くもの
+
+| 名前 | 大きさ | 中身 | GPU から見た属性 |
+|---|---|---|---|
+| SQE | ファイルの大きさ − 4 | `a660_sqe.fw` の **先頭 4 バイトを飛ばした残り**（`adreno_fw_create_bo` は `&fw->data[4]` からコピーする）[L] | WC、GPU からは読み出し専用 |
+| リングバッファ | 32 KB（`MSM_GPU_RINGBUFFER_SZ`） | PM4 のパケット | WC |
+| RPTR の影 | 4 バイト × リング数（1） | CP が RPTR を書き込む | WC、**特権**（`MSM_BO_MAP_PRIV`）。APRIV（stage D で 0x6E）によって CP の特権アクセスになる [L] |
+| memptrs | `struct msm_rbmemptrs` | rptr、fence など | 今回の最初の試験では使わない |
+
+- 電話の純正イメージの `stock-rom/vx/firmware/a660_sqe.fw` は 40496 バイト [P]。
+  - 先頭の 8 dword は 0x00000000、0x016DC094、0x0100278B、0x016DC071、0x88121F18、0x88131F98、0x88020001、0xA8020080。
+  - 4 バイト飛ばした後の buf[0] は 0x016DC094。
+  - `a6xx_ucode_check_version` は、a660_sqe.fw の版を調べない（最初から安全とみなす）[L]。
+- `MSM_GPU_RB_CNTL_DEFAULT` = BUFSZ(ilog2(32768/8) = 12) | BLKSZ(ilog2(32/8) = 2) << 8 = **0x0000020C** [L]。BUFSZ は bit0〜5、BLKSZ は bit8〜13（`adreno_common.xml`）。
+
+#### 9.20.3 SMMU（GPU 側のストリーム）
+
+- DT の GPU のノードは `iommus = <&adreno_smmu 0 0x400>, <&adreno_smmu 1 0x400>` [L]。**CP（GPU 本体）のストリーム ID は 0 と 1**（mask 0x400）。GMU は 5 [L]。
+- 今の `epi_smmu` は、SMR0 = ID 5／mask 0x400 だけを CB0 に向けている。sCR0 の USFCFG=1 なので、ID 0／1 のアクセスは一致する SMR がないとフォルトになる（G1c-1）[P]。
+- 必要な追加（文章だけ。実装はユーザー）：
+  - ID 0 と 1 を受ける SMR を足す。たとえば ID 0／mask 0x401 で 1 本、または ID 0 と ID 1 で 1 本ずつ。SMR は全部で 6 本ある [P]。
+  - 向け先の CB は、GMU と同じ CB0 にしてページテーブルを共有するのがいちばん簡単 [I]。IOVA は GMU の領域（0x4000〜、0x60000000〜）と重ならない場所にする。
+  - Linux は GPU 用に別のドメイン（CB）を使う。共有にするか分けるかは、ユーザーが決める。
+  - RPTR の影は特権（PRIVILEGED）属性で張り、SQE は読み出し専用で張る。
+- 番地の幅：ADDR_MODE=1（stage B）なので、CP は 64 ビットの番地を使う。今の CB0 の TCR は 32 ビットの IOVA 向けなので、IOVA は 4 GB 未満に置く [I]。
+
+#### 9.20.4 CP_ME_INIT と WPTR
+
+- パケットの形 [L]：
+  - `PKT7(op, cnt)` = 0x70000000 | cnt | PM4_PARITY(cnt) << 15 | (op & 0x7F) << 16 | PM4_PARITY(op) << 23。
+  - PM4_PARITY は、32 ビットを 4 ビットずつ XOR した値を n として (0x9669 >> n) & 1。
+- `CP_ME_INIT` は opcode 0x48、本体は 8 dword [L]。ヘッダを計算すると **0x70C80008**。
+- リングの最初の 9 dword：
+
+  | 位置 | 値 | 意味（Linux のコメント） |
+  |---|---|---|
+  | 0 | 0x70C80008 | ヘッダ |
+  | 1 | 0x0000002F | 有効にする項目のマスク |
+  | 2 | 0x00000003 | 複数のハードウェアコンテキスト |
+  | 3 | 0x20000000 | エラー検出 |
+  | 4、5 | 0、0 | ヘッダダンプなし |
+  | 6 | 0 | ワークアラウンドなし |
+  | 7、8 | 0、0 | 埋め草 |
+
+- WPTR を進める：
+  - `CP_RB_WPTR`（0x807）に 9（dword 単位）を書く。
+  - Linux は `fenced_write` を使う。書いた後に `GMU_AHB_FENCE_STATUS` を見て、フェンスに落とされていれば書き直す [L]。
+  - OOB GPU_SET を取っている間は、フェンスは開いていると見ている [I]。
+- 空になるまで待つ（`a6xx_idle`）[L]：
+  1. RPTR の影（メモリ）が WPTR（9）と等しくなる。hw_apriv なので、レジスタではなく影を見る（`a6xx_get_rptr`）。
+  2. `RBBM_STATUS`（0x210）が、bit0（CP_AHB_BUSY_CX_MASTER）以外すべて 0。
+  3. `RBBM_INT_0_STATUS`（0x201）の bit23（RBBM_HANG_DETECT）が 0。
+  4. GMU も idle（`a6xx_gmu_isidle`）。
+- 失敗したときのために、`CP_RB_RPTR`（0x806）、`CP_HW_FAULT`（0x821）、`RBBM_INT_0_STATUS`、SMMU の FSR／FAR も記録することを提案する。
+
+#### 9.20.5 zap shader と SECVID_TRUST_CNTL（大きな障害）
+
+- Linux は、`cp_init` の後で zap shader（`a660_zap.mbn`）を SCM の PAS で TZ に読み込ませる [L]。
+  - spacewar の DT では `qcom/sm7325/nothing/spacewar/a660_zap.mbn`。
+  - 成功したら、リングで `CP_SET_SECURE_MODE 0`（ヘッダ 0x70E60001、本体 0）を送り、CP を安全モードから出す [L]。
+- zap がない場合は、`RBBM_SECVID_TRUST_CNTL`（0xF400）= 0 を直接書く [L]。
+  - ただし Linux のコメントは、推測が外れていればこのレジスタへのアクセスは塞がれ、すぐに権限違反が起きる、と書いている [L]。
+- 量産の電話では TZ が zap を前提に設定しているはずなので、0xF400 は塞がれている可能性が高い [I]。GPU PDC を読んだときのように、電話がリセットされるおそれもある [U]。
+- 純正イメージには `a660_zap.mdt`、`.b00`〜`.b02`、`.elf` がある [P]。しかし Windows から TZ の PAS を呼ぶ手段がない（qcscm は軽々しく戻さない方針）。
+- **結論：最初の CP の試験は zap の手前（`cp_init` の idle 確認）で止める。0xF400 は読みも書きもしない。** zap は別の課題として切り分ける。
+  - CP が安全モードのままでも、`CP_ME_INIT` の処理と RPTR の書き戻しはできるはず [U]。
+
+#### 9.20.6 後片付け
+
+- Linux の通常の停止（`a6xx_pm_suspend`）は、SQE を止めずに、バスを halt してから GX を落とす [L]。エラー回復のときだけ、`CP_SQE_CNTL=3` で SQE を止める [L]。
+- 今の後片付けの順番は、バスの halt → slumber（GX OFF）→ SMMU の Disable → メモリの解放。こうすると、CP がメモリを触らなくなってから SMMU を外すことになるので、この順番を守る [I]。
+- メモリ（SQE、リング、影）の解放は、SMMU を Disable した後に行う。Disable が失敗したら解放しない（既存の規則と同じ）。
+
+#### 9.20.7 段階の提案
+
+| 段階 | ビット | 中身 | CP は動くか |
+|---|---|---|---|
+| G-1 | bit21 | メモリ 3 つの確保と SMMU への map（ID 0／1 の SMR を追加）、SQE の中身のコピー、`CP_SQE_INSTR_BASE`、`CP_RB_BASE`、`CP_RB_CNTL`、`CP_RB_RPTR_ADDR` を書いて読み戻す | 動かさない |
+| G-2 | bit22 | G-1 の後に `CP_SQE_CNTL=1`、ME_INIT を置いて WPTR=9、idle を待つ（タイムアウト付き） | 動かす |
+| Z | 未定 | zap shader／SECVID_TRUST_CNTL | 別途調査 |
+
+- G-1 は、SMMU の変更（ユーザーの担当）が中心になる。
+- G-2 が成功すれば、CP の SQE が動き、GPU が初めて命令を実行したことになる。
+- G-2 の前に、stage F（`CP_AHB_CNTL`）を済ませる。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

@@ -30,6 +30,7 @@
 //      Bit16 follows successful stage A with twelve ADDR_MODE controls set to 1; bit17 then enables hwcg.
 //      Bit18 then applies stage D fixed settings without CP_AHB_CNTL; no CP execution is started.
 //      Bit19 adds stage E UBWC / CP protection settings after successful stage D under the same OOB lease.
+//      Bit20 then writes CP_AHB_CNTL and reads four known registers, still before OOB release.
 //      Record ACKs/queue indices,
 //      diagnostics, the SMMU fault state and the GMU log; put CM3 back in reset, bit12 rpmh_stop, check RSCC/GX idle.
 //   7. EpiSmmuDisable, restore GMU controls, optional GBIF and RSCC, then Unmap / Destroy / free.
@@ -1248,10 +1249,74 @@ static NTSTATUS GmuGxStageE(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,
     for (ULONG i=0;i<RTL_NUMBER_OF(maps);++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
     return st;
 }
+struct GMU_GX_STAGE_F_TRACE {
+    ULONG Attempted, Reason;
+    NTSTATUS Status;
+    ULONG Count, Gdscr, GxHm, Before, After, Check[4];
+};
+static_assert(sizeof(GMU_GX_STAGE_F_TRACE)==48,"GX stage F diagnostic ABI");
+static GMU_GX_STAGE_F_TRACE GmuGxStageFTrace()
+{
+    GMU_GX_STAGE_F_TRACE t;
+    RtlFillMemory(&t,sizeof(t),0xFF);
+    t.Attempted=0; t.Reason=GX_REG_NOT_REACHED; t.Status=STATUS_NOT_FOUND; t.Count=0;
+    return t;
+}
+static NTSTATUS GmuGxStageFGuard(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,
+                                  const GMU_GX_TRACE* T,GMU_GX_STAGE_F_TRACE* F,ULONG Step)
+{
+    const NTSTATUS st=GmuStep(Params,Step);
+    if (!NT_SUCCESS(st)) { F->Reason=GX_REG_BREADCRUMB_FAILED; return st; }
+    GMU_GX_REG_TRACE guard={};
+    const BOOLEAN ready=GmuGxRegReady(Cc,S,T,&guard);
+    F->Gdscr=guard.Gdscr; F->GxHm=guard.GxHm;
+    if (!ready) { F->Reason=guard.Reason; return STATUS_INVALID_DEVICE_STATE; }
+    return STATUS_SUCCESS;
+}
+static NTSTATUS GmuGxStageF(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,
+                             const GMU_GX_TRACE* T,GMU_GX_STAGE_F_TRACE* F)
+{
+    PVOID maps[4]={};
+    NTSTATUS st=GmuGxStageFGuard(S,Params,Cc,T,F,0xB00);
+    if (!NT_SUCCESS(st)) { return st; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(maps);++i)
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart=EPI_GMU_GPU_BASE+i*PAGE_SIZE;
+        maps[i]=MmMapIoSpaceEx(pa,PAGE_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+        if (maps[i]==NULL) { F->Reason=GX_REG_MAP_FAILED; st=STATUS_INSUFFICIENT_RESOURCES; break; }
+    }
+    if (NT_SUCCESS(st))
+    {
+        volatile ULONG* ahb=static_cast<volatile ULONG*>(maps[2])+(0x98D&0x3FF);
+        st=GmuGxStageFGuard(S,Params,Cc,T,F,0xB01);
+        if (NT_SUCCESS(st)) { F->Before=READ_REGISTER_ULONG(ahb); }
+        if (NT_SUCCESS(st))
+        {
+            st=GmuGxStageFGuard(S,Params,Cc,T,F,0xB02);
+            if (NT_SUCCESS(st))
+            {
+                F->Attempted=1;
+                WRITE_REGISTER_ULONG(ahb,1);
+                F->After=READ_REGISTER_ULONG(ahb);
+            }
+        }
+        const ULONG regs[]={0x011,0x500,0xE17,0x84F};
+        for (ULONG i=0;i<RTL_NUMBER_OF(regs) && NT_SUCCESS(st);++i)
+        {
+            st=GmuGxStageFGuard(S,Params,Cc,T,F,0xB10+i); if (!NT_SUCCESS(st)) { break; }
+            F->Check[i]=READ_REGISTER_ULONG(static_cast<volatile ULONG*>(maps[regs[i]/0x400])+(regs[i]&0x3FF));
+            F->Count=i+1; // count only completed post-write diagnostic reads
+        }
+    }
+    if (NT_SUCCESS(st)) { F->Reason=0; }
+    for (ULONG i=0;i<RTL_NUMBER_OF(maps);++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
+    return st;
+}
 static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_TRACE* T,
                          GMU_GX_REG_TRACE* GxReg = NULL, GMU_GX_HALT_TRACE* Halt = NULL,
                          GMU_GX_INIT_TRACE* Init = NULL, BOOLEAN AddrMode = FALSE, GMU_GX_HWCG_TRACE* Hwcg = NULL,
-                         GMU_GX_CFG_TRACE* Cfg = NULL, GMU_GX_STAGE_E_TRACE* StageE = NULL)
+                         GMU_GX_CFG_TRACE* Cfg = NULL, GMU_GX_STAGE_E_TRACE* StageE = NULL,
+                         GMU_GX_STAGE_F_TRACE* StageF = NULL)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -1304,6 +1369,11 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
     {
         if (Cfg!=NULL && NT_SUCCESS(Cfg->Status)) { StageE->Status=GmuGxStageE(S,Params,Cc,T,StageE); }
         else { StageE->Reason=8; StageE->Status=STATUS_INVALID_DEVICE_STATE; }
+    }
+    if (StageF!=NULL)
+    {
+        if (StageE!=NULL && NT_SUCCESS(StageE->Status)) { StageF->Status=GmuGxStageF(S,Params,Cc,T,StageF); }
+        else { StageF->Reason=8; StageF->Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
     WRITE_REGISTER_ULONG(GmuReg(S,R_HOST2GMU_INTR_SET),0x80000000UL);
@@ -1414,7 +1484,7 @@ static BOOLEAN GmuCopy(GMU_TEST* S, HANDLE Params, const UCHAR* Fw, ULONG Length
 ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
                      PWCHAR Text, SIZE_T TextCch, BOOLEAN* KeepCx, BOOLEAN StartHfi, BOOLEAN VoteGx, BOOLEAN FastClock,
                      BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode, BOOLEAN Hwcg,
-                     BOOLEAN GxCfg, BOOLEAN StageE)
+                     BOOLEAN GxCfg, BOOLEAN StageE, BOOLEAN StageF)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
@@ -1430,6 +1500,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     if (Hwcg && !AddrMode) { return EPI_GMU_E_PRECOND; }
     if (GxCfg && !Hwcg) { return EPI_GMU_E_PRECOND; }
     if (StageE && !GxCfg) { return EPI_GMU_E_PRECOND; }
+    if (StageF && !StageE) { return EPI_GMU_E_PRECOND; }
     if (Cc == NULL || Text == NULL || TextCch==0) { return EPI_GMU_E_PRECOND; }
     EpiSetDword(Diag,L"GpuGmuKeepCx",0);
     EpiSetDword(Diag,L"GpuGmuFaultStatus",static_cast<ULONG>(STATUS_NOT_FOUND));
@@ -1471,6 +1542,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxCfg",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuGxStageE",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuGmuGxStageF",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { return EPI_GMU_E_NOMEM; }
     for (ULONG i=0;i<RTL_NUMBER_OF(s->SmmuCbar);++i)
@@ -1492,6 +1564,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     GMU_GX_HWCG_TRACE gxHwcg=GmuGxHwcgTrace();
     GMU_GX_CFG_TRACE gxCfg=GmuGxCfgTrace();
     GMU_GX_STAGE_E_TRACE gxStageE=GmuGxStageETrace();
+    GMU_GX_STAGE_F_TRACE gxStageF=GmuGxStageFTrace();
     GMU_GX_TRACE gx={};
     gx.OobStatus=STATUS_NOT_FOUND; gx.HaltStatus=STATUS_NOT_FOUND; gx.SlumberStatus=STATUS_NOT_FOUND;
     gx.BusyStatus=STATUS_NOT_FOUND; gx.RpmhStopStatus=STATUS_NOT_FOUND; gx.IdleStatus=STATUS_NOT_FOUND;
@@ -1723,7 +1796,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         {
             const NTSTATUS oob=GmuGxOob(s,Params,Cc,&gx,GxReg ? &gxReg : NULL,
                                         ClearHalt ? &gxHalt : NULL,Secvid ? &gxInit : NULL,AddrMode,Hwcg ? &gxHwcg : NULL,
-                                        GxCfg ? &gxCfg : NULL,StageE ? &gxStageE : NULL);
+                                        GxCfg ? &gxCfg : NULL,StageE ? &gxStageE : NULL,StageF ? &gxStageF : NULL);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (gx.Attempted)
             {
@@ -1733,7 +1806,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
             if (!NT_SUCCESS(oob) || (gx.Attempted && !NT_SUCCESS(slumber)) || !NT_SUCCESS(gx.BreadcrumbStatus) ||
                 (ClearHalt && !NT_SUCCESS(gxHalt.Status)) || (Secvid && !NT_SUCCESS(gxInit.Status)) ||
                 (Hwcg && !NT_SUCCESS(gxHwcg.Status)) || (GxCfg && !NT_SUCCESS(gxCfg.Status)) ||
-                (StageE && !NT_SUCCESS(gxStageE.Status)))
+                (StageE && !NT_SUCCESS(gxStageE.Status)) || (StageF && !NT_SUCCESS(gxStageF.Status)))
             {
                 result=EPI_GMU_E_GX;
                 st=!NT_SUCCESS(oob) ? oob : (!NT_SUCCESS(slumber) ? slumber :
@@ -1741,7 +1814,8 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                     (ClearHalt && !NT_SUCCESS(gxHalt.Status) ? gxHalt.Status :
                      (Secvid && !NT_SUCCESS(gxInit.Status) ? gxInit.Status :
                       (Hwcg && !NT_SUCCESS(gxHwcg.Status) ? gxHwcg.Status :
-                       (GxCfg && !NT_SUCCESS(gxCfg.Status) ? gxCfg.Status : gxStageE.Status))))));
+                       (GxCfg && !NT_SUCCESS(gxCfg.Status) ? gxCfg.Status :
+                        (StageE && !NT_SUCCESS(gxStageE.Status) ? gxStageE.Status : gxStageF.Status)))))));
             }
         }
         GmuHfiPower(s,Params,Cc,&hfi,1);
@@ -1762,6 +1836,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         EpiSetValue(Diag,L"GpuGmuLog",REG_BINARY,log->Va,EPI_GMU_LOG_DUMP);
     }
 cleanup:
+    if (StageF) { EpiSetValue(Diag,L"GpuGmuGxStageF",REG_BINARY,&gxStageF,sizeof(gxStageF)); }
     if (StageE) { EpiSetValue(Diag,L"GpuGmuGxStageE",REG_BINARY,&gxStageE,sizeof(gxStageE)); }
     if (GxCfg) { EpiSetValue(Diag,L"GpuGmuGxCfg",REG_BINARY,&gxCfg,sizeof(gxCfg)); }
     if (Hwcg) { EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,&gxHwcg,sizeof(gxHwcg)); }
@@ -1913,6 +1988,7 @@ cleanup:
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
     return result;
 keep:
+    if (StageF) { EpiSetValue(Diag,L"GpuGmuGxStageF",REG_BINARY,&gxStageF,sizeof(gxStageF)); }
     if (StageE) { EpiSetValue(Diag,L"GpuGmuGxStageE",REG_BINARY,&gxStageE,sizeof(gxStageE)); }
     if (GxCfg) { EpiSetValue(Diag,L"GpuGmuGxCfg",REG_BINARY,&gxCfg,sizeof(gxCfg)); }
     if (Hwcg) { EpiSetValue(Diag,L"GpuGmuGxHwcg",REG_BINARY,&gxHwcg,sizeof(gxHwcg)); }

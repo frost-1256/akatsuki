@@ -48,6 +48,7 @@ static std::vector<UCHAR> Image() {
     ULONG version=0x30010008; Block(f,0x10007FE0,4,0,0,&version); return f;
 }
 static void Reset() {
+    stageFWrites.clear(); allowStageFWrite=false; ignoreStageFWrite=false; dropGxAtStep=0xFFFFFFFF;
     stageEWrites.clear(); failStageEDword=0xFFFFFFFF;
     cfgWrites.clear(); failCfgDword=0xFFFFFFFF;
     std::memset(hwcgIsdbPage,0,sizeof(hwcgIsdbPage)); std::memset(hwcgSpPage,0,sizeof(hwcgSpPage));
@@ -348,6 +349,46 @@ int main(int argc,char** argv) {
         seedStageE(); stageE=GmuGxStageETrace(); gPages[1][0xD0]=0xC0;
         assert(GmuGxStageE(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageE)==STATUS_INVALID_DEVICE_STATE);
         assert(stageE.Reason==GX_REG_HM_OFF && stageEWrites.empty()); gPages[1][0xD0]=0;
+        // Stage F: one opt-in write, then four ordered diagnostic reads without comparisons.
+        const ULONG checkRegs[]={0x011,0x500,0xE17,0x84F};
+        const ULONG checkValues[]={0,1,4,0xB};
+        const auto seedStageF=[&]() {
+            failGmuStep=0xFFFFFFFF; failAddrMap=0xFFFFFFFF; dropGxAtStep=0xFFFFFFFF;
+            gPages[1][0xD0]=0; stageFWrites.clear(); allowStageFWrite=true; ignoreStageFWrite=false;
+            *GmuCfgReg(0x98D)=7;
+            for(ULONG i=0;i<4;++i) *GmuCfgReg(checkRegs[i])=checkValues[i];
+        };
+        seedStageF(); GMU_GX_STAGE_F_TRACE stageF=GmuGxStageFTrace();
+        assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==0);
+        assert(stageF.Attempted==1 && stageF.Reason==0 && stageF.Before==7 && stageF.After==1 && stageF.Count==4);
+        assert(stageFWrites.size()==1 && stageFWrites[0]==1);
+        for(ULONG i=0;i<4;++i) assert(stageF.Check[i]==checkValues[i]);
+        seedStageF(); stageF=GmuGxStageFTrace(); ignoreStageFWrite=true;
+        for(ULONG i=0;i<4;++i) *GmuCfgReg(checkRegs[i])=0x100+i;
+        assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==0);
+        assert(stageF.Reason==0 && stageF.After==7 && stageF.Count==4);
+        for(ULONG i=0;i<4;++i) assert(stageF.Check[i]==0x100+i);
+        // Original/write breadcrumb failures must prevent CP_AHB_CNTL publication.
+        for(ULONG step=0xB00;step<=0xB02;++step) {
+            seedStageF(); stageF=GmuGxStageFTrace(); failGmuStep=step;
+            assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_IO_DEVICE_ERROR);
+            assert(stageF.Reason==6 && stageF.Attempted==0 && stageF.Count==0 && stageFWrites.empty());
+            assert(stageF.After==0xFFFFFFFF);
+        }
+        for(ULONG fail=0;fail<4;++fail) {
+            seedStageF(); stageF=GmuGxStageFTrace(); failGmuStep=0xB10+fail;
+            assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_IO_DEVICE_ERROR);
+            assert(stageF.Reason==6 && stageF.Attempted==1 && stageF.Count==fail && stageFWrites.size()==1);
+            for(ULONG i=0;i<fail;++i) assert(stageF.Check[i]==checkValues[i]);
+            for(ULONG i=fail;i<4;++i) assert(stageF.Check[i]==0xFFFFFFFF);
+        }
+        seedStageF(); stageF=GmuGxStageFTrace(); failAddrMap=0;
+        assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_INSUFFICIENT_RESOURCES);
+        assert(stageF.Reason==5 && stageFWrites.empty());
+        seedStageF(); stageF=GmuGxStageFTrace(); dropGxAtStep=0xB12;
+        assert(GmuGxStageF(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&stageF)==STATUS_INVALID_DEVICE_STATE);
+        assert(stageF.Reason==GX_REG_HM_OFF && stageF.Count==2 && stageF.Check[2]==0xFFFFFFFF && stageF.Check[3]==0xFFFFFFFF);
+        dropGxAtStep=0xFFFFFFFF; gPages[1][0xD0]=0; allowStageFWrite=false;
         // A stuck CX clear must stop before the RBBM write and must block final CX teardown.
         regs={}; halt={}; halt.Status=STATUS_NOT_FOUND; gmuWrites=0;
         gPages[6][0x45]=3; gPages[6][0x46]=3; gPages[8][0x16]=1; failCxHaltClear=true;

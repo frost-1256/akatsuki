@@ -48,6 +48,9 @@ static std::vector<std::pair<ULONG,ULONG>> cfgWrites;
 static ULONG failCfgDword=0xFFFFFFFF;
 static std::vector<std::pair<ULONG,ULONG>> stageEWrites;
 static ULONG failStageEDword=0xFFFFFFFF;
+static bool allowStageFWrite=false, ignoreStageFWrite=false;
+static std::vector<ULONG> stageFWrites;
+static ULONG dropGxAtStep=0xFFFFFFFF;
 inline ULONG GmuStageEReg(ULONG i) {
     const ULONG prefix[]={0x8E08,0xB604,0xAE02,0xE01,0x534,0x84F};
     return i<6 ? prefix[i] : (i==46 ? 0x87F : 0x850+i-6);
@@ -102,7 +105,10 @@ inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T,ULONG protection) {
 }
 inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     ++gmuWrites;
-    assert(p!=GmuCfgReg(0x98D)); // stage D must never enable CP_AHB_CNTL
+    if(p==GmuCfgReg(0x98D)) {
+        assert(allowStageFWrite); stageFWrites.push_back(v);
+        if(ignoreStageFWrite) return;
+    }
     for(ULONG reg=0x878;reg<=0x87E;++reg) assert(p!=GmuCfgReg(reg));
     for(ULONG i=0;i<47;++i) {
         const ULONG reg=GmuStageEReg(i);
@@ -166,6 +172,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
+    if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==dropGxAtStep) gPages[1][0xD0]=0xC0;
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
     diagnostics[name]=v; return 0;
 }
