@@ -2936,6 +2936,73 @@ shim とホスト試験ケースを追加した。仕様の IB / ring パケッ�
   - 広い走査で見つかった：候補 3。アドレスや pitch の解釈を直す。
   - どちらもない：候補 1（secure mode）がいちばん有力になる。そこから先は zap shader の読み込み（SCM／PAS 経由）が必要になる。これは qcscm などの扱いを含む大きな判断なので、ユーザーと相談して決める。
 
+#### 9.21.21 G-5b の実装（実機未実行）
+
+- bit28（`EPI_GMU_PROBE_G5B=0x10000000`、合計 `0x1FFFFE80`）を追加した。G-5 と全前提を要求し、ワンショット解除にも含める。G-5 の Checks=`0x17` / Reason=13 / `STATUS_IO_DEVICE_ERROR` は続行可能とするが、時間切れ、アクセス・breadcrumb・map の失敗、エラー割り込みは許容しない。
+- 実際の入口では WPTR / shadow=48、旧 ring と IB、データ[0..11]、全256画素と番兵16個が前段の期待値であることを再確認する。画素は全個 `0xFFFFFFFF` が必要。G-5 がすでに描画に成功した場合は、過去の画素を G-5b の結果と取り違えないよう、ここで停止する。
+- 採用したのは IB を入れ子にしない案。ring[48..60] から ring+0x6200 の10 dword IB（CACHE_INVALIDATE、WFI、3レジスタ、WFI）、既存の ring+0x6100 の G-5 IB、最後の CACHE_FLUSH_TS の順に実行する。WPTR=61、データ[12] に `0xCAFE000A`。画素と番兵は入口の値を保ち、CPU から再初期化しない。追加の GPU メモリ確保や SMMU マッピング変更はない。
+- MASK=0 を入口、投入・fence 再送前に確認し、MASK には書かない。magic レジスタの書き込みは CP の IB だけで行う。0xE19 は前後を読むだけ。レジスタページ 0 / 0x2000 / 0x23000 / 0x3000 を一時的に map し、OOB 解除より前に unmap する。
+- `EpiSmmuQueryGlobalFault` を追加した。既存の SMMU context と CX 窓を確認し、GR0 の 0x48 / 0x50 / 0x54 / 0x58 を読むだけ。clear / acknowledge は行わない。前後の値と各呼び出しの NTSTATUS を保存する。global 診断の読み取り失敗は記録のみで、描画の成功条件には追加しない。
+- 最後に既存の32 KB ring を CPU から走査する。除外はバイトの半開区間 `[0,0xF4)`、`[0x6000,0x6240)`、`[0x7000,0x7040)`、`[0x7400,0x7840)`。対象は7699 dword。`0x78563412` / `0x12345678` / `0x00000012` それぞれの一致数と最初の **ring 内バイト位置**を記録する。見つかったこと自体は描画の成功条件にしない。
+- Checks は仕様の4ビットで、全成功=`0xF`。bit0 は hardware RPTR / WPTR / shadow=61、エラーなし・idle、bit1 はデータ[12]、bit2 は全画素、bit3 は全番兵。既存の `GpuGmuG5` は変更せず失敗の記録も保持する。許容した G-5 の画素不一致だけで全体を失敗にせず、G-5b の結果を使う。後片付けの失敗は引き続き status=8 / KeepCx を優先する。
+
+`GpuGmuG5b` は REG_BINARY、764バイト（ULONG 191個）。既存 ABI は変更しない。
+
+```text
+{ Draw (既存 GpuGmuG5 と同じ564バイト), Data12Before, Data12After,
+  Packet[13], Ib[10], MagicBefore[4], MagicAfter[4],
+  GlobalStatus[2], GlobalBefore[4], GlobalAfter[4],
+  ScanCount[3], ScanFirst[3], ScanDwords }
+```
+
+- Magic の順は 0x8E04 / 0x8E01 / 0xE12 / 0xE19。Global の順は sGFSR / sGFSYNR0 / 1 / 2。Scan の順は上記3色。未記録と最初の一致なしは `0xFFFFFFFF`、GlobalStatus の初期値は `STATUS_NOT_FOUND`。Draw.Prepared / Checks は0から始める。走査を実行した場合だけ一致数は0以上になる。
+- Draw.DataBefore / After はデータ[0..11]、Data12Before / After は別に保存する。Draw.Packet[9] は未使用、今回の ring は外側の Packet[13] に保存する。Draw.Ib[36] は再利用した G-5 の IB、外側の Ib[10] が初期化 IB。Draw の画素・番兵・CCU・CP・FSR の項目は G-5 と同じ。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x1300 / 0x1301 | map / 前段の状態と MASK の確認 |
+| 0x1302〜0x1305 | magic レジスタ4個の元の値 |
+| 0x1306 / 0x1307 | 元の CCU / global fault |
+| 0x1308 / 0x1309 | IB と追加 ring の準備 / WPTR=61 |
+| 0x130A / 0x130B | fence / idle 待ち |
+| 0x1310〜0x131C | G-5 と同じ順の GX 診断 |
+| 0x1320〜0x1323 / 0x1324 | magic レジスタ前後比較用の値 / global fault の後 |
+
+shim と試験ケースに、G-5 の Checks=0x17 からの正常続行、4条件の個別不成立、global 診断失敗の記録、走査の境界と3種類の値、前提・breadcrumb・fence・idle・エラー割り込み、全体結果の選択、KeepCx 時の保持を追加した。SMMU の global 読み取りがレジスタを書き換えない試験も追加した。テスト、ビルド、配置、実機実行は行っていない。
+
+#### 9.21.22 v67 実機結果（2026-11-13、0x1FFFFE80、G-5b）
+
+- 実行条件：版 20.0.2.67（oem125）。端末を 16:56 に起動し、配置のあとに実行した（配置のときは EpiGpuProbe＝0 で、GX には触れていない）。
+- **結果：magic レジスタは届いたが、画素はやはり 1 つも書かれなかった。G-5b の Checks は 0xB（bit2 だけが不成立）。広い走査にも何も出なかった。**
+  - EpiGpuProbeStep は 0xFFFF。GpuGmuStatus は 15、NtStatus は 0xC0000185（Reason 13）。
+  - KeepCx、DisableStatus、FaultStatus は 0。デバイスは Started。
+- `GpuGmuG5`（G-5 の部分）は v66 とほぼ同じで、Checks 0x17、画素の一致は 0。
+- `GpuGmuG5b`（764 B）：
+  | 項目 | 値 |
+  |---|---|
+  | shadow／WPTR／RPTR | 48 → **61**／61／61 |
+  | RBBM_STATUS／INT0／CP_HW_FAULT／CP_INT／PROTECT／STATUS_1 | 0x1／0／0／0／0／0 |
+  | RB_CCU_CNTL：前 → 後 | 0x10000000 → 0x10000000 |
+  | データ[12]：前 → 後 | 0 → CPU が 0xFFFFFFFF にした後 → **0xCAFE000A** |
+  | 0x8E04（RB_DBG_ECO_CNTL）：前 → 後 | 0x00100000 → **0x04100000** |
+  | 0x8E01：前 → 後 | 0xDEAFBEAD → 0xDEAFBEAD（CPU からは読めないレジスタ） |
+  | 0xE12（UCHE_UNKNOWN_0E12）：前 → 後 | 0 → **1** |
+  | 0xE19（UCHE_CLIENT_PF）：前 → 後 | 0x81 → 0x81 |
+  | SMMU sGFSR／sGFSYNR0..2：前／後 | すべて 0／すべて 0 |
+  | 画素の一致数／画素[0]・[15]・[16]・[255] | **0**／すべて 0xFFFFFFFF |
+  | 番兵 | 16 個とも 0xFFFFFFFF |
+  | 走査（7699 dword）：0x78563412／0x12345678／0x00000012 | **0／0／0** |
+  | IB1_BASE／REM_SIZE | 0x70016100／0（G-5 の IB を最後まで処理した） |
+  | FSR | 0x400 |
+- わかったこと：
+  - 候補 2（初期化の不足）：RB_DBG_ECO_CNTL と UCHE_UNKNOWN_0E12 を Mesa の値にしても変わらなかった。少なくともこの 3 つは原因ではない。
+  - 候補 3（別の場所に書いた）：ring の領域 32 KB のどこにも、塗った色の値は現れなかった。私たちの CB にも、SMMU の global にもフォルトはない。
+  - したがって、RB の書き込みは私たちの context bank を通っていない。**候補 1（secure mode のため、描画系の書き込みが secure の側に行くか捨てられる）が、いちばん有力になった** [I]。
+  - 残る小さな候補 [I]：ほかの magic レジスタ（PC_POWER_CNTL＝1、SP_CHICKEN_BITS、PC_MODE_CNTL など）。2D エンジンは SP_2D_DST_FORMAT を使うので、SP 側の設定が要る可能性はゼロではない。
+- 次に決めること（ユーザーの判断）：
+  1. zap shader を読み込んで `CP_SET_SECURE_MODE 0` を送る道（§9.20.5）。TZ の PAS（SCM）を呼ぶ手段が要る。qcscm を戻すか、自前の SCM 呼び出しを作るかを決める必要がある。
+  2. その前に、残りの magic レジスタを全部書く G-5c で、候補 2 を完全に消しておく道。安くて安全だが、効く見込みは低い [I]。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

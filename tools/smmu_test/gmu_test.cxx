@@ -41,6 +41,14 @@ NTSTATUS EpiSmmuDisable(EPI_SMMU* c) {
 NTSTATUS EpiSmmuDestroy(EPI_SMMU* c) {assert(!c->enabled); ExFreePoolWithTag(c,0); return 0;}
 static ULONG testFaultFsr=2;
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU*,ULONG* fsr,ULONGLONG* addr,ULONG* syn) {*fsr=testFaultFsr;*addr=0x4000;*syn=0;return 0;}
+static ULONG testGlobalCalls=0;
+static NTSTATUS testGlobalStatus=STATUS_SUCCESS;
+NTSTATUS EpiSmmuQueryGlobalFault(EPI_SMMU* c,ULONG* values) {
+    if(!c || !values) return STATUS_INVALID_PARAMETER;
+    ++testGlobalCalls; if(!NT_SUCCESS(testGlobalStatus)) return testGlobalStatus;
+    for(ULONG i=0;i<4;++i) values[i]=0x100*testGlobalCalls+i;
+    return STATUS_SUCCESS;
+}
 NTSTATUS EpiSmmuQueryLastError(EPI_SMMU*,ULONG*,ULONG*,ULONG*,ULONG*) {return STATUS_NOT_FOUND;}
 NTSTATUS EpiSmmuQueryCbar(EPI_SMMU* c,ULONG* value) {
     if(!c || !value) return STATUS_INVALID_PARAMETER;
@@ -71,6 +79,8 @@ static std::vector<UCHAR> SqeImage() {
     return sqe;
 }
 static void Reset() {
+    allowG5bWrites=false; g5bCompletes=true; g5bFill=true; g5bEvent=true; g5bFenceForever=false; g5bBadRptr=false;
+    g5bFenceDrops=0; g5bErrorBits=0; g5bBadSentinel=0xFFFFFFFF; g5bWrites.clear(); testGlobalCalls=0; testGlobalStatus=STATUS_SUCCESS;
     allowG5Writes=false; g5Completes=true; g5Flush=true; g5Event=true; g5Fill=true; g5FenceForever=false; g5BadRptr=false;
     g5FenceDrops=0; g5ErrorBits=0; g5Color=0x78563412; g5BadPixel=0xFFFFFFFF; g5BadSentinel=0xFFFFFFFF; g5Writes.clear();
     allowG4Writes=false; g4Completes=true; g4Scratch=true; g4Mem=true; g4Event=true; g4FenceForever=false;
@@ -113,14 +123,15 @@ static ULONG RunG1(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOO
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
                           sqe.data(),static_cast<ULONG>(sqe.size()));
 }
-static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false) {
+static ULONG RunG2(const std::vector<UCHAR>& f,const std::vector<UCHAR>& sqe,BOOLEAN* keep,BOOLEAN g3=false,BOOLEAN g3b=false,BOOLEAN g3c=false,BOOLEAN g4=false,BOOLEAN g5=false,BOOLEAN g5b=false) {
     WCHAR text[3072]={}; allowStageFWrite=true; allowG1Writes=true; allowG2Writes=true; allowG3Writes=g3; allowG3bWrites=g3b;
     allowG3cWrites=g3c;
     allowG4Writes=g4;
     allowG5Writes=g5;
+    allowG5bWrites=g5b;
     return EpiGmuBootTest(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),cc,f.data(),static_cast<ULONG>(f.size()),
                           text,3072,keep,true,true,true,true,true,true,true,true,true,true,true,true,true,
-                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5);
+                          sqe.data(),static_cast<ULONG>(sqe.size()),true,g3,g3b,g3c,g4,g5,g5b);
 }
 // Host reset simulation only. Production deliberately retains these allocations on teardown failure.
 static void ClearQuarantine() {
@@ -1020,6 +1031,75 @@ int main(int argc,char** argv) {
                 assert(GmuG5Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5)==STATUS_INVALID_DEVICE_STATE);
                 assert(g5.Cp.Reason==(bad>=6 ? 15UL : 12UL) && g5.Cp.WptrWrites==(bad==8 ? 1UL : 0UL));
             }
+            const auto seedG5b=[&]() {
+                seedG5(); allowG5bWrites=true; g5bWrites.clear(); g5bCompletes=true; g5bFill=true;
+                g5bEvent=true; g5bFenceForever=false; g5bBadRptr=false; g5bFenceDrops=0; g5bErrorBits=0;
+                g5bBadSentinel=0xFFFFFFFF; testGlobalCalls=0; testGlobalStatus=STATUS_SUCCESS;
+                std::memcpy(cpRing.data()+0x6100/4,GmuG5Ib,sizeof(GmuG5Ib));
+                std::memcpy(cpRing.data()+39,GmuG5Packet,sizeof(GmuG5Packet));
+                cpShadow[0]=48; *GmuCfgReg(0x806)=48; *GmuCfgReg(0x807)=48;
+                cpRing[0x7028/4]=0xCAFE0008; cpRing[0x702C/4]=0xCAFE0009;
+                for(ULONG i=0;i<272;++i) cpRing[0x7400/4+i]=0xFFFFFFFF;
+                *GmuCfgReg(0x8E04)=0x10; *GmuCfgReg(0x8E01)=0x20; *GmuCfgReg(0xE12)=0x30; *GmuCfgReg(0xE19)=0x81;
+            };
+            seedG5b(); GMU_G5B_TRACE g5b=GmuG5bTrace();
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
+            assert(g5b.Draw.Checks==0xF && g5b.Draw.Cp.Reason==0 && g5b.Draw.Cp.ShadowAfter==61);
+            assert(g5b.Draw.Cp.Rptr==61 && g5b.Draw.Cp.WptrAfter==61 && g5b.Data12After==0xCAFE000A);
+            assert(g5b.Draw.PixelMatches==256 && g5b.Draw.SentinelMatches==16 && g5b.Draw.Cp.WptrWrites==1);
+            assert(g5b.MagicBefore[0]==0x10 && g5b.MagicAfter[0]==0x04100000 && g5b.MagicAfter[1]==0);
+            assert(g5b.MagicAfter[2]==1 && g5b.MagicAfter[3]==0x81 && testMaps.size()==originalMaps);
+            assert(testGlobalCalls==2 && g5b.GlobalBefore[0]==0x100 && g5b.GlobalAfter[3]==0x203);
+            assert(g5b.ScanDwords==7699 && g5b.ScanCount[0]==0 && g5b.ScanCount[1]==0 && g5b.ScanCount[2]==0);
+            assert(cpRing[61]==0 && cpRing[0x6228/4]==0 && std::memcmp(g5b.Ib,GmuG5bIb,sizeof(g5b.Ib))==0);
+            // Scan boundaries: exclusions must not hide the first/last included DWORD next to each range.
+            const ULONG included[]={0xF4,0x5FFC,0x6240,0x6FFC,0x7040,0x73FC,0x7840,0x7FFC};
+            for(ULONG off:included) {
+                seedG5b(); g5b=GmuG5bTrace(); cpRing[off/4]=0x78563412;
+                assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
+                assert(g5b.ScanCount[0]==1 && g5b.ScanFirst[0]==off);
+            }
+            seedG5b(); g5b=GmuG5bTrace(); cpRing[0x200/4]=0x12345678; cpRing[0x204/4]=0x12;
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
+            assert(g5b.ScanCount[1]==1 && g5b.ScanFirst[1]==0x200 && g5b.ScanCount[2]==1 && g5b.ScanFirst[2]==0x204);
+            for(ULONG bad=0;bad<4;++bad) {
+                seedG5b(); g5b=GmuG5bTrace();
+                if(bad==0) g5bBadRptr=true;
+                if(bad==1) g5bEvent=false;
+                if(bad==2) g5bFill=false;
+                if(bad==3) g5bBadSentinel=15;
+                assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR);
+                assert(g5b.Draw.Checks==(0xFUL&~(1UL<<bad)) && g5b.Draw.Cp.Reason==13);
+            }
+            seedG5b(); g5b=GmuG5bTrace(); g5bFenceDrops=3;
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0 && g5b.Draw.Cp.WptrWrites==4);
+            seedG5b(); g5b=GmuG5bTrace(); g5bFenceForever=true;
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_TIMEOUT && g5b.Draw.Cp.Reason==10);
+            seedG5b(); g5b=GmuG5bTrace(); g5bCompletes=false; failGmuStep=0x1320;
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_TIMEOUT && g5b.Draw.Cp.Reason==9);
+            for(ULONG bit:errorBits) {
+                seedG5b(); g5b=GmuG5bTrace(); g5bErrorBits=bit;
+                assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR && g5b.Draw.Cp.Reason==14);
+            }
+            for(ULONG step=0x1300;step<=0x130B;++step) {
+                seedG5b(); g5b=GmuG5bTrace(); failGmuStep=step;
+                assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_IO_DEVICE_ERROR && g5b.Draw.Cp.Reason==6);
+            }
+            seedG5b(); g5b=GmuG5bTrace(); testGlobalStatus=STATUS_INVALID_DEVICE_STATE;
+            assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==0);
+            assert(g5b.GlobalStatus[0]==testGlobalStatus && g5b.GlobalBefore[0]==0xFFFFFFFF);
+            for(ULONG bad=0;bad<6;++bad) {
+                seedG5b(); g5b=GmuG5bTrace();
+                if(bad==0) cpRing[0x7400/4]=0;
+                if(bad==1) cpRing[0x7800/4]=0;
+                if(bad==2) cpRing[0x7028/4]=0;
+                if(bad==3) cpRing[39]=0;
+                if(bad==4) cpRing[0x6100/4]=0;
+                if(bad==5) cpShadow[0]=39;
+                assert(GmuG5bSubmit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&g5b)==STATUS_INVALID_DEVICE_STATE);
+                assert(g5b.Draw.Cp.Reason==12 && g5bWrites.empty());
+            }
+            allowG5bWrites=false;
             allowG5Writes=false;
             allowG4Writes=false;
             allowG3cWrites=false; g3cPolling=false; g3cPending=false; g3cMaskChangeStep=0xFFFFFFFF; *GmuCfgReg(0x38)=0;
@@ -1217,6 +1297,27 @@ int main(int argc,char** argv) {
         Reset(); smmuDisableFails=true;
         assert(RunG2(f,sqe,&keep,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         for(ULONG i=0;i<3;++i) assert(GmuFind(g_KeptGmu,GmuG1Iova[i],GmuG1Size[i])->Va!=nullptr);
+        ClearQuarantine(); Reset();
+    }
+    // G-5's data-only failure remains in its own trace, but does not veto a successful G-5b retry.
+    {
+        const auto sqe=SqeImage();
+        Reset(); g5Fill=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==0 && !keep && allocations.empty());
+        assert(g5bWrites.size()==1 && g2Writes.back().second==61 && testMaps.size()==11 && testGlobalCalls==2);
+        Reset(); g5Fill=false; g5bFill=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==EPI_GMU_E_CP && !keep && allocations.empty());
+        Reset(); g5Completes=false;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==EPI_GMU_E_CP && g5bWrites.empty() && !keep);
+        Reset(); // Already-filled pixels must be rejected rather than attributing old success to new magic registers.
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==EPI_GMU_E_CP && g5bWrites.empty() && !keep);
+        Reset(); g5Fill=false; g2KeepGxOn=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
+        GMU_REGION* retained=GmuFind(g_KeptGmu,GmuG1Iova[1],GmuG1Size[1]);
+        assert(retained && static_cast<ULONG*>(retained->Va)[0x7030/4]==0xCAFE000A);
+        ClearQuarantine();
+        Reset(); g5Fill=false; smmuDisableFails=true;
+        assert(RunG2(f,sqe,&keep,true,true,true,true,true,true)==EPI_GMU_E_TEARDOWN && keep && g_KeptGmu);
         ClearQuarantine(); Reset();
     }
     std::puts("GMU tests passed: firmware regions, synthetic/real image load, allocation failures, boot timeout, reset and SMMU teardown quarantine.");

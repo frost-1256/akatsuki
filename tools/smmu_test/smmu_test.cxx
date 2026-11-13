@@ -81,6 +81,16 @@ int main() {
     before=mmioWrites;
     assert(EpiSmmuQueryFault(c,&fsr,&far,&syn)==0);
     assert(fsr==2 && far==0x160004000ULL && syn==0x1234 && mmioWrites==before);
+    ULONG global[4]={0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+    const ULONG globalOffsets[]={0x48,0x50,0x54,0x58};
+    for(ULONG i=0;i<4;++i) mmio[globalOffsets[i]/4]=0xA0+i;
+    assert(EpiSmmuQueryGlobalFault(c,global)==0 && mmioWrites==before);
+    for(ULONG i=0;i<4;++i) assert(global[i]==0xA0+i && mmio[globalOffsets[i]/4]==0xA0+i);
+    assert(EpiSmmuQueryGlobalFault(nullptr,global)==STATUS_INVALID_PARAMETER);
+    assert(EpiSmmuQueryGlobalFault(c,nullptr)==STATUS_INVALID_PARAMETER);
+    cc[0x106C/4]=0;
+    assert(EpiSmmuQueryGlobalFault(c,global)==STATUS_INVALID_DEVICE_STATE && mmioWrites==before);
+    cc[0x106C/4]=0x80000000;
     assert(EpiSmmuDisable(c)==STATUS_INVALID_DEVICE_STATE && mmioWrites==before); gmu[0]=1;
     syncTimeout=true;
     assert(EpiSmmuDisable(c)==STATUS_IO_TIMEOUT && stalls>=1000);

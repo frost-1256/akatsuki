@@ -24,6 +24,7 @@
 #define EPI_GMU_PROBE_G3C       0x2000000UL // modifier: requires 0x1FFFE80 (0x3FFFE80 total), IRQ source probe with MASK=0
 #define EPI_GMU_PROBE_G4        0x4000000UL // modifier: requires 0x3FFFE80 (0x7FFFE80 total), one indirect buffer
 #define EPI_GMU_PROBE_G5        0x8000000UL // modifier: requires 0x7FFFE80 (0xFFFFE80 total), 16x16 RGBA8 solid CP_BLIT
+#define EPI_GMU_PROBE_G5B       0x10000000UL // modifier: requires G5 (0x1FFFFE80 total), magic registers then repeat CP_BLIT
 #define EPI_GMU_SQE_FILE_SIZE   40496UL
 #define EPI_GMU_SQE_CODE_SIZE   40492UL
 
@@ -231,6 +232,20 @@
 // 1203 prepare, 1204 publish, 1205 fence, 1206 idle, 1210..121C CCU/RPTR/WPTR/HW_FAULT/
 // CP_INT/PROTECT/STATUS_1/RBBM/INT0/IB1_BASE_LO/IB1_BASE_HI/IB1_REM_SIZE/MASK.
 
+// GpuGmuG5b: 764 bytes {Draw (564-byte GpuGmuG5 layout), Data12Before, Data12After,
+// Packet[13], Ib[10], MagicBefore[4], MagicAfter[4], GlobalStatus[2], GlobalBefore[4], GlobalAfter[4],
+// ScanCount[3], ScanFirst[3], ScanDwords}. Draw.Packet[9] is unused; Draw.Ib[36] is the reused G5 IB.
+// Magic order: 8E04/8E01/E12/E19 (E19 is read only). Global order: sGFSR/sGFSYNR0/1/2; never cleared.
+// Scan colors: 78563412/12345678/00000012. ScanFirst is a byte offset within ring, FFFFFFFF if absent.
+// Scan excludes [0,61*4), [6000,6240), [7000,7040), [7400,7840); ScanDwords=7699.
+// Global read failure is recorded in GlobalStatus and does not fail drawing. Other reason/status rules match G5.
+// Draw.Checks: bit0=RPTR/WPTR/shadow 61 and idle/no errors, bit1=data[12]==CAFE000A,
+// bit2=256 pixels 78563412, bit3=16 sentinel FFFFFFFF. Require F; pixels must all be FFFFFFFF on entry.
+// G5 Checks=17 with Reason13/IO_DEVICE_ERROR may precede G5b; retain that G5 trace and report G5b's result.
+// Breadcrumbs 1300 map, 1301 precondition, 1302..1305 magic originals, 1306 CCU, 1307 global originals,
+// 1308 prepare, 1309 publish, 130A fence, 130B idle, 1310..131C G5-style GX diagnostics,
+// 1320..1323 magic readback, 1324 global readback. CPU-only ring scan follows without further MMIO.
+
 // Runs inside the CX window: CX GDSC and all five G1b branches on, GX off. Cc maps GPU_CC (RW).
 // Fw/FwLen: the a660_gmu.bin image already read by the caller.
 // *KeepCx is set TRUE only on EPI_GMU_E_TEARDOWN: the caller must then NOT collapse CX or turn the branches off
@@ -254,6 +269,7 @@
 // G3c: requires G3b and its prerequisites; IRQ source observation under MASK=0 (probe 0x3FFFE80).
 // G4: requires successful G3c; one IB and a return-to-ring event under the same OOB (probe 0x7FFFE80).
 // G5: requires successful G4; CP_BLIT solid fill under the same OOB (probe 0xFFFFE80).
+// G5b: requires G5 completed without transport/access errors; magic registers and repeat fill (probe 0x1FFFFE80).
 // Unrequested/unreached message NtStatus is STATUS_NOT_FOUND; unrecorded queue indices are 0xFFFFFFFF.
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCHAR* Fw, ULONG FwLen,
@@ -262,4 +278,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN ClearHalt = FALSE, BOOLEAN Secvid = FALSE, BOOLEAN AddrMode = FALSE, BOOLEAN Hwcg = FALSE,
                      BOOLEAN GxCfg = FALSE, BOOLEAN StageE = FALSE, BOOLEAN StageF = FALSE,
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
-                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE);
+                     BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE);

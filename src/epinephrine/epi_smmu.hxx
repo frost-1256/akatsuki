@@ -73,3 +73,6 @@ NTSTATUS EpiSmmuQueryDisableWrites(EPI_SMMU* Context, EPI_SMMU_DISABLE_WRITE* Wr
 // Read-only, valid while enabled, including while CM3 runs. Does not clear faults.
 // Caller keeps CX/branches on and serializes against Disable/CX teardown.
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU* Context, ULONG* Fsr, ULONGLONG* Far, ULONG* Fsynr0);
+// Read-only GR0 snapshot: sGFSR, sGFSYNR0, sGFSYNR1, sGFSYNR2 (byte offsets 0x48/0x50/0x54/0x58).
+// No acknowledgement/clear writes. Values must have room for four ULONGs; unchanged on failure.
+NTSTATUS EpiSmmuQueryGlobalFault(EPI_SMMU* Context, ULONG* Values);

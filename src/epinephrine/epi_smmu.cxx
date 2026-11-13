@@ -435,6 +435,15 @@ NTSTATUS EpiSmmuEnable(EPI_SMMU* C, volatile ULONG* Cc, volatile ULONG* GmuA)
     const NTSTATUS cleanup = EpiSmmuDisable(C);
     return NT_SUCCESS(cleanup) ? st : cleanup;
 }
+NTSTATUS EpiSmmuQueryGlobalFault(EPI_SMMU* C, ULONG* Values)
+{
+    PAGED_CODE();
+    if (C==NULL || Values==NULL) { return STATUS_INVALID_PARAMETER; }
+    if (!C->Enabled || !WindowReady(C,FALSE)) { return STATUS_INVALID_DEVICE_STATE; }
+    const ULONG offsets[]={0x48,0x50,0x54,0x58};
+    for (ULONG i=0;i<RTL_NUMBER_OF(offsets);++i) { Values[i]=READ_REGISTER_ULONG(C->Regs+offsets[i]/4); }
+    return STATUS_SUCCESS;
+}
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU* C, ULONG* Fsr, ULONGLONG* Far, ULONG* Fsynr0)
 {
     PAGED_CODE();
