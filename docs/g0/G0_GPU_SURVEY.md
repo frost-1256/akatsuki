@@ -6332,6 +6332,222 @@ DriverVer 20.0.2.84（oem142）で、再起動の直後（v34-akat）に Probe 0
 
 **この後：** P-2（present の dirty rect を heap の staging から GPU で画面に blit する）の仕様を書く。
 
+#### 9.21.68 P-2 の提案：present の dirty rect を、heap の staging から GPU で画面に写す（文章仕様）
+
+P-1 の session の中で、DXGK の `PresentDisplayOnly` の仕事を GPU に渡す。
+
+- CPU は、dirty rect の画素を DOD の source から heap の staging に写す。
+- GPU は、その staging を texture にして 1:1 の四角形を描き、画面（framebuffer）に書く。
+- SMMU の実行時の map は使わない（ユーザーの選択）。画面全体は、plan の段階で 1 つの External region として map する。
+
+速さの利点はない。CPU が staging に写すので、CPU が画面に直接写すいまの経路より遅くなる見込みである。P-2 で確かめたいのは、次の点である。
+
+- present と GPU の完了の順序。
+- source の寿命（present から戻る前に、source を読み終えること）。
+- 画面全体への GPU の書き込みが正しいこと。
+- うまくいかないときに CPU の経路へ戻せること。
+
+**前提の事実：**
+- **画面：** PA 0xE1000000、1080 × 2400、pitch 4320 B、1 画素はメモリ順に B, G, R, X（§9.21.37）。DOD の source も 32 bpp で、同じ並びである。
+- **pitch の制約：** RB_MRT の PITCH と BASE は 64 B 単位なので、4320 B の画面には D-1 以来の 2 パス方式で書く。
+  - パス A（偶数行）：base = 画面の先頭、pitch 8640。view の行 v は画面の行 2v。
+  - パス B（奇数行）：base = 画面の先頭 + 4320 − 32、pitch 8640、x は +8。view の行 v は画面の行 2v + 1。
+  - D-1 の band と違い、base を画面の先頭に固定し、行は scissor で選ぶ。
+  - パス B の最後の画素（v = 1199、x = 1087）の最後のバイトは、画面の先頭から 0x9E33FF で、画面（0x9E3400 B）の中に収まる。
+- **コピーの手段：** T-1 / Q-1 の texture 描画（FS4 の TEX_PREFETCH、NEAREST、UNNORM、FMT6_8_8_8_8_UNORM）をそのまま使う。
+  - texture と描画先は同じ形式・同じ並びなので、texel の 32 bit がそのまま画素になる（8 bit の UNORM は往復で変わらない。blend はしない）。
+  - 2D engine（G-5 の CP_BLIT）は、zap の前に画素が書かれなかった（§9.21.19 / 22）。zap の後には試していないので、使わない。
+- **1:1 の対応：** staging は、CPU が写すときに偶数行と奇数行の 2 つの texture（A / B）に分ける。各パスの四角形は、texture の texel と画面の画素を 1:1 に対応させる。
+  - 頂点の s / t は 0 .. 幅 / 0 .. 行数。
+  - 画素の中心（+0.5）は、必ず対応する texel の中に落ちる。生成器で、ランダムな矩形 2000 個と画面全体について確かめた。
+- **texture の記述子（TEX_CONST、64 B）：** Q-1 の TEX_CONST2 と同じで、次の欄だけを変える。
+  - word1 = WIDTH（bit0..14）| HEIGHT << 15。
+  - word2 = PITCH（バイト）<< 7 | TYPE 2D（1 << 29）。T-1 の `0x20002000` が PITCH 64 であることから確かめた。
+  - word4 = BASE（64 B 単位に揃える）。
+- P-1 の後の状態：heap には static の 7 つと SESS（0x400）がある。heartbeat の IB は 0x440 を使い回す。
+
+**plan（ユーザーの担当）：**
+- **FB region：** IOVA **0x72000000**、大きさ **0x9E4000**、PA 0xE1000000、READ | WRITE、**External**。
+  - Probe2 の bit11 が立っているときだけ、D-1 と同じ位置で足す。
+  - D-1 の band（0x71000000、PA 0xE1462000）とは IOVA が重ならない。同じ PA を 2 つの IOVA から見ることになる。
+- 4 KB の page で 2532 枚になる。SMMU の page table（L3 の表が 5 枚以上）を確保できることを確かめる。足りなければ plan で失敗にする（EPI_GMU_E_GPU_MEMORY）。
+
+**chunk（GPU に渡す 1 回分の仕事）：**
+- dirty rect（画面の範囲に切り詰めたもの）を、行の方向に chunk に分ける。
+- 1 つの chunk は、heap から 1 回の `Alloc(大きさ, 256)` で確保する。大きさは最大 **96 KB**。
+
+| chunk 内の offset | 大きさ | 中身 |
+|---|---|---|
+| 0x000 | 64 B | TEX_CONST A（偶数行の texture） |
+| 0x040 | 64 B | TEX_CONST B（奇数行の texture） |
+| 0x080 | 384 B | VB：パス A の 6 頂点、続いてパス B の 6 頂点（T-1 と同じ `x, v, 0, 1.0, s, t, 0, 1.0`） |
+| 0x200 | 456 B（114 dw） | IB |
+| 0x400 | 行数 A × P | staging A（chunk の偶数行を上から順に） |
+| 0x400 + 行数 A × P | 行数 B × P | staging B（chunk の奇数行） |
+
+- P は `幅 × 4` を 64 B 単位に切り上げたもの（全幅なら 4352）。
+- 1 つの chunk の行数 R は `(96 KB − 0x400) / P` を偶数に切り下げたもの。全幅なら 22 行（偶数 11 行 + 奇数 11 行）で、画面全体は 110 chunk になる。
+- chunk の始めの行は奇数でもよい。そのときは B の行が A より 1 行多くなることがある。
+- 片方のパスが 0 行のときは、そのパスの 6 頂点をすべて同じ点（x = v = 0）にして、画素を出さない（IB の形は変えない）。scissor は、パス A なら (0, 0)、パス B なら (8, 0) の 1 画素にする。
+
+**chunk の IB（114 dw）：** IB11 の 4 つの部分をつなげる。生成器 `tools/p2ib.py` が全語を出す（例は `p2_ib_example.txt`）。
+
+| dw | 長さ | もとにする部分 | 書き換える語 |
+|---|---|---|---|
+| 0..48 | 49 | IB11 の群 S | dw 12 / 20 = FS、23 / 26 = BORDER、30 / 33 = SAMP（H-1 の static）。dw 37 / 40 = TEX_CONST A（chunk + 0x000） |
+| 49..77 | 29 | IB11 の群 A | scissor（window、2D resolve、screen の 3 組）= パス A の範囲。VFD の BASE = chunk + 0x080、SIZE = 0xC0。MRT の BASE = **0x72000000**。draw の頂点数 = 6。TS の宛先 = SESS + 4 |
+| 78..84 | 7 | IB11 の dw 35..41（texture の読み込み） | アドレス 2 語 = TEX_CONST B（chunk + 0x040） |
+| 85..113 | 29 | IB11 の群 B | scissor = パス B の範囲（x は +8）。VFD の BASE = chunk + 0x080 + 192、SIZE = 0xC0。MRT の BASE = **0x720010C0**。頂点数 = 6。TS の宛先 = SESS + 8 |
+
+- パス A の scissor は、TL = (x0, vA0)、BR = (x1 − 1, vA0 + 行数 A − 1)。vA0 は chunk の最初の偶数行 / 2。
+- パス B の scissor は、TL = (x0 + 8, vB0)、BR = (x1 + 7, vB0 + 行数 B − 1)。vB0 は (最初の奇数行 − 1) / 2。
+- TS の値は IB11 のまま（0xCAFE001B / 0xCAFE001C）。SESS[1] / [2] に書かれる。
+- 群 S の先頭の CACHE_INVALIDATE で、再利用した staging の古い内容を捨てる。パス A の後の CP_WAIT_FOR_IDLE は IB11 のままで、texture B の読み込みはその後になる。
+- IB の中に、ring の region のアドレスは残らない（生成器で確かめた）。
+
+**ring と fence：**
+- heartbeat と chunk は、1 つの通し番号 seq を使う。どちらも P-1 と同じ形の 9 dw の ring packet で、fence は SESS[0] に `0xA6000000 | (seq & 0xFFFFFF)`。
+- chunk の packet の IB の大きさは 114 = **0x72**。
+- 同時に処理中にするのは、最大 2 chunk（B-1 と同じ規則）。chunk k を投入したら、chunk k − 1 の完了を待ってから、k + 1 を確保する。
+
+**present の流れ：**
+1. `PresentDisplayOnly`（present の thread、PASSIVE_LEVEL）が、次の条件をすべて満たすときだけ GPU の経路を使う。満たさなければ、いままでどおり CPU で写す（`CpuReason` に理由を数える）。
+   - session が動いていて（State 1）、P-2 が有効で、GPU の present が止められていない。
+   - `Flags.Rotate` が立っていない。BytesPerPixel が 4。NumMoves が 0（move があるときは、present 全体を CPU で行う）。
+   - 写し先が PA 0xE1000000 の画面そのもの（1080 × 2400、pitch 4320、拡大や中央寄せなし）。
+   - dirty rect が 1 つ以上。
+2. present の thread は、要求（source の VA と pitch、dirty rect の表）を session に置き、`RequestEvent` を立てる。
+3. worker は、heartbeat の待ちを `KeWaitForMultipleObjects(StopEvent, RequestEvent, 100 ms)` に変え、要求があればすぐに処理する。要求がなければ、いままでどおり 100 ms ごとに heartbeat を行う。
+4. worker は、dirty rect ごと・chunk ごとに次を行う：確保、CPU による source から staging への写し、TEX_CONST・VB・IB の書き込みと読み返し、ring packet、WPTR、Retire。
+5. 最後の chunk の staging を書き終えたら、worker は `SourceReleased` を立てる。**これより後、worker は source を読まない。**
+6. present の thread は `SourceReleased` を待つ（上限なし）。worker の待ちはすべて 100 ms で打ち切られるので、この待ちも必ず終わる。そのあと、`GpuDone`（最後の chunk の fence）を最大 200 ms 待つ。
+7. 完了したら `STATUS_SUCCESS` を返す。
+8. **確かめ（`EpiGpuPresentVerify`、Device Parameters の DWORD、既定 1）：** 1 のとき、present の thread は GPU の present のたびに、画面の dirty rect を CPU で読み、source と 32 bit で比べる。違う画素があれば `VerifyBad` に数え、その rect を CPU で写し直す。以後の present は CPU の経路にする（`GpuPresentDisabled` = 1。session と heartbeat は続ける）。
+9. **失敗のとき：** chunk の確保の失敗、timeout、エラー割り込みのどれかが起きたら、次のようにする。
+   - worker はその present を打ち切り、`SourceReleased` と `GpuDone`（失敗）を立てる。
+   - present の thread は、present 全体を CPU で写し直す。
+   - session は cause 4 で止める（後始末をする）。
+   - 後始末が GPU を止めるので、遅れて届く GPU の書き込みが、後の CPU の書き込みを上書きし続けることはない。
+
+**自己試験（引き継ぎの直後、heartbeat の前に 1 回）：** desktop の present が少なくても、GPU の経路を確かめられるようにする。
+1. 対象は、D-1 の箱と同じ矩形（列 412..667、行 1072..1327、256 × 256）。
+2. CPU は、その矩形の今の画面の値を pool に退避する（D-1 と同じ band の map を使う）。
+3. 型の source（CPU が作る。値は `0xFF000000 | (y & 0xFF) << 16 | (x & 0xFF) << 8 | ((x + y) & 1 ? 0xC0 : 0x40)`、x / y は画面の座標）を、上の present の流れで GPU に写させる。P = 1024 なので、R = 94 行で 3 chunk（94、94、68 行）になる。最初の chunk は偶数行から始まる。
+4. 画面の矩形が型と完全に一致することを確かめる（`SelfBad[0]`）。
+5. 退避した値を source にして、もう一度 GPU に写させる。退避値と完全に一致することを確かめる（`SelfBad[1]`）。
+6. 画面には、数 ms だけ型が見える。
+- 自己試験が失敗したら、P-2 の GPU の present は使わない（`GpuPresentDisabled` = 1）。退避値は CPU で書き戻し、session は P-1 と同じく heartbeat を続ける。
+
+**probe：** `EpiGpuProbe2` の bit11 を P-2 とする。
+- P-2 は bit0..10 を必要とする。実行値は Probe 0xBFFFFE80 + Probe2 **4095**。
+- 許す組み合わせは Probe2 ∈ {0, 1, 3, …, 2047, 4095} だけで、それ以外は status 6。
+- FB region は bit11 のときだけ plan に足す。
+
+**判定（Checks、後始末の後に最後の `GpuPresent` に書く）：**
+- bit0：前提。P-1 の引き継ぎ、FB region（IOVA、大きさ、PA、External、Mapped）、自己試験の退避。
+- bit1：自己試験が両方とも完全に一致した（`SelfBad[0]` = `SelfBad[1]` = 0）。
+- bit2：desktop の GPU の present が 1 回以上あり、すべてが完了した。`GpuPresents` ≥ 1、`GpuFail` 0、`VerifyBad` 0、`GpuPresentDisabled` 0。
+- bit3：allocator が期待どおり。FailCount 0、停止の時点で LiveBytes 1088、退避の表が空、`MaxChunksInFlight` ≤ 2。
+- bit4：止め方と後始末（P-1 の bit4 と同じ条件）。
+- bit5：fault がない（P-1 の bit5 と同じ）。
+- 期待値は **0x3F**。P-1 の `GpuSession` も、これまでどおり書く（Checks 0x3F を期待）。
+
+**診断 `GpuPresent`（REG_BINARY、ABI は実装側で固定）：** 1 秒ごとと最後に書く。
+- `Checks`、`State`、`FbIova`、`FbSize`、`FbPaLow`、`FbMapped`、`SelfBad[2]`、`SelfFirst[2]`、`SelfValue[2]`、`SelfExpected[2]`、`SelfChunks`。
+- present：`Presents`（PresentDisplayOnly の総数）、`GpuPresents`、`CpuPresents`、`CpuReason[6]`（session なし、無効化、Rotate、BPP、move、写し先の不一致）、`GpuRects`、`GpuChunks`、`GpuPixels`（下位・上位）、`GpuFail`、`GpuFailReason`、`VerifyBad`、`VerifyFirstX / Y`、`VerifyValue`、`VerifyExpected`、`GpuPresentDisabled`。
+- 時間：`GpuPresentMaxUs`、`GpuPresentTotalUs`、`CpuPresentMaxUs`、`CpuPresentTotalUs`、`SourceHoldMaxUs`（要求から `SourceReleased` まで）。
+- chunk：`MaxChunksInFlight`、`MaxChunkBytes`、`Seq`（最後の通し番号）。
+- breadcrumb は 0x2300 番台（自己試験 0x2300..0x2307、present の処理中 0x2310、present の失敗 0x2320）。worker の breadcrumb は `GpuSessionStep` に書く。
+
+**実機での確かめ方：**
+1. 再起動の直後に Probe2 4095 で restart-device を 1 回行う。引き継ぎの後、`GpuPresent` の SelfBad が 0 であること。
+2. 約 2 分、画面を使う（時計の更新、アプリの起動、文字の入力など。スクロールは move になるので CPU の経路になる）。`GpuPresent` を 2 回読み、GpuPresents が増え、VerifyBad が 0 であること。目で見て、画面の崩れがないこと。
+3. もう一度 restart-device を行い、止め方と後始末（P-1 と同じ）を確かめる。
+
+**危険と対策：**
+- **画面全体への GPU の書き込み：** scissor で dirty rect の中に限る。パス B の base は画面の 32 B 手前ではなく、画面の中にある（画面の先頭 + 4288）。x は 8 以上にしかならないので、前の行の最後の 8 画素には書かない。
+- **source の寿命：** present の thread は、worker が source を読み終えるまで必ず待つ。worker の待ちはすべて上限つきである。
+- **遅さ：** 全画面の present は 110 chunk になり、CPU の経路より何倍も遅いかもしれない。時間を記録し、P-3 以降で staging を省く方法（source の page を実行時に map する）を考える材料にする。
+- **VSync：** present は同期的に完了するので、DXGK から見た VSync の扱いは変えない。
+- **heap：** 1 chunk 96 KB × 2 と static で 200 KB 程度。heap の 256 KB に収まる。heartbeat の IB（64 B）と同じ heap を使うので、断片化しても確保できるよう、chunk の確保に失敗したら、完了を待って Reclaim してから 1 回だけやり直す。それでも失敗なら present の失敗とする。
+
+**分担：**
+- FB region の plan、worker の chunk の投入、自己試験、判定：ユーザー。
+- present の側（`PresentDisplayOnly` の振り分け、要求と待ち、確かめ、CPU の経路への戻し、`CpuReason` などの数）：DXGK の側で、SMMU / GMU / GX / CP には触らない。ユーザーの判断で、私が書いてもよい。
+- 生成器：`tools/p2ib.py`。chunk の IB の全語、scissor と FB のアドレスの計算、1:1 の対応の確かめ（ランダムな矩形 2000 個と画面全体）を出す。
+
+**この後：** P-2 が通れば、段階 3 の present の接続ができたことになる。次は、staging を省く（source の page を実行時に SMMU へ map する）か、GPU の present を既定にするかを決める。
+
+#### 9.21.69 P-2 の GPU 側の実装（plan、chunk、自己試験、判定）
+
+`EPI_GMU_PROBE2_P2 = 0x800`（Probe2 = 4095）。`epi_gmu.cxx` の `GmuP2*` と `GMU_P2_TRACE`（診断 `GpuPresent`）。present の側（`epi_present.*`、`blthw.cxx`、`bdd.cxx`）は別に書かれているので、触っていない。
+
+- **plan：** `GmuP2Plan` が FB region（IOVA 0x72000000、0x9E4000 B、PA 0xE1000000、READ|WRITE、External）を、Probe2 の bit11 のときだけ足す。SMMU の page table（L3 の表）は map の時に確保され、足りなければ `EPI_GMU_E_SMMU_MAP` になる（plan の時点では数えられない）。
+- **chunk：** `GmuP2Layout` / `GmuP2IbWord` / `GmuP2Vertex` / `GmuP2TexWord`。IB の 114 語と VB の 96 語は、`p2ib.py` の 7 通り（全幅、箱の 2 chunk、奇数行だけ、1 画素、幅 800 など）と FNV-1a が一致した。確保は `Alloc(大きさ, 256)`、上限 96 KB、失敗したら完了を待って Reclaim し、1 回だけやり直す。fence と slot の通し番号は heartbeat と共有（`W->Submitted`）。
+- **worker の loop：** 待ちは、mailbox が開いているときだけ `EpiGpuSessionWaitRequest`（StopEvent と要求）。要求があれば `GmuP2Present`（chunk を 1 つ投入したら、1 つ前の完了を待つ。最大 2 chunk）、なければ 100 ms ごとの heartbeat。最後の staging を書いた後に `SourceReleased`、最後の fence の後に Complete。失敗は Complete（失敗）、cause 4 で停止。診断は 1 秒ごと（時間で判断）。heartbeat の上限（6000 回）に加え、11 分の上限も入れた。
+- **自己試験：** 引き継ぎの直後、D-1 の箱（256×256）で、型と退避値を GPU で写し、両方が完全に一致するか確かめる（3 chunk）。GPU のエラーは session を止める。画素の不一致だけなら、P-2 を無効にして session は続ける。退避値は CPU で書き戻す。mailbox は自己試験が通ったときだけ開く。FB region がないときも P-2 だけ無効にする。
+- **判定：** bit0 前提（FB region と退避）、bit1 自己試験、bit2 desktop の GPU present（present 側の統計）、bit3 allocator と同時 2 chunk 以下、bit4/5 は P-1 と同じ条件。
+- **present 側との境界：** `epi_gmu.hxx` の `EpiP2*`（primitive 型だけ）。`epi_gpu.cxx` が `epi_present.hxx` の API に橋渡しする。`EpiGpuSessionRequestStop(cause)`（present thread が呼ぶ。待たない）も `epi_gpu.cxx` にある。
+- **机上試験：** shim の GPU が、IB に書かれた scissor・texture・MRT の base を読んで画面を描く。全画面 110 chunk と、奇数行・1 画素・最終行を含む複数 rect で、画面が source と完全に一致し、rect の外は 1 画素も変わらないことを確かめた。自己試験の不一致（1 回目・2 回目）、FB region なし、chunk 中の fence 欠落・エラー割り込み・fence の異常、自己試験の GPU エラーも確かめた。
+
+
+#### 9.21.70 目標の決定：B（Windows の画面を GPU で描く）と、その道のり（2026-11-14）
+
+**決定（ユーザー）：**
+- 目標は B とする。DWM と D3D のアプリが Adreno で描く。いまの DOD のまま GPU が画面に写すだけ（A）では止まらない。
+- UMD は、D3D11 の UMD DDI を新しく書き、中身は Turnip（Vulkan、MIT）に流す。shader は DXBC → SPIR-V → NIR → ir3 とする。DXBC から SPIR-V への変換は、DXVK の変換器（zlib）の流用を候補にする。
+- P-2 は仕上げる（GPU が SMMU を通して画面全体に正しく書けることの実機確認として）。P-3（staging を省く）は行わない。P-2 の IB と順序の仕組みは W-4 の blt と W-2 の paging copy で再利用する。DOD の中の受け渡し（epi_present.cxx の mailbox）は W-1 で作り替える。
+
+**事実（Microsoft Learn など）：**
+- DWM は既定の adapter でしか動かない。render-only の adapter は client で主 GPU になれない。したがって、表示と描画を 1 つで持つ完全な WDDM driver が要る。DOD の横に render-only の driver を足しても、DWM の合成は GPU に移らない。
+- DWM は D3D11 を使う。したがって D3D の UMD が要る（CONCEPT.md の非ゴールを 2026-11-14 に見直した）。
+- Mesa の d3d10umd（Gallium の D3D10 UMD）は D3D10 だけで TGSI に依存し、Mesa 26.3 で削除される。使わない。
+
+**段階（案。順番と分け方は各段階の仕様で決める）：**
+
+| 段階 | 内容 | 主な担当 |
+|---|---|---|
+| W-1 | DOD を完全な WDDM driver（DxgkInitialize と描画の DDI 表）に作り替える。表示の経路（VidPN、画面）はいまのものを残す。最初に「UMD がない、または最小の UMD で起動して画面が出るか」を確かめる。GPU の起動は StartDevice の後の session（P-1）を使う | DXGK 側：私 |
+| W-2 | VidMm のメモリモデル：GpuMmu として SMMU の page table の形を VidMm に記述する。segment、allocation、BuildPagingBuffer（CP による fill と copy）、root page table の切り替え | SMMU / CP：ユーザー、DXGK 側：私 |
+| W-3 | 投入と完了：SubmitCommand、IRQ 332 による fence の割り込みと DPC、preemption の宣言、TDR からの戻り（GPU の reset と再起動） | CP / GMU：ユーザー、DXGK 側：私 |
+| W-4 | present：blt（P-2 の IB）と flip（MDP の scanout 先の切り替え。MDP は apps 側の SMMU を通る） | 分担は仕様で決める |
+| W-5 | UMD の最小形：D3D11 DDI の device、resource、clear、copy、present。DWM が起動すること | 私 |
+| W-6 | shader：DXBC → SPIR-V → NIR → ir3、Turnip の pipeline | 私 |
+| W-7 | 電源と周波数：GMU の perf level、idle 時の電源 OFF、D3 との行き来 | ユーザー |
+
+**危険：**
+- W-1 で UMD がないと、DWM が起動せず画面が黒くなるかもしれない。最初の実機試験はこの確認だけにし、戻せる形（DriverVer と INF の切り替え）で行う。
+- 完全な WDDM driver の失敗は、DOD よりも画面を巻き込みやすい。W-1 から W-3 では、GPU の経路を Device Parameters で切れるようにしておく。
+
+#### 9.21.71 P-2 の実機結果（v85、成功、2026-11-14）
+
+v34-akat で再起動した後、v85（20.0.2.85）を配置し、Probe 0xBFFFFE80 + Probe2 4095 で restart-device を 1 回行った。約 3 分 30 秒、desktop を GPU の present で動かし、もう一度 restart-device で止めた。`EpiFastPresent` = 1、`EpiGpuPresentVerify` = 1（既定）。
+
+**判定：** `GpuPresent` の Checks = **0x3F**、P-1 の `GpuSession` の Checks も **0x3F**。
+
+| 項目 | 値 |
+|---|---|
+| 引き継ぎ | restart から約 50 秒。引き継ぎ時の `GpuSessionStep` は 0x2310（すでに present の処理中） |
+| FB region | IOVA 0x72000000、0x9E4000 B、PA 0xE1000000、Mapped 1 |
+| 自己試験 | 3 chunk、`SelfBad` = 0 / 0（型も退避値も完全に一致）、SelfStatus 0 |
+| present | 1253 回すべて GPU（CPU の経路 0 回、理由別もすべて 0。move のある present は 1 回も来なかった） |
+| rect / chunk / 画素 | 4004 rect、13339 chunk、237,006,046 画素（全画面の約 91 枚分） |
+| 失敗 | GpuFail 0、FailRequests 0、VerifyBad 0、Disabled 0、Abandoned 0、AllocRetries 0 |
+| 同時の chunk | MaxChunksInFlight 2、MaxChunkBytes 98304（96 KB） |
+| 時間 | 1 present の平均 38.4 ms、最大 731 ms、source を握る最大 294 ms（確かめの読み返しを含む） |
+| 通し番号 | Seq 14888（heartbeat 1599 + chunk 13345 などを共有） |
+| 止め方 | StopCause 1（StopDevice）、StopLatency 432 ms、Teardown 0、KeepCx 0、StopTimeout なし |
+| allocator | LiveBytes 1088、FailCount 0 |
+| heartbeat | 1599 回すべて完了、すべて StartDevice の後 |
+
+**読み取れること：**
+- GPU は SMMU を通して画面全体に正しく書ける。1253 回の present を、毎回 CPU で画面を読み返して 32 bit で比べ、1 画素も違わなかった。
+- present と GPU の完了の順序、source の寿命（source を読み終えてから present を返す）、heartbeat との番号の共有、同時 2 chunk は、実機で問題がなかった。
+- 遅い。1 present の平均 38 ms は、CPU で画面に直接写すより遅いと考えられる（この run では CPU の経路が 0 回で、同じ条件の比較はない）。CPU による staging への写し、chunk ごとの完了待ち、書き込み結合の画面の読み返し（確かめ）が主な原因と考えられる。目標 B（§9.21.70）では P-3 を行わないので、ここは最適化しない。
+- DWM は、この構成では move を 1 度も送らなかった。
+
+**次：** P-2 で段階 3 の present の接続は終わり。目標 B の W-1（完全な WDDM driver への作り替え）の仕様に進む。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

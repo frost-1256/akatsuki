@@ -7036,9 +7036,10 @@ static NTSTATUS GmuP1Ahb(GMU_TEST* S,volatile ULONG* Cc,const GMU_GX_TRACE* T,GM
 }
 static NTSTATUS GmuP1Beat(GMU_TEST* S,volatile ULONG* Cc,const GMU_GX_TRACE* T,GMU_P1_TRACE* G,GMU_H1_WORK* W,
                           volatile ULONG* Cp,volatile ULONG* Gpu,volatile ULONG* Shadow,
-                          volatile ULONG* Hw,volatile ULONG* Words,ULONG N)
+                          volatile ULONG* Hw,volatile ULONG* Words)
 {
     GMU_G2_TRACE* C=&G->Cp; volatile ULONG* sess=Hw+0x400/4;
+    const ULONG N=W->Submitted; // fence/slot sequence number, shared with the P-2 chunks
     NTSTATUS st=GmuP1Live(S,Cc,T,G,Cp,Gpu,Shadow); if (!NT_SUCCESS(st)) { return st; }
     st=GmuP1Observe(G,W,sess); if (!NT_SUCCESS(st)) { return st; }
     const ULONG off=EpiGpuHeapAlloc(&W->Heap,64,64);
@@ -7055,7 +7056,7 @@ static NTSTATUS GmuP1Beat(GMU_TEST* S,volatile ULONG* Cc,const GMU_GX_TRACE* T,G
     for (ULONG i=0;i<9;++i) { if (Words[(pos+i)%4096]!=packet[i]) { C->Reason=13; return STATUS_IO_DEVICE_ERROR; } }
     const ULONG target=(pos+9)%4096;
     const ULONGLONG begin=KeQueryInterruptTime();
-    W->Submitted=N+1; G->BeatsSubmitted=N+1; C->Attempted=1;
+    W->Submitted=N+1; ++G->BeatsSubmitted; C->Attempted=1;
     WRITE_REGISTER_ULONG(Cp+7,target); KeMemoryBarrier(); ++C->WptrWrites;
     // The accepted IB may already be running: it is only retired here and freed by Reclaim once its fence is seen.
     if (!EpiGpuHeapRetire(&W->Heap,off,64,N)) { C->Reason=19; return STATUS_IO_DEVICE_ERROR; }
@@ -7071,7 +7072,7 @@ static NTSTATUS GmuP1Beat(GMU_TEST* S,volatile ULONG* Cc,const GMU_GX_TRACE* T,G
     }
     KeMemoryBarrier();
     if (ib[8]!=(0xA7000000UL|(N&0xFFFFFF)))
-    { ++G->SlotBad; if (G->SlotFirstBeat==0xFFFFFFFF) { G->SlotFirstBeat=N; } C->Reason=13; return STATUS_IO_DEVICE_ERROR; }
+    { ++G->SlotBad; if (G->SlotFirstBeat==0xFFFFFFFF) { G->SlotFirstBeat=G->BeatsSubmitted-1; } C->Reason=13; return STATUS_IO_DEVICE_ERROR; }
     const ULONG us=static_cast<ULONG>((KeQueryInterruptTime()-begin+9)/10);
     if (us>G->BeatMaxUs) { G->BeatMaxUs=us; } G->BeatTotalUs+=us;
     ++G->BeatsDone;
@@ -7094,8 +7095,311 @@ static VOID GmuP1Diag(HANDLE Diag,GMU_P1_TRACE* G)
     { G->StartReturnMs=static_cast<ULONG>((returned-g_GmuP1Handover)/10000); }
     EpiSetValue(Diag,L"GpuSession",REG_BINARY,G,sizeof(*G));
 }
+// ---- P-2: dirty rects of a DXGK present are copied by the CPU into heap staging; the GPU draws them 1:1 onto the screen ----
+// FB region: IOVA 0x72000000, 0x9E4000 B, PA 0xE1000000, External. Pass A = even screen rows (base = FB start, pitch 8640),
+// pass B = odd rows (base = FB + 4288, x + 8). Chunk (one heap Alloc, max 96 KB, align 256):
+//   0x000 TEX_CONST A, 0x040 TEX_CONST B, 0x080 VB (A then B), 0x200 IB (114 dw), 0x400 staging A, then staging B.
+// The fence/slot sequence number is shared with the heartbeat: fence 0xA6000000|seq in SESS[0] (heap 0x400).
+#define GMU_P2_FB_IOVA  0x72000000UL
+#define GMU_P2_FB_SIZE  0x9E4000UL
+#define GMU_P2_CHUNK_MAX 0x18000UL
+struct GMU_P2_TRACE {
+    ULONG Checks,State,FbIova,FbSize,FbPaLow,FbMapped,Prepared;
+    ULONG SelfBad[2],SelfFirst[2],SelfValue[2],SelfExpected[2],SelfChunks;
+    ULONG Requests,Chunks,MaxChunksInFlight,MaxChunkBytes,Seq,FailRequests,FailReason,FailStatus,AllocRetries,SelfStatus;
+    ULONG GpuPresents,GpuFail,VerifyBad,GpuPresentDisabled;
+    ULONG PresentStats[64]; // EPI_P2_STATS::Raw: the present side's EPI_PRESENT_STATS, in its field order
+    ULONG PresentStatsCount;
+};
+static_assert(sizeof(GMU_P2_TRACE)==4*(7+2+2+2+2+1+10+4+64+1),"P-2 diagnostic ABI");
+struct GMU_P2_CHUNK { ULONG Off,Size,Seq,X0,W,P,Na,Nb,Va0,Vb0,Y0; };
+static VOID GmuP2TraceInit(GMU_P2_TRACE* t)
+{
+    RtlFillMemory(t,sizeof(*t),0xFF);
+    t->Checks=0; t->State=0; t->Prepared=0; t->Requests=t->Chunks=t->MaxChunksInFlight=t->MaxChunkBytes=0;
+    t->FailRequests=0; t->FailReason=0; t->AllocRetries=0; t->Seq=0; t->SelfChunks=0;
+    t->GpuPresents=t->GpuFail=t->VerifyBad=t->GpuPresentDisabled=0; t->PresentStatsCount=0; t->SelfStatus=0xFFFFFFFF;
+    RtlZeroMemory(t->PresentStats,sizeof(t->PresentStats));
+}
+static BOOLEAN GmuP2Plan(GMU_TEST* S)
+{
+    if (S->Count==EPI_GMU_MAX_REGIONS) { return FALSE; }
+    for (ULONG i=0;i<S->Count;++i)
+    {
+        const GMU_REGION* r=&S->Regions[i];
+        if (static_cast<ULONGLONG>(GMU_P2_FB_IOVA)<static_cast<ULONGLONG>(r->Iova)+r->Size && r->Iova<static_cast<ULONGLONG>(GMU_P2_FB_IOVA)+GMU_P2_FB_SIZE) { return FALSE; }
+    }
+    GMU_REGION* r=&S->Regions[S->Count++];
+    r->Iova=GMU_P2_FB_IOVA; r->Size=GMU_P2_FB_SIZE; r->Flags=EPI_SMMU_READ|EPI_SMMU_WRITE;
+    r->Va=NULL; r->Pa.QuadPart=0xE1000000; r->Mapped=FALSE; r->External=TRUE;
+    return TRUE;
+}
+// Small non-negative integers as IEEE-754 single bits (no floating point in the kernel).
+static ULONG GmuP2F(ULONG V)
+{
+    if (V==0) { return 0; }
+    ULONG msb=31; while (!(V&(1UL<<msb))) { --msb; }
+    return ((127+msb)<<23)|((V<<(23-msb))&0x7FFFFF); // V < 2^24
+}
+static ULONG GmuP2Up(ULONG N,ULONG A) { return (N+A-1)/A*A; }
+static ULONG GmuP2Xy(ULONG X,ULONG Y) { return X|(Y<<16); }
+static VOID GmuP2Layout(GMU_P2_CHUNK* C,ULONG X0,ULONG X1,ULONG Cy0,ULONG Cy1)
+{
+    C->X0=X0; C->W=X1-X0; C->P=GmuP2Up(4*C->W,64); C->Y0=Cy0;
+    C->Na=(Cy1+1)/2-(Cy0+1)/2; C->Nb=Cy1/2-Cy0/2;
+    C->Va0=C->Na ? (Cy0+(Cy0&1))/2 : 0;                 // first even row / 2
+    C->Vb0=C->Nb ? ((Cy0&1 ? Cy0 : Cy0+1)-1)/2 : 0;     // (first odd row - 1) / 2
+    C->Size=0x400+(C->Na+C->Nb)*C->P;
+}
+static ULONG GmuP2Vertex(const GMU_P2_CHUNK* C,ULONG Index) // Index 0..95: pass (0/1) * 48 + vertex * 8 + component
+{
+    const BOOLEAN second=Index>=48; const ULONG k=(Index%48)/8,comp=Index%8;
+    const ULONG rows=second ? C->Nb : C->Na;
+    if (comp==3 || comp==7) { return 0x3F800000; }
+    if (rows==0) { return 0; }
+    const ULONG v0=second ? C->Vb0 : C->Va0,x0=C->X0+(second ? 8 : 0);
+    static const ULONG corner[6]={0,1,2,0,2,3};
+    const ULONG c=corner[k];
+    const ULONG right=(c==1 || c==2),bottom=(c==2 || c==3);
+    switch (comp)
+    {
+    case 0: return GmuP2F(x0+(right ? C->W : 0));
+    case 1: return GmuP2F(v0+(bottom ? rows : 0));
+    case 2: case 6: return 0;
+    case 4: return GmuP2F(right ? C->W : 0);
+    default: return GmuP2F(bottom ? rows : 0); // 5
+    }
+}
+static ULONG GmuP2TexWord(const GMU_P2_CHUNK* C,BOOLEAN B,ULONG Word)
+{
+    const ULONG rows=B ? C->Nb : C->Na;
+    const ULONG base=0x70100000UL+C->Off+(rows==0 ? 0 : 0x400+(B ? C->Na*C->P : 0));
+    if (Word==0) { return 0x0C006880; }
+    if (Word==1) { return C->W|((rows ? rows : 1)<<15); }
+    if (Word==2) { return (C->P<<7)|(1UL<<29); }
+    if (Word==4) { return base; }
+    return 0;
+}
+static ULONG GmuP2IbWord(ULONG Word,const GMU_P2_CHUNK* C)
+{
+    const ULONG base=0x70100000UL+C->Off;
+    if (Word<49)
+    {
+        switch (Word)
+        {
+        case 12: case 20: return 0x70100080;
+        case 23: case 26: return 0x70100100;
+        case 30: case 33: return 0x70100040;
+        case 37: case 40: return base;
+        default: return GmuQ1Ib[Word];
+        }
+    }
+    if (Word>=78 && Word<85)
+    {
+        const ULONG r=Word-78; // texture B load (IB11 dw 35..41)
+        return (r==2 || r==5) ? base+0x40 : GmuQ1Ib[35+r];
+    }
+    const BOOLEAN second=Word>=85;
+    const ULONG g=Word-(second ? 85 : 49),src=second ? 78+g : 49+g;
+    const ULONG rows=second ? C->Nb : C->Na;
+    ULONG tl,br;
+    if (rows==0) { tl=br=second ? GmuP2Xy(8,0) : 0; }
+    else if (!second) { tl=GmuP2Xy(C->X0,C->Va0); br=GmuP2Xy(C->X0+C->W-1,C->Va0+rows-1); }
+    else { tl=GmuP2Xy(C->X0+8,C->Vb0); br=GmuP2Xy(C->X0+C->W+7,C->Vb0+rows-1); }
+    switch (g)
+    {
+    case 1: case 4: case 7: return tl;
+    case 2: case 5: case 8: return br;
+    case 10: return base+0x80+(second ? 192 : 0);
+    case 12: return 0xC0;
+    case 17: return second ? GMU_P2_FB_IOVA+4320-32 : GMU_P2_FB_IOVA;
+    case 22: return 6;
+    case 25: return 0x70100404UL+(second ? 4 : 0);
+    default: return GmuQ1Ib[src];
+    }
+}
+struct GMU_P2_CTX {
+    GMU_TEST* S; volatile ULONG* Cc; const GMU_GX_TRACE* T; GMU_P1_TRACE* G; GMU_P2_TRACE* Q; GMU_H1_WORK* W;
+    volatile ULONG *Cp,*Gpu,*Shadow,*Hw,*Words;
+};
+// Wait until the fence of Seq (and, if Target != ~0, an idle ring at Target) is seen. 100 ms bound (Reason 16).
+static NTSTATUS GmuP2WaitSeq(GMU_P2_CTX* X,ULONG Seq,ULONG Target)
+{
+    const ULONGLONG begin=KeQueryInterruptTime(); GMU_G2_TRACE* C=&X->G->Cp;
+    for (;;)
+    {
+        NTSTATUS st=GmuP1Live(X->S,X->Cc,X->T,X->G,X->Cp,X->Gpu,X->Shadow); if (!NT_SUCCESS(st)) { return st; }
+        st=GmuP1Observe(X->G,X->W,X->Hw+0x400/4); if (!NT_SUCCESS(st)) { return st; }
+        if (X->W->Completed!=0xFFFFFFFF && X->W->Completed>=Seq &&
+            (Target==0xFFFFFFFF || (C->Rptr==Target && C->WptrAfter==Target && C->ShadowAfter==Target))) { return STATUS_SUCCESS; }
+        if (KeQueryInterruptTime()-begin>=1000000) { C->Reason=16; return STATUS_IO_TIMEOUT; }
+        KeStallExecutionProcessor(20);
+    }
+}
+// Fills the chunk from the source and submits it. *Seq is the fence sequence used; the allocation is retired with it.
+static NTSTATUS GmuP2Submit(GMU_P2_CTX* X,const UCHAR* Src,LONG SrcPitch,const GMU_P2_CHUNK* In,ULONG* SeqOut,ULONG* TargetOut)
+{
+    GMU_G2_TRACE* C=&X->G->Cp; GMU_H1_WORK* W=X->W; volatile ULONG* hw=X->Hw;
+    GMU_P2_CHUNK c=*In;
+    NTSTATUS st=GmuP1Live(X->S,X->Cc,X->T,X->G,X->Cp,X->Gpu,X->Shadow); if (!NT_SUCCESS(st)) { return st; }
+    st=GmuP1Observe(X->G,W,hw+0x400/4); if (!NT_SUCCESS(st)) { return st; }
+    c.Off=EpiGpuHeapAlloc(&W->Heap,c.Size,256);
+    if (c.Off==0xFFFFFFFF)
+    {
+        // Fragmentation: wait for everything in flight, reclaim, and try once more.
+        ++X->Q->AllocRetries;
+        if (W->Submitted!=0)
+        {
+            st=GmuP2WaitSeq(X,W->Submitted-1,0xFFFFFFFF); if (!NT_SUCCESS(st)) { return st; }
+        }
+        c.Off=EpiGpuHeapAlloc(&W->Heap,c.Size,256);
+        if (c.Off==0xFFFFFFFF) { C->Reason=19; return STATUS_INSUFFICIENT_RESOURCES; }
+    }
+    c.Seq=W->Submitted;
+    if (c.Size>X->Q->MaxChunkBytes) { X->Q->MaxChunkBytes=c.Size; }
+    volatile ULONG* ch=hw+c.Off/4;
+    // Staging: even rows (pass A) then odd rows (pass B), straight from the locked source.
+    UCHAR* stagingA=reinterpret_cast<UCHAR*>(const_cast<ULONG*>(hw))+c.Off+0x400;
+    UCHAR* stagingB=stagingA+static_cast<SIZE_T>(c.Na)*c.P;
+    const ULONG y1=c.Y0+((c.Na+c.Nb));
+    for (ULONG y=c.Y0;y<y1;++y)
+    {
+        const BOOLEAN odd=(y&1)!=0;
+        const ULONG first=odd ? (c.Y0&1 ? c.Y0 : c.Y0+1) : c.Y0+(c.Y0&1);
+        UCHAR* row=(odd ? stagingB : stagingA)+static_cast<SIZE_T>((y-first)/2)*c.P;
+        RtlCopyMemory(row,Src+static_cast<LONG_PTR>(y)*SrcPitch+static_cast<LONG_PTR>(c.X0)*4,static_cast<SIZE_T>(c.W)*4);
+    }
+    for (ULONG i=0;i<16;++i) { ch[i]=GmuP2TexWord(&c,FALSE,i); ch[16+i]=GmuP2TexWord(&c,TRUE,i); }
+    for (ULONG i=0;i<96;++i) { ch[0x80/4+i]=GmuP2Vertex(&c,i); }
+    for (ULONG i=0;i<114;++i) { ch[0x200/4+i]=GmuP2IbWord(i,&c); }
+    KeMemoryBarrier();
+    for (ULONG i=0;i<16;++i) if (ch[i]!=GmuP2TexWord(&c,FALSE,i) || ch[16+i]!=GmuP2TexWord(&c,TRUE,i)) { C->Reason=13; return STATUS_IO_DEVICE_ERROR; }
+    for (ULONG i=0;i<96;++i) if (ch[0x80/4+i]!=GmuP2Vertex(&c,i)) { C->Reason=13; return STATUS_IO_DEVICE_ERROR; }
+    for (ULONG i=0;i<114;++i) if (ch[0x200/4+i]!=GmuP2IbWord(i,&c)) { C->Reason=13; return STATUS_IO_DEVICE_ERROR; }
+    const ULONG pos=1363+9*c.Seq,target=(pos+9)%4096;
+    const ULONG packet[9]={0x70BF8003,0x70100000UL+c.Off+0x200,0,0x72,0x70460004,4,0x70100400,0,0xA6000000UL|(c.Seq&0xFFFFFF)};
+    for (ULONG i=0;i<9;++i) { X->Words[(pos+i)%4096]=packet[i]; }
+    KeMemoryBarrier();
+    for (ULONG i=0;i<9;++i) { if (X->Words[(pos+i)%4096]!=packet[i]) { C->Reason=13; return STATUS_IO_DEVICE_ERROR; } }
+    const ULONGLONG begin=KeQueryInterruptTime();
+    W->Submitted=c.Seq+1; C->Attempted=1;
+    WRITE_REGISTER_ULONG(X->Cp+7,target); KeMemoryBarrier(); ++C->WptrWrites;
+    if (!EpiGpuHeapRetire(&W->Heap,c.Off,c.Size,c.Seq)) { C->Reason=19; return STATUS_IO_DEVICE_ERROR; }
+    st=GmuP1Ahb(X->S,X->Cc,X->T,X->G,X->Cp,X->Gpu,X->Shadow,target,begin); if (!NT_SUCCESS(st)) { return st; }
+    ++X->Q->Chunks; X->Q->Seq=c.Seq; *SeqOut=c.Seq; *TargetOut=target;
+    return STATUS_SUCCESS;
+}
+// One request (a present, or the self-test): every rect, in chunks, at most two chunks in flight.
+// Handle != NULL: EpiP2SourceReleased is called once the last staging row is written.
+static NTSTATUS GmuP2Present(GMU_P2_CTX* X,PVOID Handle,const UCHAR* Src,LONG SrcPitch,ULONG NumRects,const EPI_P2_RECT* Rects,
+                             ULONG* ChunksOut,ULONG* MaxInFlightOut)
+{
+    NTSTATUS st=STATUS_SUCCESS; ULONG chunks=0,maxInFlight=0;
+    ULONG prevSeq=0xFFFFFFFF,lastSeq=0xFFFFFFFF,lastTarget=0xFFFFFFFF;
+    for (ULONG i=0;i<NumRects && NT_SUCCESS(st);++i)
+    {
+        const EPI_P2_RECT& r=Rects[i];
+        if (r.Left<0 || r.Top<0 || r.Right>1080 || r.Bottom>2400 || r.Left>=r.Right || r.Top>=r.Bottom)
+        { X->G->Cp.Reason=13; st=STATUS_INVALID_PARAMETER; break; }
+        const ULONG w=static_cast<ULONG>(r.Right-r.Left),p=GmuP2Up(4*w,64);
+        const ULONG rowsPer=((GMU_P2_CHUNK_MAX-0x400)/p)&~1UL;
+        for (ULONG cy0=static_cast<ULONG>(r.Top);cy0<static_cast<ULONG>(r.Bottom) && NT_SUCCESS(st);)
+        {
+            const ULONG cy1=(static_cast<ULONG>(r.Bottom)-cy0>rowsPer) ? cy0+rowsPer : static_cast<ULONG>(r.Bottom);
+            GMU_P2_CHUNK c; GmuP2Layout(&c,static_cast<ULONG>(r.Left),static_cast<ULONG>(r.Right),cy0,cy1);
+            ULONG seq=0,target=0;
+            st=GmuP2Submit(X,Src,SrcPitch,&c,&seq,&target);
+            if (!NT_SUCCESS(st)) { break; }
+            ++chunks;
+            // seq's chunk is in flight alongside the previous one at most (prev is waited for right below).
+            const ULONG inFlight=(prevSeq!=0xFFFFFFFF && (X->W->Completed==0xFFFFFFFF || X->W->Completed<prevSeq)) ? 2 : 1;
+            if (inFlight>maxInFlight) { maxInFlight=inFlight; }
+            if (prevSeq!=0xFFFFFFFF) { st=GmuP2WaitSeq(X,prevSeq,0xFFFFFFFF); if (!NT_SUCCESS(st)) { break; } }
+            prevSeq=seq; lastSeq=seq; lastTarget=target; cy0=cy1;
+        }
+    }
+    if (NT_SUCCESS(st) && Handle!=NULL) { EpiP2SourceReleased(Handle); } // the last CPU read of the source is behind us
+    if (NT_SUCCESS(st) && lastSeq!=0xFFFFFFFF) { st=GmuP2WaitSeq(X,lastSeq,lastTarget); }
+    *ChunksOut=chunks; *MaxInFlightOut=maxInFlight;
+    if (maxInFlight>X->Q->MaxChunksInFlight) { X->Q->MaxChunksInFlight=maxInFlight; }
+    return st;
+}
+static ULONG GmuP2Pattern(ULONG X,ULONG Y) { return 0xFF000000UL|((Y&0xFF)<<16)|((X&0xFF)<<8)|(((X+Y)&1) ? 0xC0UL : 0x40UL); }
+// Self-test on the D-1 box (412..667 x 1072..1327): pattern by GPU, then the saved screen values back by GPU.
+// Both must match exactly. The saved values are written back by the CPU if either step fails.
+static NTSTATUS GmuP2SelfTest(GMU_P2_CTX* X,HANDLE Params)
+{
+    GMU_P2_TRACE* Q=X->Q; GMU_G2_TRACE* C=&X->G->Cp;
+    const ULONG x0=412,y0=1072,n=256,pitch=n*4;
+    ULONG* saved=static_cast<ULONG*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,n*n*4,EPI_GMU_TAG));
+    ULONG* pattern=static_cast<ULONG*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,n*n*4,EPI_GMU_TAG));
+    PVOID band=NULL; NTSTATUS st=STATUS_SUCCESS;
+    if (saved==NULL || pattern==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; C->Reason=19; }
+    else
+    {
+        PHYSICAL_ADDRESS pa; pa.QuadPart=0xE1462000;
+        band=MmMapIoSpaceEx(pa,0x120000,PAGE_READWRITE|PAGE_NOCACHE);
+        if (band==NULL) { st=STATUS_INSUFFICIENT_RESOURCES; C->Reason=GX_REG_MAP_FAILED; }
+    }
+    volatile ULONG* b=static_cast<volatile ULONG*>(band);
+    const auto off=[](ULONG x,ULONG y)->ULONG { return (y*4320+x*4-0x462000)/4; };
+    if (NT_SUCCESS(st))
+    {
+        st=GmuStep(Params,0x2300);
+        for (ULONG y=0;y<n && NT_SUCCESS(st);++y) for (ULONG x=0;x<n;++x)
+        { saved[y*n+x]=READ_REGISTER_ULONG(b+off(x0+x,y0+y)); pattern[y*n+x]=GmuP2Pattern(x0+x,y0+y); }
+    }
+    BOOLEAN wrote=FALSE;
+    if (NT_SUCCESS(st))
+    {
+        Q->Prepared=1; Q->Checks|=1;
+        const EPI_P2_RECT rect={static_cast<LONG>(x0),static_cast<LONG>(y0),static_cast<LONG>(x0+n),static_cast<LONG>(y0+n)};
+        for (ULONG step=0;step<2 && NT_SUCCESS(st);++step)
+        {
+            st=GmuStep(Params,0x2301+step*3);
+            if (!NT_SUCCESS(st)) { break; }
+            const ULONG* source=step==0 ? pattern : saved;
+            // Src is such that pixel (x, y) is at Src + y * pitch + x * 4; only the box rows are touched.
+            const UCHAR* src=reinterpret_cast<const UCHAR*>(source)-static_cast<LONG_PTR>(y0)*pitch-static_cast<LONG_PTR>(x0)*4;
+            ULONG chunks=0,inFlight=0;
+            wrote=TRUE;
+            st=GmuP2Present(X,NULL,src,static_cast<LONG>(pitch),1,&rect,&chunks,&inFlight);
+            if (step==0) { Q->SelfChunks=chunks; }
+            if (!NT_SUCCESS(st)) { break; }
+            st=GmuStep(Params,0x2302+step*3);
+            ULONG bad=0;
+            for (ULONG y=0;y<n;++y) for (ULONG x=0;x<n;++x)
+            {
+                const ULONG got=READ_REGISTER_ULONG(b+off(x0+x,y0+y)),want=source[y*n+x];
+                if (got!=want) { if (bad==0) { Q->SelfFirst[step]=y*n+x; Q->SelfValue[step]=got; Q->SelfExpected[step]=want; } ++bad; }
+            }
+            Q->SelfBad[step]=bad;
+        }
+        if (NT_SUCCESS(st) && Q->SelfBad[0]==0 && Q->SelfBad[1]==0) { Q->Checks|=2; }
+    }
+    Q->SelfStatus=static_cast<ULONG>(st);
+    if (wrote && band!=NULL)
+    {
+        // Whatever happened, the saved screen values go back (a no-op after a successful second step).
+        GmuStep(Params,0x2306);
+        for (ULONG y=0;y<n;++y) for (ULONG x=0;x<n;++x)
+        { if (READ_REGISTER_ULONG(b+off(x0+x,y0+y))!=saved[y*n+x]) { WRITE_REGISTER_ULONG(b+off(x0+x,y0+y),saved[y*n+x]); } }
+        KeMemoryBarrier();
+    }
+    if (band!=NULL) { MmUnmapIoSpace(band,0x120000); }
+    if (saved!=NULL) { ExFreePoolWithTag(saved,EPI_GMU_TAG); }
+    if (pattern!=NULL) { ExFreePoolWithTag(pattern,EPI_GMU_TAG); }
+    return st;
+}
+static VOID GmuP2Refresh(GMU_P2_TRACE* Q)
+{
+    EPI_P2_STATS s; RtlZeroMemory(&s,sizeof(s)); EpiP2Stats(&s);
+    Q->GpuPresents=s.GpuPresents; Q->GpuFail=s.GpuFail; Q->VerifyBad=s.VerifyBad; Q->GpuPresentDisabled=s.Disabled;
+    Q->PresentStatsCount=s.RawCount>64 ? 64 : s.RawCount;
+    for (ULONG i=0;i<Q->PresentStatsCount;++i) { Q->PresentStats[i]=s.Raw[i]; }
+}
 static NTSTATUS GmuP1Run(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,const GMU_GX_TRACE* T,GMU_P1_TRACE* G,
-                         GMU_H1_WORK* W,HANDLE Diag,const GMU_B1_TRACE* B)
+                         GMU_H1_WORK* W,HANDLE Diag,const GMU_B1_TRACE* B,GMU_P2_TRACE* Q=NULL)
 {
     GMU_G2_TRACE* C=&G->Cp;
     G->State=0; G->BChecks=B!=NULL ? B->Checks : 0xFFFFFFFF; G->BReason=B!=NULL ? B->Cp.Reason : 0xFFFFFFFF;
@@ -7186,19 +7490,68 @@ static NTSTATUS GmuP1Run(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,const GMU_
             EpiGpuSessionHandover();
             st=GmuG2Guard(S,Params,Cc,T,C,0x2210);
         }
-        for (ULONG n=0;NT_SUCCESS(st);++n)
+        // P-2: FB region check, then the self-test; the mailbox opens only if the self-test matched exactly.
+        GMU_P2_CTX px={S,Cc,T,G,Q,W,cp,gpu,rptr,hw,words};
+        BOOLEAN p2Open=FALSE;
+        if (NT_SUCCESS(st) && Q!=NULL)
         {
-            if (n>=GmuP1MaxBeats) { EpiGpuSessionSetCause(3); break; }
-            if (EpiGpuSessionWait(100)) { GmuStep(Params,0x2220); break; }
-            st=GmuP1Beat(S,Cc,T,G,W,cp,gpu,rptr,hw,words,n);
-            if (!NT_SUCCESS(st))
+            GMU_REGION* fb=GmuFind(S,GMU_P2_FB_IOVA,GMU_P2_FB_SIZE);
+            const BOOLEAN fbOk=fb!=NULL && fb->External && fb->Mapped && fb->Size==GMU_P2_FB_SIZE && fb->Pa.QuadPart==0xE1000000 &&
+                fb->Flags==(EPI_SMMU_READ|EPI_SMMU_WRITE) && fb->Iova==GMU_P2_FB_IOVA;
+            Q->FbIova=fb!=NULL ? static_cast<ULONG>(fb->Iova) : 0; Q->FbSize=fb!=NULL ? static_cast<ULONG>(fb->Size) : 0;
+            Q->FbPaLow=fb!=NULL ? static_cast<ULONG>(fb->Pa.QuadPart) : 0; Q->FbMapped=fb!=NULL && fb->Mapped ? 1 : 0;
+            if (!fbOk) { Q->FailReason=12; EpiP2Disable(); }
+            else
             {
-                G->FailBeat=n; G->FailFence=hw[0x400/4]; G->FailRptr=C->Rptr; G->FailWptr=C->WptrAfter;
-                EpiGpuSessionSetCause(4);
-                break;
+                st=GmuP2SelfTest(&px,Params);   // an error here is a GPU failure; a mismatch only disables P-2
+                if (NT_SUCCESS(st))
+                {
+                    if (Q->Checks&2) { EpiP2MailboxOpen(); p2Open=TRUE; Q->State=1; }
+                    else { Q->FailReason=21; EpiP2Disable(); }
+                }
+                else { Q->FailReason=C->Reason; Q->FailStatus=static_cast<ULONG>(st); EpiGpuSessionSetCause(4); }
             }
-            if ((n%10)==9) { GmuP1Diag(Diag,G); }
         }
+        ULONGLONG lastDiag=KeQueryInterruptTime();
+        while (NT_SUCCESS(st))
+        {
+            if (G->BeatsSubmitted>=GmuP1MaxBeats || KeQueryInterruptTime()-g_GmuP1Handover>=6600000000ULL) { EpiGpuSessionSetCause(3); break; }
+            const ULONG woke=p2Open ? EpiGpuSessionWaitRequest(100) : (EpiGpuSessionWait(100) ? 1UL : 0UL);
+            if (woke==1) { GmuStep(Params,0x2220); break; }
+            if (woke==2)
+            {
+                EPI_P2_VIEW view={};
+                while (NT_SUCCESS(st) && Q!=NULL && EpiP2Take(&view))
+                {
+                    ULONG chunks=0,inFlight=0; ++Q->Requests;
+                    GmuStep(Params,0x2310);
+                    const NTSTATUS ps=GmuP2Present(&px,view.Handle,view.Src,view.SrcPitch,view.NumRects,view.Rects,&chunks,&inFlight);
+                    EpiP2Complete(view.Handle,ps,chunks,inFlight,NT_SUCCESS(ps) ? 0 : C->Reason);
+                    if (!NT_SUCCESS(ps))
+                    {
+                        GmuStep(Params,0x2320);
+                        ++Q->FailRequests; Q->FailReason=C->Reason; Q->FailStatus=static_cast<ULONG>(ps);
+                        st=ps; EpiGpuSessionSetCause(4);
+                    }
+                }
+            }
+            else
+            {
+                const ULONG n=G->BeatsSubmitted;
+                st=GmuP1Beat(S,Cc,T,G,W,cp,gpu,rptr,hw,words);
+                if (!NT_SUCCESS(st))
+                {
+                    G->FailBeat=n; G->FailFence=hw[0x400/4]; G->FailRptr=C->Rptr; G->FailWptr=C->WptrAfter;
+                    EpiGpuSessionSetCause(4);
+                }
+            }
+            if (NT_SUCCESS(st) && KeQueryInterruptTime()-lastDiag>=10000000ULL)
+            {
+                lastDiag=KeQueryInterruptTime(); GmuP1Diag(Diag,G);
+                if (Q!=NULL) { GmuP2Refresh(Q); EpiSetValue(Diag,L"GpuPresent",REG_BINARY,Q,sizeof(*Q)); }
+            }
+        }
+        if (p2Open) { EpiP2MailboxClose(); } // a request still waiting is cancelled; nothing is left behind
         GmuStep(Params,0x2230);
         // Final observation and registers, taken while the vote is still held.
         const ULONG reason=C->Reason;
@@ -7227,20 +7580,22 @@ static NTSTATUS GmuP1Run(GMU_TEST* S,HANDLE Params,volatile ULONG* Cc,const GMU_
         if (NT_SUCCESS(st))
         {
             if (G->BeatsDone==G->BeatsSubmitted && G->BeatsDone>=1 && G->SlotBad==0 && G->FenceBackwards==0 && G->FailBeat==0xFFFFFFFF &&
-                W->Completed==G->BeatsDone-1 && G->LastFence==(0xA6000000UL|((G->BeatsDone-1)&0xFFFFFF)) &&
+                W->Submitted>=1 && W->Completed==W->Submitted-1 && G->LastFence==(0xA6000000UL|((W->Submitted-1)&0xFFFFFF)) &&
                 C->Rptr==C->WptrAfter && C->WptrAfter==C->ShadowAfter && G->IbRemaining==0 && G->CcuAfter==0x10000000)
             { G->Checks|=4; }
             if (G->FailCount==0 && G->LiveBytes==1088 && G->RetirePending==0) { G->Checks|=8; }
             if (faultFree) { G->Checks|=32; }
+            if (Q!=NULL && (G->Checks&8) && Q->MaxChunksInFlight<=2) { Q->Checks|=8; }
         }
     }
     for (ULONG i=0;i<3;++i) { if (maps[i]!=NULL) { MmUnmapIoSpace(maps[i],PAGE_SIZE); } }
-    if (!NT_SUCCESS(st)) { G->SessionReason=C->Reason; }
+    if (NT_SUCCESS(st)) { C->Reason=0; G->SessionReason=0; }
+    else { G->SessionReason=C->Reason; }
     return st;
 }
 // Called after the full teardown (before the traces are freed). bit1 needs beats after StartDevice returned,
 // bit4 needs a clean stop and a successful teardown.
-static VOID GmuP1Final(HANDLE Params,HANDLE Diag,GMU_P1_TRACE* G,ULONG Result,BOOLEAN Keep)
+static VOID GmuP1Final(HANDLE Params,HANDLE Diag,GMU_P1_TRACE* G,ULONG Result,BOOLEAN Keep,GMU_P2_TRACE* Q=NULL)
 {
     if (G->Prepared)
     {
@@ -7252,6 +7607,16 @@ static VOID GmuP1Final(HANDLE Params,HANDLE Diag,GMU_P1_TRACE* G,ULONG Result,BO
         if (G->StopCause>=1 && G->StopCause<=3 && G->StopLatencyMs<5000 && Result==EPI_GMU_OK && !Keep) { G->Checks|=16; }
     }
     G->State=2;
+    if (Q!=NULL)
+    {
+        // GpuPresent: bit0/1 from the self-test, bit2 present results, bit3 allocator, bit4/5 as P-1.
+        GmuP2Refresh(Q);
+        if (Q->Prepared && Q->GpuPresents>=1 && Q->GpuFail==0 && Q->VerifyBad==0 && Q->GpuPresentDisabled==0) { Q->Checks|=4; }
+        if (G->Checks&16) { Q->Checks|=16; }
+        if (G->Checks&32) { Q->Checks|=32; }
+        Q->State=2;
+        EpiSetValue(Diag,L"GpuPresent",REG_BINARY,Q,sizeof(*Q));
+    }
     GmuStep(Params,0x22FF);
     GmuP1Diag(Diag,G);
     EpiSetDword(Diag,L"GpuSessionState",2);
@@ -7265,7 +7630,7 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
                          GMU_G3_TRACE* G3 = NULL, GMU_G3B_TRACE* G3b = NULL, GMU_G3C_TRACE* G3c = NULL,
                          GMU_G4_TRACE* G4 = NULL, GMU_G5_TRACE* G5 = NULL, GMU_G5B_TRACE* G5b = NULL,
                          GMU_Z1_TRACE* Z1 = NULL,HANDLE Diag = NULL,const UCHAR* Zap = NULL,ULONG ZapLen = 0,
-                         GMU_S1_TRACE* S1 = NULL, GMU_R1_TRACE* R1 = NULL, GMU_D1_TRACE* D1 = NULL, GMU_V1_TRACE* V1 = NULL, GMU_A1_TRACE* A1 = NULL, GMU_T1_TRACE* T1 = NULL, GMU_W1_TRACE* W1 = NULL, GMU_M1_TRACE* M1 = NULL, GMU_Q1_TRACE* Q1 = NULL, GMU_H1_TRACE* H1 = NULL, GMU_H1_WORK* H1Work = NULL, GMU_B1_TRACE* B1 = NULL, GMU_P1_TRACE* P1 = NULL)
+                         GMU_S1_TRACE* S1 = NULL, GMU_R1_TRACE* R1 = NULL, GMU_D1_TRACE* D1 = NULL, GMU_V1_TRACE* V1 = NULL, GMU_A1_TRACE* A1 = NULL, GMU_T1_TRACE* T1 = NULL, GMU_W1_TRACE* W1 = NULL, GMU_M1_TRACE* M1 = NULL, GMU_Q1_TRACE* Q1 = NULL, GMU_H1_TRACE* H1 = NULL, GMU_H1_WORK* H1Work = NULL, GMU_B1_TRACE* B1 = NULL, GMU_P1_TRACE* P1 = NULL, GMU_P2_TRACE* P2 = NULL)
 {
     NTSTATUS st=GmuGxStep(Params,0x7C0,T);
     if (!NT_SUCCESS(st)) { T->OobStatus=st; return st; }
@@ -7446,7 +7811,7 @@ static NTSTATUS GmuGxOob(GMU_TEST* S, HANDLE Params, volatile ULONG* Cc, GMU_GX_
     if (P1!=NULL && H1Work!=NULL)
     {
         // P-1 runs before the OOB vote is released below, and keeps running until the stop request.
-        if (GmuP1CanFollow(B1)) { P1->Cp.Status=GmuP1Run(S,Params,Cc,T,P1,H1Work,Diag,B1); }
+        if (GmuP1CanFollow(B1)) { P1->Cp.Status=GmuP1Run(S,Params,Cc,T,P1,H1Work,Diag,B1,P2); }
         else { P1->Cp.Reason=8; P1->SessionReason=8; P1->Cp.Status=STATUS_INVALID_DEVICE_STATE; }
     }
     GmuGxStep(Params,0x7C4,T);
@@ -7609,6 +7974,7 @@ struct GMU_BOOT_TRACES {
     GMU_H1_TRACE h1;
     GMU_B1_TRACE b1;
     GMU_P1_TRACE p1;
+    GMU_P2_TRACE p2;
     GMU_H1_WORK h1Work;
     GMU_GX_TRACE gx;
     GMU_CLOCK_TRACE clocks;
@@ -7652,6 +8018,7 @@ static VOID GmuBootTracesInit(GMU_BOOT_TRACES* p,BOOLEAN VoteGx,const ULONG* Dis
     GmuH1TraceInit(&p->h1);
     GmuB1TraceInit(&p->b1);
     GmuP1TraceInit(&p->p1);
+    GmuP2TraceInit(&p->p2);
     RtlZeroMemory(&p->h1Work,sizeof(p->h1Work)); p->h1Work.Completed=0xFFFFFFFF;
     RtlZeroMemory(&p->gx,sizeof(p->gx));
     p->gx.OobStatus=STATUS_NOT_FOUND; p->gx.HaltStatus=STATUS_NOT_FOUND; p->gx.SlumberStatus=STATUS_NOT_FOUND;
@@ -7719,12 +8086,13 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                      BOOLEAN GxOn, BOOLEAN GxReg, BOOLEAN ClearHalt, BOOLEAN Secvid, BOOLEAN AddrMode, BOOLEAN Hwcg,
                      BOOLEAN GxCfg, BOOLEAN StageE, BOOLEAN StageF, BOOLEAN G1, const UCHAR* Sqe, ULONG SqeLen,
                      BOOLEAN G2, BOOLEAN G3, BOOLEAN G3b, BOOLEAN G3c, BOOLEAN G4, BOOLEAN G5, BOOLEAN G5b,
-                     BOOLEAN Z1,const UCHAR* Zap,ULONG ZapLen,BOOLEAN S1,BOOLEAN R1,BOOLEAN D1,const ULONG* Disp,BOOLEAN V1,BOOLEAN A1,BOOLEAN T1,BOOLEAN W1,BOOLEAN M1,BOOLEAN Q1,BOOLEAN H1,BOOLEAN B1,BOOLEAN P1)
+                     BOOLEAN Z1,const UCHAR* Zap,ULONG ZapLen,BOOLEAN S1,BOOLEAN R1,BOOLEAN D1,const ULONG* Disp,BOOLEAN V1,BOOLEAN A1,BOOLEAN T1,BOOLEAN W1,BOOLEAN M1,BOOLEAN Q1,BOOLEAN H1,BOOLEAN B1,BOOLEAN P1,BOOLEAN P2)
 {
     PAGED_CODE();
     if (KeepCx == NULL) { return EPI_GMU_E_PRECOND; }
     *KeepCx=FALSE;
     if (g_KeptGmu != NULL) { *KeepCx=TRUE; return EPI_GMU_E_TEARDOWN; }
+    if (P2 && !P1) { return EPI_GMU_E_PRECOND; }
     if (P1 && !B1) { return EPI_GMU_E_PRECOND; }
     if (B1 && !H1) { return EPI_GMU_E_PRECOND; }
     if (H1 && !Q1) { return EPI_GMU_E_PRECOND; }
@@ -7824,6 +8192,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
     EpiSetValue(Diag,L"GpuGmuH1",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuGmuB1",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuSession",REG_BINARY,NULL,0);
+    EpiSetValue(Diag,L"GpuPresent",REG_BINARY,NULL,0);
     EpiSetValue(Diag,L"GpuSmmuGpuStreams",REG_BINARY,NULL,0);
     GMU_TEST* s=static_cast<GMU_TEST*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(GMU_TEST),EPI_GMU_TAG));
     if (s==NULL) { ExFreePoolWithTag(p,EPI_GMU_TAG); return EPI_GMU_E_NOMEM; }
@@ -7845,6 +8214,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
         if (!NT_SUCCESS(st)) { p->g1.MemoryStatus=st; result=EPI_GMU_E_GPU_MEMORY; goto cleanup; }
     }
     if (H1 && !GmuH1Plan(s)) { result=EPI_GMU_E_GPU_MEMORY; st=STATUS_INSUFFICIENT_RESOURCES; goto cleanup; }
+    if (P2 && !GmuP2Plan(s)) { result=EPI_GMU_E_GPU_MEMORY; st=STATUS_INSUFFICIENT_RESOURCES; goto cleanup; }
     if (D1 && !GmuD1Plan(s)) { result=EPI_GMU_E_GPU_MEMORY; st=STATUS_INSUFFICIENT_RESOURCES; goto cleanup; }
     // Confirm the CX window before accessing any GMU register.
     {
@@ -8007,7 +8377,7 @@ ULONG EpiGmuBootTest(HANDLE Params, HANDLE Diag, volatile ULONG* Cc, const UCHAR
                                         GxCfg ? &p->gxCfg : NULL,StageE ? &p->gxStageE : NULL,StageF ? &p->gxStageF : NULL,
                                         G1 ? &p->g1 : NULL,G2 ? &p->g2 : NULL,G3 ? &p->g3 : NULL,G3b ? &p->g3b : NULL,
                                         G3c ? &p->g3c : NULL,G4 ? &p->g4 : NULL,G5 ? &p->g5 : NULL,G5b ? &p->g5b : NULL,
-                                        Z1 ? &p->z1 : NULL,Diag,Zap,ZapLen,S1 ? &p->s1 : NULL,R1 ? &p->r1 : NULL,D1 ? &p->d1 : NULL,V1 ? &p->v1 : NULL,A1 ? &p->a1 : NULL,T1 ? &p->t1 : NULL,W1 ? &p->w1 : NULL,M1 ? &p->m1 : NULL,Q1 ? &p->q1 : NULL,H1 ? &p->h1 : NULL,H1 ? &p->h1Work : NULL,B1 ? &p->b1 : NULL,P1 ? &p->p1 : NULL);
+                                        Z1 ? &p->z1 : NULL,Diag,Zap,ZapLen,S1 ? &p->s1 : NULL,R1 ? &p->r1 : NULL,D1 ? &p->d1 : NULL,V1 ? &p->v1 : NULL,A1 ? &p->a1 : NULL,T1 ? &p->t1 : NULL,W1 ? &p->w1 : NULL,M1 ? &p->m1 : NULL,Q1 ? &p->q1 : NULL,H1 ? &p->h1 : NULL,H1 ? &p->h1Work : NULL,B1 ? &p->b1 : NULL,P1 ? &p->p1 : NULL,P2 ? &p->p2 : NULL);
             NTSTATUS slumber=STATUS_NOT_FOUND;
             if (p->gx.Attempted)
             {
@@ -8260,7 +8630,7 @@ cleanup:
     { if (s->Maps[i]!=NULL) { MmUnmapIoSpace(s->Maps[i],GmuMapLength(i)); } }
     ExFreePoolWithTag(s,EPI_GMU_TAG);
     EpiSetDword(Diag,L"GpuGmuStatus",result); GmuText(Text,TextCch,L"gmu_status",result);
-    if (P1) { GmuP1Final(Params,Diag,&p->p1,result,FALSE); }
+    if (P1) { GmuP1Final(Params,Diag,&p->p1,result,FALSE,P2 ? &p->p2 : NULL); }
     ExFreePoolWithTag(p,EPI_GMU_TAG);
     return result;
 keep:
@@ -8299,7 +8669,7 @@ keep:
     g_KeptGmu=s; *KeepCx=TRUE;
     EpiSetDword(Diag,L"GpuGmuStatus",result); EpiSetDword(Diag,L"GpuGmuKeepCx",1);
     GmuText(Text,TextCch,L"gmu_keep_cx",1);
-    if (P1) { GmuP1Final(Params,Diag,&p->p1,result,TRUE); }
+    if (P1) { GmuP1Final(Params,Diag,&p->p1,result,TRUE,P2 ? &p->p2 : NULL); }
     ExFreePoolWithTag(p,EPI_GMU_TAG);
     return result;
 }

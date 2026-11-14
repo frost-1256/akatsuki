@@ -16,6 +16,7 @@
 #include "epi_zap.hxx"
 #include "epi_hw.hxx"
 #include "epi_gmu.hxx"
+#include "epi_present.hxx"
 extern "C" {
 #include <ntstrsafe.h>
 }
@@ -846,7 +847,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags
                                                (Flags2 & EPI_GMU_PROBE2_Q1) ? TRUE : FALSE,
                                                (Flags2 & EPI_GMU_PROBE2_H1) ? TRUE : FALSE,
                                                (Flags2 & EPI_GMU_PROBE2_B1) ? TRUE : FALSE,
-                                               (Flags2 & EPI_GMU_PROBE2_P1) ? TRUE : FALSE);
+                                               (Flags2 & EPI_GMU_PROBE2_P1) ? TRUE : FALSE,
+                                               (Flags2 & EPI_GMU_PROBE2_P2) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -1237,6 +1239,54 @@ ULONGLONG EpiGpuSessionReturnTime(VOID)
 {
     EPI_GPU_SESSION* s=g_GpuSession;
     return (s!=NULL && s->Returned) ? static_cast<ULONGLONG>(s->ReturnTime) : 0;
+}
+
+// ---- P-2: adapters between the GPU worker (epi_gmu.cxx, primitive types only) and the present side (epi_present.cxx) ----
+static_assert(sizeof(RECT)==sizeof(EPI_P2_RECT),"RECT layout");
+VOID EpiP2MailboxOpen(VOID) { EpiPresentMailboxOpen(); }
+VOID EpiP2MailboxClose(VOID) { EpiPresentMailboxClose(); }
+BOOLEAN EpiP2Take(EPI_P2_VIEW* View)
+{
+    EPI_GPU_PRESENT_REQ* r=EpiPresentTake();
+    if (r==NULL) { return FALSE; }
+    View->Handle=r; View->Src=r->Src; View->SrcPitch=r->SrcPitch; View->NumRects=r->NumRects;
+    View->Rects=reinterpret_cast<const EPI_P2_RECT*>(r->Rects);
+    return TRUE;
+}
+VOID EpiP2SourceReleased(PVOID Handle) { EpiPresentSourceReleased(static_cast<EPI_GPU_PRESENT_REQ*>(Handle)); }
+VOID EpiP2Complete(PVOID Handle,NTSTATUS Status,ULONG Chunks,ULONG MaxInFlight,ULONG FailReason)
+{
+    EPI_GPU_PRESENT_REQ* r=static_cast<EPI_GPU_PRESENT_REQ*>(Handle);
+    r->Chunks=Chunks; r->MaxInFlight=MaxInFlight; r->FailReason=FailReason;
+    EpiPresentComplete(r,Status); // drops the worker's reference: r is gone afterwards
+}
+VOID EpiP2Disable(VOID) { EpiGpuPresentDisable(); }
+VOID EpiP2Stats(EPI_P2_STATS* Stats)
+{
+    const EPI_PRESENT_STATS& p=g_EpiPresentStats;
+    Stats->GpuPresents=p.GpuPresents; Stats->GpuFail=p.GpuFail; Stats->VerifyBad=p.VerifyBad; Stats->Disabled=p.GpuPresentDisabled;
+    const ULONG words=static_cast<ULONG>(sizeof(p)/sizeof(ULONG));
+    Stats->RawCount=words>64 ? 64 : words;
+    RtlCopyMemory(Stats->Raw,&p,Stats->RawCount*sizeof(ULONG));
+}
+// 0 timeout, 1 stop requested, 2 a present request is waiting. Only valid while the present mailbox is open.
+ULONG EpiGpuSessionWaitRequest(ULONG Milliseconds)
+{
+    EPI_GPU_SESSION* s=g_GpuSession; if (s==NULL) { return 1; }
+    PVOID objects[2]={&s->StopEvent,EpiPresentRequestEvent()};
+    LARGE_INTEGER t; t.QuadPart=-static_cast<LONGLONG>(Milliseconds)*10000;
+    const NTSTATUS w=KeWaitForMultipleObjects(2,objects,WaitAny,Executive,KernelMode,FALSE,&t,NULL);
+    if (w==STATUS_WAIT_0) { return 1; }
+    if (w==STATUS_WAIT_0+1) { return 2; }
+    return 0;
+}
+// Called by the present thread when a GPU present failed: the worker tears the GPU down. Never waits.
+VOID EpiGpuSessionRequestStop(ULONG Cause)
+{
+    EPI_GPU_SESSION* s=g_GpuSession; if (s==NULL) { return; }
+    if (InterlockedCompareExchange(&s->StopCause,static_cast<LONG>(Cause),0)==0)
+    { InterlockedExchange64(&s->StopTime,static_cast<LONGLONG>(KeQueryInterruptTime())); }
+    KeSetEvent(&s->StopEvent,IO_NO_INCREMENT,FALSE);
 }
 _Function_class_(KSTART_ROUTINE)
 static VOID NTAPI EpiGpuSessionThread(PVOID Context)

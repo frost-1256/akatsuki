@@ -37,10 +37,11 @@
 #define EPI_GMU_PROBE2_Q1      0x80UL // requires M1; Probe2=255, rotating textured quad
 #define EPI_GMU_PROBE2_B1      0x200UL // requires H1; Probe2=1023, gated GMEM frames
 #define EPI_GMU_PROBE2_H1      0x100UL // requires Q1; Probe2=511, boot-mapped heap and two-frame submission
+#define EPI_GMU_PROBE2_P2      0x800UL // requires P1; Probe2=4095, dirty rects drawn by the GPU from heap staging
 #define EPI_GMU_PROBE2_P1      0x400UL // requires B1; Probe2=2047, GPU kept running after StartDevice returns (worker thread)
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511 || Probe2==1023 || Probe2==2047) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511 || Probe2==1023 || Probe2==2047 || Probe2==4095) && Probe==0xBFFFFE80UL);
 }
 // P-1 session hooks. Implemented in epi_gpu.cxx (the worker thread owns the whole probe once P-1 is requested).
 // All are PASSIVE_LEVEL. EpiGpuSessionWait returns TRUE when a stop was requested within Milliseconds.
@@ -51,6 +52,27 @@ ULONG   EpiGpuSessionCause(VOID);                // 0 none, 1 StopDevice/unload,
 VOID    EpiGpuSessionSetCause(ULONG Cause);      // first writer wins (the worker uses 3 and 4)
 ULONGLONG EpiGpuSessionStopTime(VOID);           // interrupt time of the stop request, 0 if none
 ULONGLONG EpiGpuSessionReturnTime(VOID);         // interrupt time StartDevice returned, 0 if not yet
+// P-2 worker interface. epi_gpu.cxx adapts it to the present side (epi_present.hxx); only primitive types cross it.
+typedef struct _EPI_P2_RECT { LONG Left,Top,Right,Bottom; } EPI_P2_RECT;   // same layout as RECT
+typedef struct _EPI_P2_VIEW {
+    PVOID Handle;                // pass back to EpiP2SourceReleased / EpiP2Complete
+    const UCHAR* Src;            // pixel (x, y) at Src + y * SrcPitch + x * 4 (only the rows of the rects are mapped)
+    LONG SrcPitch;
+    ULONG NumRects;
+    const EPI_P2_RECT* Rects;    // in screen coordinates, clipped, non-empty
+} EPI_P2_VIEW;
+typedef struct _EPI_P2_STATS {
+    ULONG GpuPresents,GpuFail,VerifyBad,Disabled;
+    ULONG RawCount; ULONG Raw[64]; // the present side's counters in its own field order (diagnostic only)
+} EPI_P2_STATS;
+VOID    EpiP2MailboxOpen(VOID);                  // present requests may now be taken
+VOID    EpiP2MailboxClose(VOID);                 // a request still in the mailbox is cancelled
+BOOLEAN EpiP2Take(EPI_P2_VIEW* View);            // FALSE when nothing is waiting
+VOID    EpiP2SourceReleased(PVOID Handle);       // the worker will not read Src any more
+VOID    EpiP2Complete(PVOID Handle,NTSTATUS Status,ULONG Chunks,ULONG MaxInFlight,ULONG FailReason); // exactly once per taken request
+VOID    EpiP2Disable(VOID);                      // no more GPU presents this session
+VOID    EpiP2Stats(EPI_P2_STATS* Stats);
+ULONG   EpiGpuSessionWaitRequest(ULONG Milliseconds); // 0 timeout, 1 stop requested, 2 a present request is waiting
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
     return D!=NULL && D[0]==0xE1000000 && D[1]==0 && D[2]==1080 && D[3]==2400 && D[4]==4320 && (D[5]==21 || D[5]==22);
@@ -567,4 +589,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE,BOOLEAN B1 = FALSE,BOOLEAN P1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE,BOOLEAN B1 = FALSE,BOOLEAN P1 = FALSE,BOOLEAN P2 = FALSE);

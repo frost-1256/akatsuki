@@ -2,6 +2,54 @@
 #define EPI_GMU_HOST_TEST
 #include "../../src/epinephrine/epi_zap.cxx"
 #include "../../src/epinephrine/epi_gmu.cxx"
+// P-2 present-side stubs (the real ones are in epi_gpu.cxx / epi_present.cxx): a scripted mailbox. Every request taken must be
+// completed exactly once, and SourceReleased must come before a successful completion.
+struct P2ReqRec { ULONG AtWait; std::vector<EPI_P2_RECT> Rects; const UCHAR* Src; LONG Pitch; bool Taken=false,Released=false,Done=false; NTSTATUS Status=1; ULONG Chunks=0,MaxInFlight=0,FailReason=0; };
+static std::vector<P2ReqRec*> p2Script;
+static P2ReqRec* p2Mailbox=nullptr;
+static bool p2IsOpen=false;
+static ULONG p2Opens=0,p2Closes=0,p2Disables=0,p2Presents=0,p2Fails=0,p2Cancelled=0;
+static std::vector<ULONG> p2FbAtOpen;
+VOID EpiP2MailboxOpen(VOID) { assert(!p2IsOpen); p2IsOpen=true; ++p2Opens; p2FbAtOpen=fbShim; }
+VOID EpiP2MailboxClose(VOID)
+{
+    assert(p2IsOpen);
+    if(p2Mailbox) { P2ReqRec* r=p2Mailbox; p2Mailbox=nullptr; r->Done=true; r->Status=-100; ++p2Cancelled; }
+    p2IsOpen=false; ++p2Closes;
+}
+BOOLEAN EpiP2Take(EPI_P2_VIEW* View)
+{
+    if(!p2Mailbox) return FALSE;
+    P2ReqRec* r=p2Mailbox; p2Mailbox=nullptr; r->Taken=true;
+    View->Handle=r; View->Src=r->Src; View->SrcPitch=r->Pitch; View->NumRects=static_cast<ULONG>(r->Rects.size()); View->Rects=r->Rects.data();
+    return TRUE;
+}
+VOID EpiP2SourceReleased(PVOID Handle) { P2ReqRec* r=static_cast<P2ReqRec*>(Handle); assert(r->Taken && !r->Done); r->Released=true; }
+VOID EpiP2Complete(PVOID Handle,NTSTATUS Status,ULONG Chunks,ULONG MaxInFlight,ULONG FailReason)
+{
+    P2ReqRec* r=static_cast<P2ReqRec*>(Handle); assert(r->Taken && !r->Done);
+    if(NT_SUCCESS(Status)) { assert(r->Released); ++p2Presents; } else ++p2Fails;
+    r->Done=true; r->Status=Status; r->Chunks=Chunks; r->MaxInFlight=MaxInFlight; r->FailReason=FailReason;
+}
+VOID EpiP2Disable(VOID) { ++p2Disables; }
+VOID EpiP2Stats(EPI_P2_STATS* Stats)
+{
+    RtlZeroMemory(Stats,sizeof(*Stats));
+    Stats->GpuPresents=p2Presents; Stats->GpuFail=p2Fails; Stats->VerifyBad=0; Stats->Disabled=p2Disables ? 1 : 0;
+    Stats->RawCount=3; Stats->Raw[0]=p2Presents; Stats->Raw[1]=p2Fails; Stats->Raw[2]=p2Disables;
+}
+ULONG EpiGpuSessionWaitRequest(ULONG Milliseconds)
+{
+    assert(p2IsOpen); // the real wait uses the request event, which only exists while the mailbox is open
+    ++p1Waits; KeStallExecutionProcessor(static_cast<int>(Milliseconds*1000));
+    if(p1ReturnTime==0 && p1Handovers && !p1NoReturn) p1ReturnTime=testInterruptTime;
+    for(auto it=p2Script.begin();it!=p2Script.end() && !p2Mailbox;) {
+        if((*it)->AtWait<=p1Waits) { p2Mailbox=*it; it=p2Script.erase(it); } else ++it;
+    }
+    if(p2Mailbox) return 2;
+    if(p1Waits>p1StopAfter) { if(p1Cause==0) {p1Cause=1; p1StopTime=testInterruptTime;} return 1; }
+    return 0;
+}
 #include <fstream>
 #include <iterator>
 struct EPI_SMMU { bool enabled, gpuStreams; };
@@ -363,7 +411,7 @@ int main(int argc,char** argv) {
         assert(model[0]==0x70016400 && model[4095]==0x70BF8003 && model[3095]==0xB1000220);
     }
     assert(EpiGmuProbe2Valid(0xBFFFFE80,127) && !EpiGmuProbe2Valid(0x3FFFFE80,127));
-    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1022UL,1024UL,2046UL,2048UL,4095UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1022UL,1024UL,2046UL,2048UL,4094UL,8191UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
     assert(sizeof(GMU_M1_TRACE)==600 && RTL_NUMBER_OF(GmuM1Packet)==177 && RTL_NUMBER_OF(GmuM1Ibs)==18);
     assert(GmuM1Packet[0]==0x70BF8003 && GmuM1Packet[1]==0x70015B80 && GmuM1Packet[176]==0xCAFE001A);
     assert(EpiGmuProbe2Valid(0xBFFFFE80,255) && !EpiGmuProbe2Valid(0x3FFFFE80,255));
@@ -2581,6 +2629,99 @@ int main(int argc,char** argv) {
             }
             assert(sizeof(GMU_P1_TRACE)==sizeof(GMU_G2_TRACE)+4*58);
             allowP1Writes=false; p1Active=false; p1Session=true; testGlobalStable=false;
+            // P-2: GPU present from heap staging. The IB and VB words must equal tools/p2ib.py (FNV-1a), and the model GPU must
+            // reproduce the source exactly inside every rect and leave every other screen pixel alone.
+            {
+                const auto fnv=[](const ULONG* w,ULONG n) { ULONG h=0x811C9DC5UL; for(ULONG i=0;i<n;++i) for(ULONG sh=0;sh<32;sh+=8) { h^=(w[i]>>sh)&0xFF; h*=0x01000193UL; } return h; };
+                const ULONG cases[][7]={{0,1080,0,22,0x500,0x04503A1AUL,0xA745833DUL},{412,668,1072,1166,0x500,0xAAACDB9EUL,0xBD1DB08BUL},
+                    {412,668,1166,1260,0x18500,0xEB6FCEBEUL,0x7FF8FE5FUL},{412,668,1327,1328,0x500,0x5993A10CUL,0x0AFF04BCUL},
+                    {5,6,3,4,0x100,0x97D01F4AUL,0xA0C22EE8UL},{100,900,17,40,0x1C00,0x3F377FADUL,0x809F8F8BUL},{0,1,0,1,0x500,0xEDA5A1DAUL,0x88FA4C25UL}};
+                for(const auto& k:cases) {
+                    GMU_P2_CHUNK c; GmuP2Layout(&c,k[0],k[1],k[2],k[3]); c.Off=k[4];
+                    ULONG ib[114],vb[96];
+                    for(ULONG i=0;i<114;++i) ib[i]=GmuP2IbWord(i,&c);
+                    for(ULONG i=0;i<96;++i) vb[i]=GmuP2Vertex(&c,i);
+                    assert(fnv(ib,114)==k[5]); assert(fnv(vb,96)==k[6]);
+                    assert(c.Size<=GMU_P2_CHUNK_MAX && !(c.Off&255) && c.Na+c.Nb==k[3]-k[2]);
+                }
+                assert(GmuP2F(1)==0x3F800000 && GmuP2F(1080)==0x44870000 && GmuP2F(0)==0 && GmuP2F(22)==0x41B00000 && GmuP2F(1200)==0x44960000);
+                GMU_P2_CHUNK full; GmuP2Layout(&full,0,1080,0,22); assert(full.P==4352 && full.Na==11 && full.Nb==11 && full.Size==0x400+22*4352);
+                assert(((GMU_P2_CHUNK_MAX-0x400)/4352)/2*2==22 && ((GMU_P2_CHUNK_MAX-0x400)/1024)/2*2==94);
+                assert(EpiGmuProbe2Valid(0xBFFFFE80UL,4095) && !EpiGmuProbe2Valid(0xBFFFFE80UL,4094) && !EpiGmuProbe2Valid(0xBFFFFE80UL,8191));
+            }
+            GMU_P2_TRACE q2;
+            std::vector<ULONG> screenSrc(1080*2400);
+            for(ULONG y=0;y<2400;++y) for(ULONG x=0;x<1080;++x) screenSrc[y*1080+x]=0xFF000000UL^(y*2654435761UL+x*40503UL);
+            std::vector<P2ReqRec*> reqs;
+            const auto newReq=[&](ULONG at,std::initializer_list<EPI_P2_RECT> rects)->P2ReqRec* {
+                P2ReqRec* r=new P2ReqRec(); r->AtWait=at; r->Rects=rects; r->Src=reinterpret_cast<const UCHAR*>(screenSrc.data()); r->Pitch=4320;
+                p2Script.push_back(r); reqs.push_back(r); return r;
+            };
+            const auto prepP2=[&](bool withRegion) {
+                prepP1();
+                for(auto* r:reqs) delete r;
+                reqs.clear(); p2Script.clear(); p2Mailbox=nullptr; p2IsOpen=false;
+                p2Opens=p2Closes=p2Disables=p2Presents=p2Fails=p2Cancelled=0; p2CorruptAt=0xFFFFFFFF; p2PixelsDrawn=0;
+                std::fill(fbShim.begin(),fbShim.end(),0);
+                if(withRegion) { assert(GmuP2Plan(&probe)); GMU_REGION* r=GmuFind(&probe,0x72000000,0x9E4000); assert(r && r->External && r->Pa.QuadPart==0xE1000000); r->Mapped=true; }
+                GmuP2TraceInit(&q2);
+            };
+            const auto runP2=[&]() {const NTSTATUS r=GmuP1Run(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&p1,&hwork,reinterpret_cast<HANDLE>(2),&b1,&q2); p1.Cp.Status=r; return r;};
+            const auto finalP2=[&](ULONG result,bool keep) {GmuP1Final(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),&p1,result,keep ? TRUE : FALSE,&q2);};
+            // The screen must equal what it was when the mailbox opened, with each request's rects replaced by its source.
+            const auto checkScreen=[&](const std::vector<ULONG>& before,std::initializer_list<P2ReqRec*> done) {
+                std::vector<ULONG> want=before;
+                for(P2ReqRec* r:done) for(const auto& rc:r->Rects) for(LONG y=rc.Top;y<rc.Bottom;++y) for(LONG x=rc.Left;x<rc.Right;++x) want[y*1080+x]=screenSrc[y*1080+x];
+                ULONG bad=0; for(size_t i=0;i<want.size();++i) if(fbShim[i]!=want[i]) ++bad;
+                return bad;
+            };
+            // 1) self-test + two presents (odd starts, one pixel, last row, full width): everything exact, Checks 0x3F.
+            prepP2(true); p1StopAfter=8;
+            P2ReqRec* ra=newReq(2,{{5,3,6,4},{100,17,900,40},{0,2399,1080,2400},{1079,0,1080,1},{412,1072,668,1328}});
+            P2ReqRec* rb=newReq(4,{{0,0,1080,2400}});
+            assert(runP2()==0 && q2.Prepared==1 && p2Opens==1 && p2Closes==1);
+            assert(q2.SelfBad[0]==0 && q2.SelfBad[1]==0 && q2.SelfChunks==3 && (q2.Checks&3)==3 && q2.FbIova==0x72000000 && q2.FbSize==0x9E4000 && q2.FbPaLow==0xE1000000 && q2.FbMapped==1);
+            assert(ra->Done && ra->Released && ra->Status==0 && ra->Chunks>=5 && rb->Done && rb->Released && rb->Status==0 && rb->Chunks==110);
+            assert(p2Presents==2 && p2Fails==0 && p2Disables==0 && q2.Requests==2 && q2.MaxChunksInFlight<=2 && q2.MaxChunkBytes<=GMU_P2_CHUNK_MAX);
+            assert(checkScreen(p2FbAtOpen,{ra,rb})==0);
+            assert(p1.Cp.Reason==0); assert(p1.BeatsDone>=1); assert(p1.LiveBytes==1088); assert(p1.RetirePending==0); assert(p1.FailCount==0);
+            finalP2(0,false);
+            assert(q2.Checks==0x3F && q2.State==2 && p1.Checks==0x3F && q2.GpuPresents==2);
+            d1Band=bandBefore; // the desktop presents above drew into the band's rows; later cases start from the original screen
+            // 2) a request that arrives right at the stop is still served (the stop is only seen when no request waits)
+            prepP2(true); p1StopAfter=1; newReq(1,{{300,2000,700,2100}});
+            assert(runP2()==0 && p2Presents==1 && p2Cancelled==0); finalP2(0,false); assert(q2.Checks==0x3F);
+            // 3) self-test mismatch (first step / second step): P-2 is disabled, the session itself carries on, the screen is restored
+            for(ULONG step=0;step<2;++step) {
+                prepP2(true); p1StopAfter=3; p2CorruptAt=step*65536+10; newReq(1,{{0,0,10,10}});
+                assert(runP2()==0 && p2Opens==0 && p2Disables==1 && p2Presents==0 && !(q2.Checks&2) && (q2.Checks&1));
+                assert(q2.SelfBad[step]==1 && q2.FailReason==21 && p1.BeatsDone>=1 && p2Script.size()==1);
+                finalP2(0,false);
+                assert(!(q2.Checks&6) && p1.Checks==0x3F && d1Band==bandBefore);
+            }
+            // 4) no FB region: P-2 off, P-1 intact
+            prepP2(false); p1StopAfter=3;
+            assert(runP2()==0 && p2Opens==0 && p2Disables==1 && q2.FailReason==12 && !(q2.Checks&1) && q2.Prepared==0);
+            finalP2(0,false); assert(p1.Checks==0x3F && !(q2.Checks&7));
+            // 5) the GPU fails during a present: the request is completed with the failure, the session stops with cause 4
+            for(ULONG bad=0;bad<3;++bad) {
+                prepP2(true); p1StopAfter=50; P2ReqRec* r=newReq(1,{{0,0,1080,100}});
+                if(bad==0) p1NoFenceBeat=10;         // seq 6..10 are the five chunks: the last fence never comes (an earlier one would be covered by a later fence)
+                if(bad==1) p1ErrorBeat=6;
+                if(bad==2) p1BadFenceBeat=7;
+                const NTSTATUS st=runP2();
+                assert(!NT_SUCCESS(st) && p1Cause==4 && r->Done && !NT_SUCCESS(r->Status) && p2Fails==1 && p2Presents==0 && q2.FailRequests==1);
+                assert(p2Closes==1 && p2Cancelled==0);
+                assert(p1.Cp.Reason==(bad==0 ? 16UL : bad==1 ? 14UL : 13UL) && r->FailReason==p1.Cp.Reason);
+                finalP2(EPI_GMU_E_CP,false);
+                assert(!(q2.Checks&0x34) && q2.State==2);
+            }
+            // 6) a failing self-test chunk is a GPU failure: the session stops with cause 4 and nothing was opened
+            prepP2(true); p1StopAfter=50; p1ErrorBeat=0;
+            assert(!NT_SUCCESS(runP2()) && p2Opens==0 && p1Cause==4 && q2.FailReason==14); finalP2(EPI_GMU_E_CP,false);
+            assert(d1Band==bandBefore);
+            for(auto* r:reqs) delete r;
+            reqs.clear(); p2Script.clear(); p2Mailbox=nullptr; p2IsOpen=false; allowP1Writes=false; p1Active=false;
             h1Heap=nullptr; h1Active=false; allowH1Writes=false;
             allowQ1Writes=false; q1Active=false;
             allowM1Writes=false; m1Active=false;

@@ -9,6 +9,7 @@
 
 
 #include "BDD.hxx"
+#include "epi_present.hxx"
 
 #pragma code_seg("PAGE")
 
@@ -190,6 +191,9 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
             const ULONG fp = EpiQueryDword(hParams, L"EpiFastPresent", 1);
             g_EpiFastPresent = (fp <= 2) ? fp : 1;
             EpiSetDword(hDiag, L"FastPresent", g_EpiFastPresent);
+            // Device Parameters\EpiGpuPresentVerify: P-2 compares the screen after each GPU present. Default 1.
+            g_EpiGpuPresentVerify = EpiQueryDword(hParams, L"EpiGpuPresentVerify", 1) != 0 ? 1 : 0;
+            EpiSetDword(hDiag, L"GpuPresentVerify", g_EpiGpuPresentVerify);
             ZwClose(hDiag);
             ZwClose(hParams);
         }

@@ -26,11 +26,11 @@
 - Windows Display Driver Model（WDDM）向けのオープンソース Adreno ドライバを作る。
 - 初号ターゲットは SM7325 / Adreno 642L（A6xx 系）とする。手元の実機で観測でき、本線の知見がそのまま効くためである。
 - ユーザーモード側は Vulkan とし、既存の Turnip を再利用する。
-- Direct3D は、Vulkan への変換層である DXVK 経由で受ける。
+- Direct3D は、Vulkan への変換層である DXVK 経由で受ける。（アプリ向け。DWM には上の D3D11 UMD DDI を使う。2026-11-14）
 
 ### 非ゴール
 
-- ネイティブな Direct3D ユーザーモードドライバを新規に開発しない。書くべき新規コードは他に集中させる。
+- ~~ネイティブな Direct3D ユーザーモードドライバを新規に開発しない。~~ 2026-11-14 に見直し：DWM（D3D11 を使い、既定の adapter でしか動かない）を GPU で合成させる目標（G0_GPU_SURVEY §9.21.70 の B）のため、D3D11 の UMD DDI は新規に書く。中身は Turnip（Vulkan）に流し、shader は DXBC → SPIR-V → NIR → ir3 とする。DDI から Vulkan への層以外は、なるべく新規に書かない。
 - Qualcomm のファームウェア blob を再配布しない。ドライバは、利用者が正規に入手した blob を読み込むだけの形にする。
 - 公式ドライバの置き換えを短期に目指さない。本線が公式ドライバの正常化であることと矛盾させない。
 

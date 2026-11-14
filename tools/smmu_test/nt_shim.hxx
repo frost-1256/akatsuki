@@ -57,6 +57,7 @@ inline void* MmAllocateNonCachedMemory(SIZE_T n) {
 inline void MmFreeNonCachedMemory(void* p, SIZE_T) { assert(allocations.erase(p)==1); _aligned_free(p); }
 inline PHYSICAL_ADDRESS MmGetPhysicalAddress(void* p) { return {static_cast<std::int64_t>(allocations.at(p))}; }
 inline void RtlZeroMemory(void* p, SIZE_T n) { std::memset(p,0,n); }
+using LONG_PTR = std::intptr_t;
 inline void KeMemoryBarrier() {}
 static ULONGLONG testInterruptTime=100000;
 inline ULONGLONG KeQueryInterruptTime() {return testInterruptTime;}

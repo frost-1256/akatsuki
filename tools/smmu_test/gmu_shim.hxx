@@ -416,6 +416,35 @@ ULONG EpiGpuSessionCause(VOID) { return p1Cause; }
 VOID EpiGpuSessionSetCause(ULONG Cause) { if(p1Cause==0) p1Cause=Cause; }
 ULONGLONG EpiGpuSessionStopTime(VOID) { return p1StopTime; }
 ULONGLONG EpiGpuSessionReturnTime(VOID) { return p1ReturnTime; }
+// P-2 GPU model: draws a chunk's two passes from the IB it was given (scissor, texture and MRT base are read from the
+// IB and the heap, never assumed). fbShim is the whole screen; the D-1 band mirrors the part of it that it covers.
+static std::vector<ULONG> fbShim(0x9E4000/4,0);
+static ULONG p2PixelsDrawn=0,p2CorruptAt=0xFFFFFFFF;
+inline void P2Render(const ULONG* ib) {
+    for(ULONG pass=0;pass<2;++pass) {
+        const ULONG g0=pass ? 85 : 49;
+        const ULONG tl=ib[g0+1],br=ib[g0+2];
+        assert(ib[g0+4]==tl && ib[g0+5]==br && ib[g0+7]==tl && ib[g0+8]==br && ib[g0+12]==0xC0 && ib[g0+22]==6);
+        const ULONG texAddr=pass ? ib[78+2] : ib[37]; assert((pass ? ib[78+5] : ib[40])==texAddr);
+        const ULONG vbase=ib[g0+10],mrt=ib[g0+17];
+        const ULONG* vb=h1Heap+(vbase-0x70100000)/4;
+        bool degenerate=true; for(ULONG k=1;k<6;++k) if(vb[k*8]!=vb[0] || vb[k*8+1]!=vb[1]) degenerate=false;
+        if(degenerate) continue; // an empty pass: six identical vertices draw nothing
+        const ULONG* tc=h1Heap+(texAddr-0x70100000)/4;
+        const ULONG w=tc[1]&0x7FFF,h=(tc[1]>>15)&0x7FFF,pitch=(tc[2]&0x1FFFFFFF)>>7,base=tc[4];
+        assert(tc[0]==0x0C006880 && (tc[2]>>29)==1 && !(base&63) && !(pitch&63) && pitch>=w*4);
+        const ULONG x0=tl&0xFFFF,y0=tl>>16,x1=br&0xFFFF,y1=br>>16;
+        assert(w==x1-x0+1 && h==y1-y0+1 && (mrt==0x72000000 || mrt==0x720010C0));
+        for(ULONG v=y0;v<=y1;++v) for(ULONG x=x0;x<=x1;++x) {
+            ULONG texel=h1Heap[(base-0x70100000)/4+(v-y0)*pitch/4+(x-x0)];
+            if(p2PixelsDrawn==p2CorruptAt) texel^=1; // injected GPU error
+            const ULONG off=(mrt-0x72000000)+v*8640+x*4;
+            assert(off+4<=0x9E4000);
+            fbShim[off/4]=texel; ++p2PixelsDrawn;
+            if(off>=0x462000 && off<0x582000) d1Band[(off-0x462000)/4]=texel;
+        }
+    }
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -513,6 +542,21 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
         p1Writes.push_back(v); g2Writes.push_back({0x807,v});
         *p=v; gPages[2][0x313]=0;
         ULONG packet[9]; for(ULONG i=0;i<9;++i) packet[i]=g2Ring[(pos+i)%4096];
+        if(packet[3]==0x72) { // P-2 chunk: 114-dword IB inside a 256-aligned heap chunk
+            assert(packet[4]==0x70460004 && packet[5]==4 && packet[6]==0x70100400 && packet[7]==0 && packet[8]==(0xA6000000|n));
+            const ULONG ibOff=packet[1]-0x70100000; assert(packet[1]>=0x70100200 && ibOff>=0x200 && !((ibOff-0x200)&255) && ibOff+456<=0x40000);
+            const ULONG* ib=h1Heap+ibOff/4;
+            for(ULONG i=0;i<114;++i) assert(!(ib[i]>=0x70010000 && ib[i]<0x70018000)); // no stale ring address
+            assert(ib[76]==0xCAFE001B && ib[112]==0xCAFE001C && ib[49+25]==0x70100404 && ib[85+25]==0x70100408);
+            P2Render(ib);
+            h1Heap[0x404/4]=ib[76]; h1Heap[0x408/4]=ib[112];
+            ULONG fence=0xA6000000|n; if(n==p1BackwardsBeat) fence=0xA6000000; if(n==p1BadFenceBeat) fence=0x12340000|n;
+            if(n!=p1NoFenceBeat) h1Heap[0x400/4]=fence;
+            *g2Shadow=target; *GmuCfgReg(0x806)=target; *GmuCfgReg(0x92A)=0;
+            gPages[8][0x210]=1; gPages[8][0x201]=0; gPages[2][0x30C]=0;
+            if(n==p1ErrorBeat) gPages[8][0x201]|=1UL<<9;
+            ++p1Beats; return;
+        }
         assert(packet[0]==0x70BF8003 && packet[2]==0 && packet[3]==6 && packet[4]==0x70460004 && packet[5]==4);
         assert(packet[6]==0x70100400 && packet[7]==0 && packet[8]==(0xA6000000|n));
         const ULONG ib=packet[1]-0x70100000; assert(packet[1]>=0x70100440 && ib+64<=0x40000 && !(ib&63));
@@ -1025,6 +1069,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
     }
+    if(stepName && v==0x2306) d1Restoring=true; // P-2 self-test: the CPU puts the saved screen values back
     if(stepName && v==dropGxAtStep) gPages[1][0xD0]=0xC0;
     if(stepName && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
     diagnostics[name]=v; return 0;

@@ -9,6 +9,7 @@
 \**************************************************************************/
 
 #include "BDD.hxx"
+#include "epi_present.hxx"
 
 typedef struct
 {
@@ -313,6 +314,20 @@ static NTSTATUS EpiFastPresent(BDD_HWBLT* pBlt, BYTE* DstAddr, UINT DstBitPerPix
         }
     }
 
+    // P-2 (epi_present.cxx): hand the present to the GPU session when it can take it. rows maps source row 'top'.
+    const ULONGLONG cpuStart = EpiPresentQpc();
+    ULONG cpuReason = EPI_CPU_NO_SESSION;
+    if (EpiGpuPresentTry(pModeCur, DstAddr, DstBitPerPixel, rows - (SSIZE_T)top * SrcPitch, SrcPitch, NumMoves,
+                         NumDirtyRects, DirtyRect, Rotation, &mdl, &cpuReason))
+    {
+        if (mdl != NULL)
+        {
+            MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+        return STATUS_SUCCESS;
+    }
+
     BLT_INFO DstBltInfo;
     DstBltInfo.pBits = DstAddr;
     DstBltInfo.Pitch = pModeCur->DispInfo.Pitch;
@@ -343,6 +358,7 @@ static NTSTATUS EpiFastPresent(BDD_HWBLT* pBlt, BYTE* DstAddr, UINT DstBitPerPix
         BltBits(&DstBltInfo, &SrcBltInfo, 1, &DirtyRect[i]);
     }
 
+    EpiCpuPresentDone(cpuReason, cpuStart);
     if (mdl != NULL)
     {
         MmUnlockPages(mdl);
