@@ -20,6 +20,9 @@
 
 BOOLEAN g_EpiSoftVsync = TRUE;
 ULONG g_EpiWddmMode = 0;
+ULONG g_EpiWddmProfile = 2;
+ULONG g_EpiWddmVersionOverride = 0;
+ULONG g_EpiWddmDdiVersionOverride = 0;
 
 #pragma code_seg(push)
 #pragma code_seg("PAGE")
@@ -40,6 +43,10 @@ VOID EpiReadDriverSwitches(_In_ PUNICODE_STRING RegistryPath)
     if (NT_SUCCESS(st))
     {
         g_EpiSoftVsync = EpiQueryDword(hKey, L"EpiSoftVsync", 1) != 0 ? TRUE : FALSE;
+        g_EpiWddmProfile = EpiQueryDword(hKey, L"EpiWddmProfile", 2);
+        if (g_EpiWddmProfile > 2) { g_EpiWddmProfile = 2; }
+        g_EpiWddmVersionOverride = EpiQueryDword(hKey, L"EpiWddmVersion", 0);
+        g_EpiWddmDdiVersionOverride = EpiQueryDword(hKey, L"EpiWddmDdiVersion", 0);
         const ULONG mode = EpiQueryDword(hKey, L"EpiWddmMode", 0);
         if (mode == 2)
         {

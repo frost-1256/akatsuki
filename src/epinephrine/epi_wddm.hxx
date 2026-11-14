@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Epinephrine (Akatsuki Project) - W-1: full WDDM 1.3 driver mode (G0_GPU_SURVEY section 9.21.72).
+// Epinephrine (Akatsuki Project) - W-1: full WDDM driver mode (G0_GPU_SURVEY sections 9.21.72 and 9.21.74).
 //
-// Portions of epi_wddm.cxx are derived from the render-only sample (roskmd) in microsoft/graphics-driver-samples
-// (commit de4a216): Copyright (c) Microsoft Corporation, MIT License (full text in LICENSE-ROS-MIT.txt).
+// Portions of epi_wddm.cxx are derived from the render-only sample (roskmd) and the compute-only sample (coskmd)
+// in microsoft/graphics-driver-samples (commit de4a216): Copyright (c) Microsoft Corporation, MIT License (full
+// text in LICENSE-ROS-MIT.txt).
 // The VC4 hardware parts, WPP tracing and power components were removed; the rest was adapted to Epinephrine.
 //
 // Touches no GPU, SMMU or GMU register. The render engine is emulated on the CPU (paging buffers only in W-1a)
@@ -19,10 +20,25 @@
 #define EPI_WDDM_VIDMEM_MAX          (128u * 1024 * 1024)
 #define EPI_WDDM_VIDMEM_MIN          (32u * 1024 * 1024)
 #define EPI_WDDM_DMA_BUFFER_SIZE     PAGE_SIZE
-#define EPI_WDDM_PAGING_BUFFER_SIZE  PAGE_SIZE
+#define EPI_WDDM_PAGING_BUFFER_SIZE  (64u * 1024)    // variable-length records (EPI_PAGING_REC in epi_wddm.cxx)
 #define EPI_WDDM_ALLOCATION_LIST     64
 #define EPI_WDDM_PATCH_LIST          128
 #define EPI_WDDM_QUEUE_LENGTH        64
+
+// Profiles (Services\Epinephrine\EpiWddmProfile, section 9.21.74).
+#define EPI_WDDM_PROFILE_V13         0             // WDDM 1.3 caps, QUERYSEGMENT3 (W-1a plus the ROS DDI table)
+#define EPI_WDDM_PROFILE_V26         1             // WDDM 2.6, QUERYSEGMENT4, physical addressing (as COS ships)
+#define EPI_WDDM_PROFILE_GPUMMU      2             // WDDM 2.6 with GpuMmu emulated by the CPU engine
+
+// Emulated GpuMmu (profile 2). Driver-private page tables: every entry is the DXGK_PTE that VidMm passed, stored
+// as is (16 bytes). This is not the format of the GPU SMMU; the real page tables come with W-3.
+// Level 0 is the leaf, level 2 the root. All levels: 256 entries, one 4 KB page, in system memory (segment 0).
+#define EPI_GPUVA_BITS               36
+#define EPI_PT_LEVELS                3
+#define EPI_PT_INDEX_BITS            8
+#define EPI_PT_ENTRIES               (1u << EPI_PT_INDEX_BITS)
+#define EPI_PT_BYTES                 (EPI_PT_ENTRIES * 16u)
+#define EPI_PAGING_OPS               26            // DXGK_OPERATION_* counted per value (0..25)
 
 // Allocation private data (DXGK_ALLOCATIONINFO.pPrivateDriverData). Written by GetStandardAllocationDriverData;
 // W-1a has no UMD, so every other caller of CreateAllocation is refused.
@@ -67,6 +83,12 @@ enum EPI_WDDM_DDI
     EpiDdiBuildPagingBuffer, EpiDdiPreemptCommand, EpiDdiQueryCurrentFence, EpiDdiResetFromTimeout,
     EpiDdiRestartFromTimeout, EpiDdiEscape, EpiDdiCollectDbgInfo, EpiDdiSetVidPnSourceAddress, EpiDdiSetPalette,
     EpiDdiGetNodeMetadata, EpiDdiRenderKm, EpiDdiCommitVidPn,
+    // W-1b
+    EpiDdiQueryDependentEngineGroup, EpiDdiQueryEngineStatus, EpiDdiResetEngine, EpiDdiCancelCommand,
+    EpiDdiSetPowerComponentFState, EpiDdiPowerRuntimeControlRequest, EpiDdiCalibrateGpuClock,
+    EpiDdiSetStablePowerState, EpiDdiNotifyAcpiEvent, EpiDdiControlEtwLogging, EpiDdiFormatHistoryBuffer,
+    EpiDdiCreateProcess, EpiDdiDestroyProcess, EpiDdiGetRootPageTableSize, EpiDdiSetRootPageTable,
+    EpiDdiSubmitCommandVirtual,
     EpiDdiCount
 };
 
@@ -74,7 +96,7 @@ enum EPI_WDDM_DDI
 // StopDevice. The decoder (tools/decw1.py) must follow this order.
 typedef struct _EPI_WDDM_TRACE
 {
-    ULONG Version;            // 1
+    ULONG Version;            // 6
     ULONG Mode;               // EpiWddmMode used by DriverEntry (1 or 2)
     ULONG StartStatus;        // EpiWddmStart NTSTATUS
     ULONG VidMemBytes;
@@ -92,6 +114,28 @@ typedef struct _EPI_WDDM_TRACE
     ULONG LastSubmitFence, LastDoneFence, DmaCompleted, Preempted, QueueFull, NotifyFail, PrepError, Resets;
     ULONG Flips, FlipNoAlloc, ScanCopies, ScanSkipped, ScanMaxUs, LastFlipSeg, LastFlipAddr;
     ULONG VsyncNotifies;
+    // Version 2 (W-1b)
+    ULONG Profile, WddmVersion;
+    ULONG PreQaiMask;         // bit n: DXGKQAITYPE n (< 32) was asked before StartDevice
+    ULONG PreQaiLast;         // last type asked before StartDevice
+    ULONG QaiMaskHi;          // bit n: DXGKQAITYPE 32 + n was asked
+    ULONG PagingOp[EPI_PAGING_OPS];   // BuildPagingBuffer calls per DXGK_OPERATION_* value
+    ULONG PagingNoSpace;      // STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER returned
+    ULONG ProcLive, ProcMax, RootSets, LastRootSeg, LastRootLow, LastRootHigh;
+    ULONG PtUpdates, PtEntries, PtBad, TlbFlushes;
+    ULONG VaFills, VaFillKb, VaXfers, VaXferKb, VaWalkFail, VaMapFail, LastWalkVaLow, LastWalkVaHigh, LastWalkLevel;
+    ULONG EngineResets, SubmitVirtualPaging;
+    // Version 3 (section 9.21.75)
+    ULONG DdiVersion;         // DRIVER_INITIALIZATION_DATA Version given to DxgkInitialize
+    // Version 4
+    ULONG DriverCapsSize, GpuMmuCapsSize;   // OutputDataSize of the last DRIVERCAPS / GPUMMUCAPS query
+    // Version 5 (section 9.21.76): paging buffer bookkeeping
+    ULONG PagingFresh, PagingFreshSize, PagingPrivBad;  // new paging buffers, last DmaSize of one, bad private data
+    ULONG SubmitPrivSize, SubmitPrivBad;                 // last submit private data size, submits without our info
+    ULONG RunFailWhy;         // OR of 1 kind, 2 no buffer, 4 end > size, 8 start not aligned
+    ULONG RunFailKind, RunFailSize, RunFailStart, RunFailEnd;
+    // Version 6 (section 9.21.77): paging buffers found by GPU VA
+    ULONG PagingVaRecords, PagingVaHits, PagingVaMiss, LastPagingGvaLow, LastPagingGvaHigh;
 } EPI_WDDM_TRACE;
 
 typedef struct _EPI_WDDM EPI_WDDM;

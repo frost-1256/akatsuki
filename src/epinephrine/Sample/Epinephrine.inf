@@ -30,6 +30,13 @@ Epinephrine.sys = 1
 
 [Epinephrine_Inst]
 CopyFiles = Epinephrine.Files
+AddReg = Epinephrine_Inst.AddReg
+
+; The full WDDM mode (EpiWddmMode) needs a user-mode driver name: without it dxgkrnl fails the adapter with
+; Code 43 right after DRIVERCAPS (G0_GPU_SURVEY section 9.21.76). The display-only mode ignores it.
+; epiumd.dll does not exist yet (W-1 has no UMD).
+[Epinephrine_Inst.AddReg]
+HKR,,UserModeDriverName,%REG_MULTI_SZ%,epiumd.dll,epiumd.dll,epiumd.dll,epiumd.dll
 
 [Epinephrine_Inst.Services]
 AddService = Epinephrine, 0x00000002, Epinephrine_Service_Inst, Epinephrine_EventLog_Inst
@@ -60,3 +67,4 @@ SERVICE_DEMAND_START  = 0x3
 SERVICE_ERROR_IGNORE  = 0x0
 REG_EXPAND_SZ = 0x00020000
 REG_DWORD     = 0x00010001
+REG_MULTI_SZ  = 0x00010000

@@ -6696,6 +6696,205 @@ v34-akat で再起動した後、v85（20.0.2.85）を配置し、Probe 0xBFFFFE
 - (b) W-2（WDDM 2.x、GpuMmu）を前倒しして、W-1 と一緒にする。Turnip は GPU の VA を前提にしているので、いずれ必要になる。
 - (c) 完全な driver の部分だけを WDDM 1.3 で動かす（DOD の新しい機能を条件付きにするか、別の sys にする）。
 
+### 9.21.74 W-1b：必須の DDI を揃え、WDDM 2.6 と GpuMmu（CPU で真似る）を加える（文章仕様、v87）
+
+**目的：** v86 で dxgkrnl が DRIVERCAPS の直後に止めた原因を切り分ける。そのうえで、W-2（WDDM 2.x、GpuMmu）を W-1 と一緒に進める（ユーザーの決定、候補 (b)）。W-1b でも GPU のハードウェアには触らない。
+
+**v86 のあとに分かったこと：**
+- ROS（roskmd）は、WDDMVersion を 1.3 と宣言していても、次の DDI をすべて登録していた。W-1a ではこれらを落としていた。
+  - 対象：QueryDependentEngineGroup、QueryEngineStatus、ResetEngine、CancelCommand、SetPowerComponentFState、PowerRuntimeControlRequest、SubmitCommandVirtual、CreateProcess、DestroyProcess、CalibrateGpuClock、SetStablePowerState、NotifyAcpiEvent、ControlEtwLogging。
+  - DRIVERCAPS で `SupportPerEngineTDR` = 1 も立てていた。
+- 同じ repo（MIT）の compute-only-sample（COS、coskmd）は、出荷時の設定では GPU の VA を使っていない（`COS_GPUVA_SUPPORT` = 0）。DDI の version を WDDM 2.6、WDDMVersion を 2.6 とし、segment を QUERYSEGMENT4 で報告している。
+  - したがって「WDDM 2 以降は GPU の VA が必須」という §9.21.73 の見立ては、たぶん違う。
+  - COS の GPU VA の部分（`COS_GPUVA_SUPPORT` = 1）は中身のない stub で、PTE の walk も実装されていない。形だけを手本にする。
+- MCDM の実装の指針（learn.microsoft.com）の必須の DDI の一覧も、ROS の表とほぼ同じである。
+- `DXGKQAITYPE_WDDMDEVICECAPS` は、AddDevice のあと、StartDevice の前に問われる。W-1a は StartDevice の前の QueryAdapterInfo をすべて `STATUS_DEVICE_NOT_READY` で返し、trace にも残していなかった。
+- 有力な原因は、必須の DDI が欠けていたこと（dxgkrnl は DDI の表を DRIVERCAPS のあとで確かめる、と考える）。WDDMVERSION と DDI の version の組み合わせのほうは、可能性が下がった。
+
+**切り替え：** service の `EpiWddmProfile`（DWORD、既定 2）。DriverEntry で読み、mode 1 / 2 のときだけ使う。
+
+| profile | WDDMVersion | segment の報告 | GPU の VA | 確かめること |
+|---|---|---|---|---|
+| 0 | 1.3 | QUERYSEGMENT3（W-1a と同じ） | なし | ROS と同じ DDI の表で、v86 の失敗が消えるか |
+| 1 | 2.6 | QUERYSEGMENT4 | なし（COS と同じ） | WDDM 2.6 の物理アドレスの形が通るか |
+| 2 | 2.6 | QUERYSEGMENT4 | GpuMmu（CPU で真似る） | W-2 の形が通るか |
+
+- `EpiWddmVersion`（DWORD、既定 0）が 0 でなければ、profile の WDDMVersion をその値で置き換える（例：0x2000 = 2.0）。build し直さずに試すためである。
+- 実機では、profile 2 → だめなら 0 → 1 の順に、一回だけの mode 2 で試す。
+
+**DDI（すべての profile）：**
+- ROS が登録していて W-1a が落とした DDI を、ROS と同じ意味で足す。
+  - QueryDependentEngineGroup：mask 0（ROS と同じ）。
+  - QueryEngineStatus：Responsive = 1。
+  - ResetEngine：queue を捨てる（ResetFromTimeout と同じ）。`LastAbortedFenceId` は最後に積んだ fence、完了の fence もそれにそろえる（COS と同じ）。
+  - CancelCommand：`STATUS_NOT_IMPLEMENTED`（`CancelCommandAware` は立てないので呼ばれない）。
+  - SetPowerComponentFState、PowerRuntimeControlRequest：電源の component は 0 個なので、呼ばれたら数えて `STATUS_SUCCESS` / `STATUS_NOT_SUPPORTED` を返す。
+  - CalibrateGpuClock：GPU の clock を CPU の QPC とする（GpuFrequency = QPC の周波数、両方の counter = QPC）。
+  - SetStablePowerState：何もしない。
+  - NotifyAcpiEvent：`AcpiFlags` = 0 で成功を返す。ControlEtwLogging：何もしない。
+- DRIVERCAPS に `SupportPerEngineTDR` = 1 を足す。
+- QueryAdapterInfo は、StartDevice の前でも `DXGKQAITYPE_WDDMDEVICECAPS` に答える（profile の WDDMVersion）。ほかの型は、StartDevice の前は `STATUS_NOT_SUPPORTED` を返す。StartDevice の前に問われた型は global に記録し、StartDevice で trace に移す。
+
+**DDI（profile 1 / 2）：**
+- QUERYSEGMENT4：segment は W-1a と同じ 2 つ（1 = aperture、2 = video memory）。`PagingBufferSegmentId` = 0（物理的に連続した system memory、COS と同じ）。descriptor の間隔は `SegmentDescriptorStride`（0 なら構造体の大きさ）。
+- NUMPOWERCOMPONENTS：0。
+- FormatHistoryBuffer：history buffer を書かないので `STATUS_NOT_SUPPORTED`（呼ばれたら数える）。
+
+**GpuMmu（profile 2）：**
+- caps：DRIVERCAPS の `MemoryManagementCaps.VirtualAddressingSupported` = 1、`GpuMmuSupported` = 1。GetNodeMetadata の `GpuMmuSupported` = TRUE。
+- DDI：CreateProcess / DestroyProcess（小さな object を作るだけ）、GetRootPageTableSize、SetRootPageTable、SubmitCommandVirtual。
+- GPUMMUCAPS：
+  - `PageTableUpdateMode` = CPU_VIRTUAL。
+  - `VirtualAddressBitCount` = 36、`PageTableLevelCount` = 3。
+  - flag は `CacheCoherentMemorySupported` だけ。`LeafPageTableSizeFor64KPagesInBytes` = 0（64 KB の page は使わない）。
+- PAGETABLELEVELDESC：
+  - level 0 が leaf、level 2 が root（WDK の説明のとおり）。
+  - 3 段とも、index は 8 bit（256 個）、page table は 4 KB、alignment は 4 KB。
+  - 置き場所は segment 0（system memory）。CPU_VIRTUAL では local の segment に置けず、system memory の page table は 4 KB までと決まっているためである。
+- **page table の中身は、driver だけが使う形にする。** 各 entry には、VidMm から渡された `DXGK_PTE`（16 byte）をそのまま書く。これは GPU の SMMU の形式ではない。W-3 で実の SMMU の page table に替えるときの形式と書き方は、ユーザーが決めて書く。
+- UPDATE_PAGE_TABLE：
+  - BuildPagingBuffer の中で、`PageTableAddress.CpuVirtual` に CPU で書く（COS と同じ）。
+  - `Repeat` のときは、同じ entry を繰り返して書く。
+  - 範囲は `StartIndex` + `NumPageTableEntries` ≤ 256 を確かめる。
+- FLUSH_TLB：TLB はないので数えるだけ。
+- VIRTUAL_FILL、VIRTUAL_TRANSFER：
+  - paging buffer に記録し、worker で実行する。
+  - GPU の VA は、submit した context の root（SetRootPageTable で記録したもの）から CPU で引く。
+  - entry の segment ごとの扱い：
+    - segment 0：system memory の PFN。
+    - segment 1（aperture）：W-1a の aperture の表で PFN に直す。
+    - segment 2（video memory）：video memory の先頭からの offset。
+  - system memory の page と page table は、1 page の MDL に PFN を入れて、その都度 map する。
+  - 引けない entry（Valid でないなど）は `PagingError` と `VaWalkFail` に数え、その操作をやめる。
+- COPY_PAGE_TABLE_ENTRIES、NOTIFY_RESIDENCY、UPDATE_CONTEXT_ALLOCATION、SIGNAL_MONITORED_FENCE、そのほかの操作：W-1b では数えるだけ（UMD がないので起きない見込み）。
+- SubmitCommandVirtual：
+  - SubmitCommand と同じ queue に積む（private data に CPU の address がある paging buffer は実行する）。
+  - UMD の DMA buffer は、W-1a と同じく何もせずに完了する。
+
+**診断（trace の version 2）：** decw1.py も version 2 に合わせる。追加する項目は次のとおり。
+- profile、WDDMVersion。
+- StartDevice の前に問われた QAI の型の mask。
+- 32 以上の QAI の型の mask。
+- 新しい DDI の回数。
+- paging の操作ごとの回数（0〜25）。
+- GpuMmu の数：process の数、root の設定、page table の更新と entry の数、TLB の flush、VA の walk の失敗、VIRTUAL_FILL / TRANSFER で動かした byte 数。
+
+**判定：** §9.21.72 の bit0〜bit5 に、次の 2 つを足す。
+- bit6：profile 2 で GPUMMUCAPS と PAGETABLELEVELDESC が問われた。
+- bit7：page table の更新が 1 回以上あり、VA の walk の失敗が 0。
+
+**危険：**
+- system memory の PFN を MDL で map するのは、VidMm がその page を lock している間だけ正しい。VidMm の決まりでは、page table と resident の allocation は paging の操作の間は lock されている。
+- 間違った PTE を引いても、map するのは RAM の PFN だけで、GPU の register には触らない。
+- 戻し方は W-1a と同じ（`EpiWddmMode` は一回だけで、自動で 0 に戻る）。
+
+**分担：** DXGK の側だけなので、私が書く。SMMU / GMU / GX / CP には触らない。
+
+### 9.21.75 v87 の結果と、DDI の interface version を下げる（v88）
+
+**v87（W-1b）の結果（2026-11-14）：**
+- DOD の戻り：v87 の DOD は正常。三回の試験のあとも、`-Action off` で DOD に戻った。
+- profile 2 → 0 → 1 の順に、一回だけの mode 2 で試した。三つとも同じ止まり方になった。
+  - DriverEntry と StartDevice は成功（WddmStartStatus 0、video memory 128 MB）。
+  - StartDevice の前に問われた QAI の型：`WDDMDEVICECAPS`（29）と、最後に `PHYSICAL_MEMORY_CAPS`（34）。34 には `STATUS_NOT_SUPPORTED` を返した。
+  - StartDevice のあと、dxgkrnl が問うたのは DRIVERCAPS の一回だけ。そのあと Code 43（`CM_PROB_FAILED_POST_START`）になった。
+  - ほかの DDI は一度も呼ばれなかった。Checks 0x13。
+- したがって、足りない DDI（§9.21.74 の第一の見立て）も、WDDMVersion（1.3 / 2.6）も、原因ではなかった。
+
+**次の見立て：**
+- `DRIVER_INITIALIZATION_DATA.Version` に、build の最新（`DXGKDDI_INTERFACE_VERSION` = WDDM 3.2 = 0x11008）を渡していた。
+- ROS は WDDM 1.3（0x4002）を、COS は WDDM 2.6（0xB004）を渡している。
+- DRIVERCAPS の中身は ROS とほぼ同じなので、dxgkrnl は DRIVERCAPS のあとで、interface version 3.2 の full driver に要る何かを確かめて落としている、と考える。
+
+**変更（v88）：**
+- DxgkInitialize に渡す version を profile で決める。profile 0 は 0x4002、profile 1 と 2 は 0xB004。
+- service の `EpiWddmDdiVersion`（DWORD、既定 0）が 0 でなければ、その値で置き換える。
+- 構造体は build の最新の形のままである。dxgkrnl は渡された version の範囲しか読まないので、それより新しい DDI の欄は無視される。
+- driver が使う DXGKRNL の callback は、どれも WDDM 1.2 からあるもの（`DxgkCbAcquirePostDisplayOwnership` など）なので、低い version でも呼べる。
+- trace の version を 3 にし、最後に `DdiVersion` を足した。decw1.py も合わせた。
+
+**実機：** profile 2 → 0 → 1 の順に、v87 と同じ手順で試す（GX は点けないので再起動は要らない）。
+
+**v88 の結果（profile 2）と v89：**
+- interface version を 0xB004 にすると、StartDevice の前に問われる型は `WDDMDEVICECAPS` だけになった（34 は WDDM 2.9 からの型なので問われない）。
+- DRIVERCAPS は、こちらが `STATUS_BUFFER_TOO_SMALL` を返して失敗した。
+  - dxgkrnl は、渡した interface version のときの `DXGK_DRIVERCAPS` の大きさで問う。
+  - driver は build の最新（3.2）の大きさを要求していた。
+- v86 / v87 では DRIVERCAPS は成功していた。つまり 3.2 のときは、DRIVERCAPS のあとの別の確かめで落ちていた。interface version を下げたことで、dxgkrnl の進み方は変わった。
+- v89：DRIVERCAPS と GPUMMUCAPS は、手元の構造体を埋めてから、問われた大きさの分だけ写す。最小の大きさは、それぞれ `WDDMVersion`、`PageTableLevelCount` の欄までとする。
+- 問われた大きさを trace に残す（trace の version 4、`DriverCapsSize` と `GpuMmuCapsSize`）。
+
+### 9.21.76 v89 の結果と、UMD の名前で adapter が起きた（v90）
+
+**v89 の結果（2026-11-14）：**
+- DRIVERCAPS は三つの profile とも成功した。問われた大きさは、profile 0 が 552 byte、profile 1 / 2 が 584 byte。
+- それでも、その直後に Code 43 になった。driver の DDI はほかに一つも呼ばれず、DxgKrnl-Admin と System のイベントログにも記録はなかった。
+
+**原因：UMD の名前がなかった。**
+- ROS と COS の INF は、どちらも `HKR,,UserModeDriverName,%REG_MULTI_SZ%,…`（4 つ）を書いている。Epinephrine の INF は DOD 用なので、この値がなかった。
+- phone の driver の software key（`Control\Class\{4d36e968-…}\0001`）に、まだない仮の名前 `epiumd.dll` を 4 つ手で足した。そのうえで profile 2 を一回試すと、device は OK のまま起きた。
+- そのとき dxgkrnl がしたこと：
+  - QAI を 15 回問うた。型は DRIVERCAPS、HISTORYBUFFERPRECISION、QUERYSEGMENT4、GPUMMUCAPS（大きさ 24）、PAGETABLELEVELDESC、PHYSICALADAPTERCAPS、DISPLAY_DRIVERCAPS_EXTENSION、QUERYCOLORIMETRYOVERRIDES、DISPLAYID_DESCRIPTOR、ADAPTERPERFDATA_CAPS、GPUVERSION、47。答えなかった型は 6 回。
+  - DDI の呼び出し：GetNodeMetadata、CreateDevice / DestroyDevice（2 回）、CreateContext、CreateProcess、SetRootPageTable（1 回、segment 0）、UPDATE_PAGE_TABLE（67 回）、SubmitCommandVirtual（32 回、すべて paging）。
+  - fence は 32 個とも返った（LastSubmitFence = LastDoneFence = 32）。
+  - CommitVidPn は呼ばれず、表示は Basic Display のままだった。DWM は再起動しなかった。
+  - Checks 0xC3（bit0、bit1、bit6、bit7）。
+- 問題：paging buffer は 32 個とも、worker の最初の確かめで `PagingError` になった。page table の更新は一つも実行されていない（PtEntries 0）。bit7 は PtUpdates を数えただけで立ったので、当てにならない。
+  - 見立て：paging buffer が新しいかどうかを `DmaSize` == PagingBufferSize だけで見ていた（ROS と同じ）。WDDM 2 の VidMm が別の大きさを渡すと、private data に buffer の記録が残らない。
+- `-Action off` で DOD に戻った。値を足したままでも DOD は正常だった。
+
+**変更（v90）：**
+- INF：`Epinephrine_Inst` の AddReg に `UserModeDriverName`（`epiumd.dll` を 4 つ）を足した。DOD のときは使われない。UMD はまだないので、DLL の中身は W-3 以降の作業になる。
+- BuildPagingBuffer：次のどれかのとき、新しい buffer として記録する。
+  - `DmaSize` == PagingBufferSize。
+  - private data の magic、または種類が paging でない。
+  - 今の位置が、記録された buffer の範囲の外にある。
+- trace の version 5：新しい paging buffer の数とそのときの `DmaSize`、private data が使えなかった回数、submit の private data の大きさ、worker が buffer を捨てた理由（bit：1 種類、2 buffer なし、4 終わりが大きさを超える、8 始まりの揃え）とその値。
+- 判定：bit7 は、`PtEntries` > 0 も条件に加える（decw1.py）。
+
+**実機：** profile 2 を一回だけ試し、DOD に戻す。
+
+### 9.21.77 v90 の結果と、paging buffer を GPU の VA で探す（v91）
+
+**v90 の結果（2026-11-14、profile 2、INF の `UserModeDriverName` 入り）：**
+- adapter は v89 の手での試験と同じく起きた（DDI の呼び出しの回数も同じ）。
+- 新しい paging buffer は 2 回記録された（そのときの `DmaSize` は 65536）。private data が使えなかった回数は 0。
+- しかし SubmitCommandVirtual の paging の submit は 32 回とも、private data の大きさが 0 だった（`SubmitPrivSize` 0、`SubmitPrivBad` 32）。
+  - worker が buffer を捨てた理由は 1 + 2 + 4（種類、buffer なし、大きさ）。最後の submit の大きさは 9840 byte。
+- つまり WDDM 2 では、paging buffer の private data は BuildPagingBuffer には渡るが、submit には渡らない。v90 の「新しい buffer の見分け方」は原因ではなかった（直したこと自体は残す）。
+
+**変更（v91）：**
+- BuildPagingBuffer の引数には、paging buffer の始まりの GPU の VA（`DmaBufferGpuVirtualAddress`）と、今の書き込み位置（`DmaBufferWriteOffset`）がある。
+- そこで、呼ばれるたびに「GPU の VA → CPU の address、大きさ」を adapter の小さな表（8 個、`QueueLock` で守る）に残す。
+  - CPU の始まり = `pDmaBuffer` − `DmaBufferWriteOffset`。
+  - 大きさ = `DmaBufferWriteOffset` + `DmaSize`。どちらも PagingBufferSize（64 KB）を超えないときだけ残す。
+- SubmitCommandVirtual の paging の submit で private data がないときは、`DmaBufferVirtualAddress` を含む buffer を表から探す。
+  - submit の範囲 = その VA からの offset から、`DmaBufferSize` byte。
+- page table は、v90 までと同じく paging buffer の記録を worker が順に実行して書く。paging buffer は CPU の address で読むので、page table を引く必要はない。
+- trace の version 6：表に残した数、見つかった数、見つからなかった数、最後の paging の submit の GPU の VA。
+
+**実機：** profile 2 を一回だけ試し、DOD に戻す。
+
+**v91 の結果と v92：**
+- DDI の呼び出しの回数は v90 と同じだった。ただし、表に一つも残らなかった（`PagingVaRecords` 0、`PagingVaMiss` 32）。
+- 最後の paging の submit の `DmaBufferVirtualAddress` は 0x5D0 だった。segment 0 の paging buffer には GPU の VA がない。そのため BuildPagingBuffer の `DmaBufferGpuVirtualAddress` は 0 で、submit の VA は buffer の中の offset になる、と読める。v91 は VA が 0 のときに表へ残さなかった。
+- 今回は 40 秒の待ちのあと、device が Code 43 になっていた（v90 は OK のままだった）。いつ変わったかは分からない。DxgKrnl-Admin のログに新しい記録はなかった。
+- v92：VA が 0 でも表に残す（VA 0 の項目は、最後に BuildPagingBuffer が書いた buffer を指す）。run_w1.ps1 は、待ちのあいだ 5 秒ごとに device の状態を見て、変わった時刻を表示する。
+
+**v92 の結果（2026-11-14、profile 2）：paging と GpuMmu の CPU での真似が動いた。**
+- device は 60 秒のあいだ OK のままだった（5 秒ごとの状態は、ずっと OK）。
+- paging buffer は 32 個とも、GPU の VA 0 の項目から見つかって実行された（`PagingVaHits` 32、`PagingBuffers` 32、`PagingError` 0）。
+  - submit の private data の大きさは 24（表から作ったもの）。
+- page table の更新は 67 回で、entry を 8736 個書いた（`PtBad` 0）。
+- fence は 32 個とも返った。Reset、QueueFull、NotifyFail はどれも 0。
+- Checks 0xD3（bit0、bit1、bit4、bit6、bit7）。bit2 と bit3（CommitVidPn、primary、present）は 0。
+- まだ起きていないこと：
+  - CommitVidPn、CreateAllocation、Present が一度も呼ばれない。表示は Basic Display（DOD）のままで、DWM は動かない。
+  - CreateDevice / DestroyDevice が 2 回ずつあり、どちらもすぐ壊された。UMD（`epiumd.dll`）がないので、D3D の device を作れずに閉じた、と考える。
+  - VIRTUAL_FILL / VIRTUAL_TRANSFER は来ない（allocation がまだないため）。
+- `-Action off` で DOD に戻った。
+- 次：表示の側で、どこまで進んで止まるかを調べる。QueryChildRelations、QueryChildStatus、IsSupportedVidPn、RecommendFunctionalVidPn などの表示の DDI の回数を trace に足す。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

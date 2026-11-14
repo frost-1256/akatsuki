@@ -71,6 +71,14 @@ extern BOOLEAN g_EpiSoftVsync;
 // value to 0 and flushes it before registering, so a crash in full mode comes back as the display-only driver).
 // Full mode forces g_EpiSoftVsync and reports DXGK_INTERRUPT_CRTC_VSYNC instead of DISPLAYONLY_VSYNC.
 extern ULONG g_EpiWddmMode;
+// W-1b (section 9.21.74), same key, used only when g_EpiWddmMode != 0. EpiWddmProfile (DWORD, default 2):
+// 0 = WDDM 1.3 caps, 1 = WDDM 2.6 physical addressing, 2 = WDDM 2.6 with GpuMmu emulated on the CPU.
+// EpiWddmVersion (DWORD, default 0): when not 0, replaces the WDDMVersion of the profile.
+// EpiWddmDdiVersion (DWORD, default 0, section 9.21.75): when not 0, replaces the DRIVER_INITIALIZATION_DATA
+// Version of the profile (profile 0: WDDM 1.3 = 0x4002, profiles 1 and 2: WDDM 2.6 = 0xB004).
+extern ULONG g_EpiWddmProfile;
+extern ULONG g_EpiWddmVersionOverride;
+extern ULONG g_EpiWddmDdiVersionOverride;
 _IRQL_requires_(PASSIVE_LEVEL) VOID EpiReadDriverSwitches(_In_ PUNICODE_STRING RegistryPath);
 
 // StartDevice / StopDevice (PASSIVE). HwMode maps INTF1 read-write; otherwise read-only and nothing is written.
