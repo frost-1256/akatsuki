@@ -8,6 +8,7 @@
 \**************************************************************************/
 
 #include "BDD.hxx"
+#include "epi_wddm.hxx"
 
 
 #pragma code_seg(push)
@@ -65,6 +66,11 @@ DriverEntry(
     // Epinephrine (WP2b-3b): VSync control. Registering these makes dxgkrnl expect VSync notifications and real
     // target-mode frequencies; Services\Epinephrine\EpiSoftVsync=0 keeps the plain KMDOD behaviour.
     EpiReadDriverSwitches(pRegistryPath);
+    if (g_EpiWddmMode != 0)
+    {
+        // W-1 (G0_GPU_SURVEY section 9.21.72): register as a full WDDM driver instead (epi_wddm.cxx).
+        return EpiWddmDriverEntry(pDriverObject, pRegistryPath);
+    }
     if (g_EpiSoftVsync)
     {
         InitialData.DxgkDdiControlInterrupt         = BddDdiControlInterrupt;

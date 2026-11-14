@@ -19,6 +19,7 @@
 #include "epi_vsync.hxx"
 
 BOOLEAN g_EpiSoftVsync = TRUE;
+ULONG g_EpiWddmMode = 0;
 
 #pragma code_seg(push)
 #pragma code_seg("PAGE")
@@ -29,10 +30,34 @@ VOID EpiReadDriverSwitches(_In_ PUNICODE_STRING RegistryPath)
     OBJECT_ATTRIBUTES oa;
     InitializeObjectAttributes(&oa, RegistryPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     HANDLE hKey = NULL;
-    if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_READ, &oa)))
+    BOOLEAN canWrite = TRUE;
+    NTSTATUS st = ZwOpenKey(&hKey, KEY_READ | KEY_SET_VALUE, &oa);
+    if (!NT_SUCCESS(st))
+    {
+        canWrite = FALSE;
+        st = ZwOpenKey(&hKey, KEY_READ, &oa);
+    }
+    if (NT_SUCCESS(st))
     {
         g_EpiSoftVsync = EpiQueryDword(hKey, L"EpiSoftVsync", 1) != 0 ? TRUE : FALSE;
+        const ULONG mode = EpiQueryDword(hKey, L"EpiWddmMode", 0);
+        if (mode == 2)
+        {
+            // One shot: only when the reset is on disk (otherwise a crash could repeat at every boot).
+            if (canWrite && NT_SUCCESS(EpiSetDword(hKey, L"EpiWddmMode", 0)) && NT_SUCCESS(ZwFlushKey(hKey)))
+            {
+                g_EpiWddmMode = 2;
+            }
+        }
+        else if (mode == 1)
+        {
+            g_EpiWddmMode = 1;
+        }
         ZwClose(hKey);
+    }
+    if (g_EpiWddmMode != 0)
+    {
+        g_EpiSoftVsync = TRUE;   // a full driver must report VSync (and the modes then carry real frequencies)
     }
 }
 
@@ -46,8 +71,18 @@ static __forceinline VOID EpiWr(volatile ULONG* Base, ULONG Off, ULONG V) { WRIT
 static VOID EpiReportVsync(_In_ EPI_VSYNC* v)   // at DIRQL (ISR or synchronize routine)
 {
     DXGKARGCB_NOTIFY_INTERRUPT_DATA n = {};
-    n.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
-    n.DisplayOnlyVsync.VidPnTargetId = v->TargetId;
+    if (g_EpiWddmMode != 0)
+    {
+        // Full driver: the flip whose primary is at CrtcAddress is on the screen (epi_wddm.cxx CPU scanout).
+        n.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
+        n.CrtcVsync.VidPnTargetId = v->TargetId;
+        n.CrtcVsync.PhysicalAddress.QuadPart = InterlockedCompareExchange64(&v->CrtcAddress, 0, 0);
+    }
+    else
+    {
+        n.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+        n.DisplayOnlyVsync.VidPnTargetId = v->TargetId;
+    }
     v->Dxgk->DxgkCbNotifyInterrupt(v->Dxgk->DeviceHandle, &n);
     v->Dxgk->DxgkCbQueueDpc(v->Dxgk->DeviceHandle);
     InterlockedIncrement(&v->Notifies);

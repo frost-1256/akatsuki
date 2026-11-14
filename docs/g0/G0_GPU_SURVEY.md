@@ -6548,6 +6548,154 @@ v34-akat で再起動した後、v85（20.0.2.85）を配置し、Probe 0xBFFFFE
 
 **次：** P-2 で段階 3 の present の接続は終わり。目標 B の W-1（完全な WDDM driver への作り替え）の仕様に進む。
 
+#### 9.21.72 W-1：DOD を完全な WDDM driver に作り替える（W-1a 実装済み、v86、実機の結果は 9.21.73）
+
+**目的：** Epinephrine を、表示専用（`DxgkInitializeDisplayOnlyDriver`）から、表示と描画を持つ完全な WDDM driver（`DxgkInitialize`）に作り替える。W-1 では GPU のハードウェアに触らない。
+
+- 描画の engine は CPU で真似る（W-1a では paging buffer だけを CPU で実行する）。
+- 表示は、いまと同じく UEFI が用意した画面（PA 0xE1000000）に CPU で写す。flip を受けたら primary を画面に写す（CPU scanout）。
+- W-1 で確かめたいのは次の 3 つ：
+  - dxgkrnl が Epinephrine を完全な driver として受け入れること。
+  - UMD がない状態で Windows（特に DWM）がどう振る舞うか。
+  - 失敗したときに、いつでも DOD に戻せること。
+- GPU（P-1 / P-2 の session）は、W-3 で engine を CP に差し替えるまで、完全な driver の側では使わない。
+
+**手本：** Microsoft の graphics-driver-samples の render-only-sample（ROS、MIT、Microsoft 著作、commit de4a216）の `roskmd` から、DDI の形を取り込んだ（ユーザーの決定「コードを取り込む」）。
+
+- 取り込んだもの：DDI の表、QueryAdapterInfo の caps と segment、device / context / allocation、BuildPagingBuffer の記録の形、DMA の完了通知の形。
+- 取り除いたもの：VC4 のハードウェア、WPP の trace、ACPI と電源の component、表示の部分（Vc4Display）。
+- 出自は `src/epinephrine/UPSTREAM.md`、全文は `LICENSE-ROS-MIT.txt`。
+- 新しいファイルは `epi_wddm.cxx` / `epi_wddm.hxx`。
+
+**切り替え（DOD に戻す道を残す）：**
+- DriverEntry で、service の key（`Services\Epinephrine`、`EpiSoftVsync` と同じ key）の `EpiWddmMode`（DWORD、既定 0）を読む。
+  - 0：いまの DOD（`DxgkInitializeDisplayOnlyDriver`）。
+  - 1：完全な driver（`DxgkInitialize`）。次の読み込みでも完全な driver のまま。
+  - 2：今回の読み込みだけ完全な driver。DriverEntry が値を 0 に戻し、`ZwFlushKey` で disk に書いてから登録する。0 に戻せなかったときは DOD として登録する。
+- 2 を使うので、完全な driver で bugcheck（0x119 など）が起きても、次の起動は DOD になる（起動の繰り返しを防ぐ）。
+- 完全な driver では VSync が必須なので、`EpiSoftVsync` を強制的に 1 にする（mode の周波数もそれに従う、bdd_dmm.cxx の規則）。
+- 同じ sys で両方を持つ。表示の DDI（VidPN、mode、child、電源）の実装は共通にする。
+- 完全な driver では EpiGpuProbe（GPU の session）を呼ばない。
+
+**DDI：**
+- **DOD から引き継ぐもの（同じ関数）：** AddDevice、StartDevice、StopDevice、RemoveDevice、DispatchIoRequest、InterruptRoutine、DpcRoutine、QueryChildRelations、QueryChildStatus、QueryDeviceDescriptor、SetPowerState、ResetDevice、Unload、QueryInterface、ControlInterrupt、SetPointerPosition、SetPointerShape、IsSupportedVidPn、RecommendFunctionalVidPn、EnumVidPnCofuncModality、SetVidPnSourceVisibility、UpdateActiveVidPnPresentPath、RecommendMonitorModes、GetScanLine、QueryVidPnHWCapability、StopDeviceAndReleasePostDisplayOwnership、SystemDisplayEnable、SystemDisplayWrite。
+  - ControlInterrupt は、完全な driver では `DXGK_INTERRUPT_CRTC_VSYNC` を受け付ける（DOD では DISPLAYONLY_VSYNC）。
+  - VSync の報告（SW / HW VSync とも）は、完全な driver では `DXGK_INTERRUPT_CRTC_VSYNC` で、PhysicalAddress に「画面に写し終えた primary の address」を入れる。
+- **包むもの：** CommitVidPn。DOD の CommitVidPn を呼ぶ前後で、CPU scanout と同じ lock（ScanLock）を取る（commit が画面の map を外して付け直すため）。
+- **新しく持つもの（epi_wddm.cxx）：** QueryAdapterInfo、CreateDevice / DestroyDevice、CreateContext / DestroyContext、CreateAllocation / DestroyAllocation / DescribeAllocation / GetStandardAllocationDriverData、OpenAllocation / CloseAllocation、Render、RenderKm、Present、Patch、SubmitCommand、BuildPagingBuffer、PreemptCommand、QueryCurrentFence、ResetFromTimeout、RestartFromTimeout、Escape、CollectDbgInfo、GetNodeMetadata、SetPalette、SetVidPnSourceAddress。
+- 登録しないもの：WDDM 2.0 の DDI（GetNodeMetadata 以外）、engine の reset、電源の component、CancelCommand、PresentDisplayOnly。
+
+**caps と segment（ROS と同じ形、WDDM 1.3、GPU の VA なし）：**
+- `Version = DXGKDDI_INTERFACE_VERSION`、WDDMVersion は 1.3。DOD と ROS も、古い WDDMVersion をこの Version で宣言している。
+- GPU の VA は宣言しない。Turnip は固定の GPU VA を前提にしているので、W-2 で WDDM 2.x の GpuMmu に上げる（そのときに caps を変える）。
+- DRIVERCAPS：
+  - flip：FlipOnVSyncMmIo、MaxQueuedFlipOnVSync 1、FlipOnVSyncWithNoWait、FlipIndependent、SupportDirectFlip。
+  - present：SupportSoftwareDeviceBitmaps、NoScreenToScreenBlt、NoOverlapScreenBlt、MaxTexture の shift 3。
+  - SupportNonVGA、SupportSmoothRotation。
+  - 3D の node は 1 つ。SchedulingCaps は MultiEngineAware と PreemptionAware。preemption の粒度は DMA buffer 単位。
+  - 立てないもの：CancelCommandAware、engine ごとの TDR、CrossAdapterResource、実行時の電源管理。
+- segment は 2 つ：
+  - segment 1：aperture。base 0xC0000000、4 MB（1024 page）、CacheCoherent、CpuVisible（ROS と同じく形だけで、map はしない）。DMA buffer と paging buffer はここに置く。
+  - segment 2：video memory。StartDevice で `MmAllocateContiguousMemorySpecifyCache`（MmCached）で取った連続の system memory。128 MB から半分ずつ 32 MB まで試す。0 で埋める。CpuVisible、CacheCoherent、DirectFlip。CpuTranslatedAddress はその PA。StopDevice で返す。
+- DMA buffer と paging buffer は 1 page。allocation の list は 64、patch の list は 128（GDI の context は既定の大きさ）。
+- UMDRIVERPRIVATE は `EPI_UMD_ADAPTER_INFO`（magic、version、WDDM version、video memory の大きさ）を返す。HISTORYBUFFERPRECISION は 64 bit。
+- 知らない QueryAdapterInfo の種類は NOT_SUPPORTED を返し、`QaiUnknown*` に記録する。DISPLAY_DRIVERCAPS_EXTENSION は DOD の実装に渡す。
+
+**allocation：**
+- CreateAllocation は、private data が `EPI_ALLOC_DESC`（magic 'EPAC'）の大きさと magic に合うものだけを受け付ける。合わないものは STATUS_INVALID_PARAMETER にして `AllocBadData` を数える（W-1a には UMD がないので、標準の allocation だけが来る見込み）。
+- 置き場所は segment 2 だけ。shared と primary は CPU から見えない（ROS と同じ）、それ以外は CPU から見え、cached。eviction の segment はない。
+- GetStandardAllocationDriverData：shared primary、shadow、staging を 32 bpp だけ受ける（pitch は幅 × 4）。GDI の surface は NOT_SUPPORTED（GDI の加速は宣言しない）。
+- resource の object は、ROS と同じく `Flags.Resource` で hResource がないときに作る。
+
+**CPU engine（W-1a）：**
+- Render / Present は、DMA buffer に何も書かず、DMA buffer の private data に「種類（render 1、paging 2、present 3）と CPU の address」だけを書く。Patch は何もしない（allocation の address を参照する command がまだない）。
+  - Render で command が空でなかったら `RenderNonEmpty` を数える。present は flip / blt / color fill / その他に分けて数える。
+- BuildPagingBuffer：
+  - FILL と TRANSFER は、引数の構造体を DMA buffer に写し（ROS と同じ）、worker が後で CPU で実行する。範囲は segment 2 の大きさと MDL の大きさで確かめ、外れたら `PagingError` を数えて飛ばす。
+  - TRANSFER の TransferOffset は ROS と同じく使わず、0 でなければ `PagingXferOffset` を数える。
+  - MAP / UNMAP_APERTURE_SEGMENT は、aperture の page の表（PFN の配列）に記録するだけ。DISCARD_CONTENT は何もしない。
+- SubmitCommand（DISPATCH_LEVEL）は、64 個の queue に積んで worker を起こす。queue が満ちていたら `QueueFull` を数え、fence は戻らない（dxgkrnl の timeout で回復する）。
+- worker は system thread で、event（1 秒の timeout）を待つ：
+  1. preempt が待っていれば、`DXGK_INTERRUPT_DMA_PREEMPTED`（最後に完了した fence と一緒に）を報告する。
+  2. queue から 1 つ取り出して実行し、reset されていなければ `DXGK_INTERRUPT_DMA_COMPLETED` を報告する。
+  - 報告は `DxgkCbSynchronizeExecution` の中で DxgkCbNotifyInterrupt と DxgkCbQueueDpc を呼ぶ。DPC は DOD と同じく DxgkCbNotifyDpc を呼ぶ。
+- PreemptCommand は、まだ始まっていない DMA buffer を捨て、preempt を worker に頼む（DMA buffer の境目での preemption）。
+- ResetFromTimeout は queue を捨て、世代を進める（実行中のものの完了は報告しない）。RestartFromTimeout は成功を返す。QueryCurrentFence は最後に完了した fence を返す。
+
+**表示（flip と CPU scanout）：**
+- SetVidPnSourceAddress（DIRQL まで）は、seqlock（書いている間は奇数）で source、segment、address と、allocation の幅、高さ、pitch を記録し、DPC を queue する。DPC は worker を起こす。
+- worker は、記録が新しければ、ScanLock（PASSIVE_LEVEL の mutex として使う event）を取って、segment 2 の primary を UEFI の画面（`m_CurrentModes[src].FrameBuffer.Ptr`）に行ごとに写す（幅、高さ、pitch は小さい方）。
+- 写し終えたら、その address を VSync の `CrtcAddress` に入れる。次の VSync の報告で flip が完了する。
+- primary が segment 2 以外にあるとき、または画面が map されていないときは写さず、`ScanSkipped` を数える（address の報告はする）。
+
+**UMD：** W-1a では UMD を登録しない。W-1a の実機で次を確かめてから、W-1b（何もしない最小の UMD を置くか）を決める。
+- adapter が D3D から見えるか。
+- DWM が何を使って合成するか（Microsoft Basic Render にずれるか、起動しないか）。
+- 画面とロック画面が出るか。
+- UMD がないので、present と flip は起きない見込み。そのときは bit3 が 0 になるが、失敗ではなく観測として扱う。
+
+**診断：**
+- EpiDiag `WddmMode`：どちらの mode でも StartDevice が書く。`WddmStartStatus`：完全な driver の StartDevice が書く。
+- EpiDiag `WddmTrace`（REG_BINARY、全部 ULONG、`EPI_WDDM_TRACE` の順）：worker が、変化があれば 1 秒ごとに書き、StopDevice の時にも書く。
+  - version、mode、start の status、video memory の大きさと PA、書いた回数。
+  - DDI ごとの呼ばれた回数（27 個）。
+  - 失敗の数、最後に失敗した DDI と NTSTATUS。QueryAdapterInfo の種類の bit、知らない種類の数と最後の値。
+  - present（blt / flip / color fill / その他 / 完了）、render（完了 / 空でない）。
+  - paging（buffer、fill、transfer、TransferOffset、discard、map、unmap、その他、error）。
+  - allocation（生きている数、最大、生きている byte、primary / shadow / staging、private data の不正）。
+  - fence（最後に積んだもの、最後に完了したもの）、DMA の完了、preempt、QueueFull、通知の失敗、準備の error、reset。
+  - flip（数、allocation なし、写した数、写さなかった数、写すのにかかった最大の μs、最後の segment と address）、VSync の報告の数。
+- 読むのは scratchpad の `tools/decw1.py`。
+
+**実機での確かめ方：**
+1. v86 を配置する（`EpiWddmMode` は 0 のまま）。DOD として今までどおり動き、EpiDiag `WddmMode` が 0 であることを確かめる（回帰の確認）。
+2. `Services\Epinephrine\EpiWddmMode` = 2 にして restart-device する。
+3. 約 30 秒待ち、WinRM から次を集める：EpiDiag（`WddmMode`、`WddmStartStatus`、`WddmTrace`）、`Get-CimInstance Win32_VideoController`、`dxdiag /t` の結果、dwm の process、event log の display と dxgkrnl の項目。
+4. 目で見て、画面が出ているか、操作できるかをユーザーに確かめてもらう。
+5. もう一度 restart-device する（値はもう 0）。DOD に戻り、`WddmMode` が 0 で、最後の `WddmTrace`（StopDevice で書いたもの）が残っていることを確かめる。
+
+**判定（decw1.py が計算する）：**
+- bit0：完全な driver として登録した（`WddmTrace` があり、mode が 1 か 2）。
+- bit1：StartDevice が成功した（`WddmStartStatus` = 0、DRIVERCAPS が問われた）。
+- bit2：VidPN が commit され、primary が作られた（CommitVidPn > 0、AllocPrimary > 0）。
+- bit3：present か flip が 1 回以上 CPU engine で完了した（PresentDone > 0 または ScanCopies > 0）。
+- bit4：fence の取りこぼしと TDR がない（Resets、QueueFull、NotifyFail、PagingError が 0、最後に積んだ fence = 最後に完了した fence）。
+- bit5：DOD に戻せた（2 回目の restart-device の後、`WddmMode` = 0、display の device が動いている）。
+- UMD がないときの DWM の振る舞いは、判定ではなく観測として記録する。
+
+**危険：**
+- 完全な driver は dxgkrnl の確かめが DOD より厳しい。必須の DDI や caps が欠けると、DriverEntry か StartDevice が失敗し、画面が出ない。対策は `EpiWddmMode` = 2 の一回だけの切り替え。
+- UMD がないと、DWM が起動しないか、ロック画面が出ないかもしれない。画面は commit の BlackOutScreen で黒くなる見込み。回復は WinRM からの restart-device。
+- W-1 では GPU を使わないので、GPU の hang による危険はない。GX を on にしないので、実行の前の再起動は要らない。
+
+**分担：** W-1 は DXGK の側だけで、SMMU / GMU / GX / CP には触らないので、私が書いた。
+
+### 9.21.73 W-1a の実機の結果（v86）
+
+**手順：** §9.21.72 の手順のとおり、v86 を配置して、`EpiWddmMode` = 0 → 2 → 0（自動で戻る）と切り替えた。GX は on にしていない。
+
+**結果：**
+- **回帰の確認（mode 0）：** DOD として今までどおり動いた。20.0.2.86、1080x2400@60、`WddmMode` = 0。
+- **mode 2：**
+  - DriverEntry は完全な driver として登録した。`EpiWddmMode` は 0 に戻っていた（一回だけの切り替えが働いた）。
+  - StartDevice は成功した。`WddmStartStatus` = 0、video memory は 128 MB（PA 0x2307E9000）。
+  - dxgkrnl は QueryAdapterInfo を 1 回（DRIVERCAPS だけ）呼んだあと、device を止めた。device は Code 43（`CM_PROB_FAILED_POST_START`）になり、表示は Microsoft Basic Display Driver に移った。
+  - QUERYSEGMENT3 も、ほかの DDI（CreateDevice、CommitVidPn など）も呼ばれていない。DDI の失敗は 0。
+  - DxgKrnl-Admin の log と Kernel-PnP の log には、この時の項目がない。
+- **mode 0 に戻す：** 2 回目の restart-device で DOD に戻った（`WddmMode` = 0、device は OK）。
+
+**判定：** bit0 = 1、bit1 = 1、bit2 = 0、bit3 = 0、bit4 = 1、bit5 = 1（Checks 0x33）。bit2 と bit3 が 0 なのは、dxgkrnl が DRIVERCAPS の直後に止めたためである。
+
+**原因の見立て（確かめていない）：**
+- 登録の `Version` は `DXGKDDI_INTERFACE_VERSION`（この WDK では WDDM 3.2）で、DRIVERCAPS の WDDMVersion は 1.3、GPU の VA は宣言していない。
+- WDDM 2.0 以降の DDI version で登録した完全な driver は、GPU の VA（GpuMmu か IoMmu）を持つ前提なので、DRIVERCAPS の時点で受け入れられなかったと考える。ROS は WDDM 2.0 より前の dxgkrnl で動いていたので、同じ組み合わせが通っていた。
+- driver 全体を `DXGKDDI_INTERFACE_VERSION` = 0x4002（WDDM 1.3）で compile してみたが、通らない。DOD の部分が新しい定義（`DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION`、回転の `Offset0`）を使っているためである（試しただけで、元に戻した）。
+
+**次の候補：**
+- (a) dxgkrnl の ETW を取りながら mode 2 をもう一度動かし、止めた理由を確かめる。
+- (b) W-2（WDDM 2.x、GpuMmu）を前倒しして、W-1 と一緒にする。Turnip は GPU の VA を前提にしているので、いずれ必要になる。
+- (c) 完全な driver の部分だけを WDDM 1.3 で動かす（DOD の新しい機能を条件付きにするか、別の sys にする）。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

@@ -45,6 +45,8 @@ typedef struct _EPI_VSYNC
     volatile LONG            Enabled;       // DXGK_INTERRUPT_DISPLAYONLY_VSYNC enabled by dxgkrnl
     volatile LONG            Notifies;      // VSyncs reported (either source)
     volatile LONG            Skipped;       // frame counter advanced by more than 1 between polls
+    volatile LONG64          CrtcAddress;   // W-1 full mode: primary address reported with DXGK_INTERRUPT_CRTC_VSYNC
+                                            // (set by the CPU scanout after it copied a flipped primary)
 
     // Hardware mode (INTF1 frame interrupt on IRQ 0x73)
     BOOLEAN                  HwMode;        // requested for this start (Device Parameters\EpiHwVsync)
@@ -64,6 +66,11 @@ typedef struct _EPI_VSYNC
 // default 1). 0 = do not register DxgkDdiControlInterrupt / DxgkDdiGetScanLine (plain KMDOD behaviour,
 // frequencies NOTSPECIFIED). Changing it needs the driver to be reloaded (restart the device).
 extern BOOLEAN g_EpiSoftVsync;
+// W-1 (G0_GPU_SURVEY section 9.21.72), read with the same key (Services\Epinephrine\EpiWddmMode, DWORD, default 0):
+// 0 = display-only driver, 1 = full WDDM driver, 2 = full WDDM driver for this load only (DriverEntry resets the
+// value to 0 and flushes it before registering, so a crash in full mode comes back as the display-only driver).
+// Full mode forces g_EpiSoftVsync and reports DXGK_INTERRUPT_CRTC_VSYNC instead of DISPLAYONLY_VSYNC.
+extern ULONG g_EpiWddmMode;
 _IRQL_requires_(PASSIVE_LEVEL) VOID EpiReadDriverSwitches(_In_ PUNICODE_STRING RegistryPath);
 
 // StartDevice / StopDevice (PASSIVE). HwMode maps INTF1 read-write; otherwise read-only and nothing is written.

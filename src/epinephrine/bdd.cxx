@@ -10,6 +10,7 @@
 
 #include "BDD.hxx"
 #include "epi_present.hxx"
+#include "epi_wddm.hxx"
 
 #pragma code_seg("PAGE")
 
@@ -30,6 +31,7 @@ BASIC_DISPLAY_DRIVER::BASIC_DISPLAY_DRIVER(_In_ DEVICE_OBJECT* pPhysicalDeviceOb
     m_EpiLog[0] = 0;
     RtlZeroMemory(&m_Vsync, sizeof(m_Vsync));
     RtlZeroMemory(&m_Dsi, sizeof(m_Dsi));
+    m_Wddm = NULL;
     m_EpiLogSeq = 0;
     m_EpiPresentCount = 0;
     m_EpiPresentUs = 0;
@@ -88,7 +90,10 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
     // Device Parameters\EpiDiag. Diagnostic only; the start path does not depend on it.
     EpiHwSnapshot(&m_DeviceInfo, &m_EpiRes);
     EpiVsyncProbe(&m_EpiRes, m_DeviceInfo.PhysicalDeviceObject);
-    EpiGpuProbe(&m_EpiRes, m_DeviceInfo.PhysicalDeviceObject);   // GPU G1a, opt-in one shot
+    if (g_EpiWddmMode == 0)
+    {
+        EpiGpuProbe(&m_EpiRes, m_DeviceInfo.PhysicalDeviceObject);   // GPU G1a, opt-in one shot
+    }
 
     // Epinephrine (Akatsuki) WP2b-2: panel EDID and timing from GPU0 _ROM (PCFG). On failure m_Panel.Valid
     // stays FALSE and the KMDOD behaviour (no EDID, POST mode with unspecified frequencies) is kept.
@@ -191,11 +196,33 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartIn
             const ULONG fp = EpiQueryDword(hParams, L"EpiFastPresent", 1);
             g_EpiFastPresent = (fp <= 2) ? fp : 1;
             EpiSetDword(hDiag, L"FastPresent", g_EpiFastPresent);
+            EpiSetDword(hDiag, L"WddmMode", g_EpiWddmMode);   // W-1: 0 = display-only driver
             // Device Parameters\EpiGpuPresentVerify: P-2 compares the screen after each GPU present. Default 1.
             g_EpiGpuPresentVerify = EpiQueryDword(hParams, L"EpiGpuPresentVerify", 1) != 0 ? 1 : 0;
             EpiSetDword(hDiag, L"GpuPresentVerify", g_EpiGpuPresentVerify);
             ZwClose(hDiag);
             ZwClose(hParams);
+        }
+    }
+    if (g_EpiWddmMode != 0)
+    {
+        // W-1 (section 9.21.72): video memory segment, CPU engine and CPU scanout. No GPU access.
+        const NTSTATUS wst = EpiWddmStart(this, &m_Wddm);
+        HANDLE hParams = NULL;
+        HANDLE hDiag = NULL;
+        if (NT_SUCCESS(EpiOpenDiag(m_DeviceInfo.PhysicalDeviceObject, &hParams, &hDiag)))
+        {
+            EpiSetDword(hDiag, L"WddmStartStatus", (ULONG)wst);
+            ZwClose(hDiag);
+            ZwClose(hParams);
+        }
+        EpiTrace(L"WddmStart mode%u st%X", g_EpiWddmMode, (ULONG)wst);
+        if (!NT_SUCCESS(wst))
+        {
+            EpiVsyncStop(&m_Vsync);
+            EpiDsiStop(&m_Dsi);
+            CleanUp();
+            return wst;
         }
     }
     m_Flags.DriverStarted = TRUE;
@@ -210,6 +237,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StopDevice(VOID)
 {
     PAGED_CODE();
 
+    EpiWddmStop(&m_Wddm);   // W-1: worker and CPU scanout first (they read the framebuffer and m_Vsync)
     EpiGpuSessionStop(1);   // P-1: the GPU worker must be gone before anything is released
     EpiVsyncStop(&m_Vsync);
     EpiDsiStop(&m_Dsi);
@@ -890,7 +918,8 @@ VOID BASIC_DISPLAY_DRIVER::DpcRoutine(VOID)
 
 NTSTATUS BASIC_DISPLAY_DRIVER::ControlInterrupt(DXGK_INTERRUPT_TYPE InterruptType, BOOLEAN EnableInterrupt)
 {
-    if (InterruptType != DXGK_INTERRUPT_DISPLAYONLY_VSYNC)
+    const DXGK_INTERRUPT_TYPE vsyncType = (g_EpiWddmMode != 0) ? DXGK_INTERRUPT_CRTC_VSYNC : DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+    if (InterruptType != vsyncType)
     {
         return STATUS_NOT_IMPLEMENTED;
     }

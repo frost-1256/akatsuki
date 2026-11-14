@@ -190,7 +190,7 @@
        and for display drivers dxgkrnl reads the first field as the WDDM version: builds made after 21:00
        got 21.x and AddDevice failed with STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182). Keep it at 20.x. -->
   <PropertyGroup>
-    <EpiDriverVersion Condition="'$(EpiDriverVersion)'==''">20.0.2.85</EpiDriverVersion>
+    <EpiDriverVersion Condition="'$(EpiDriverVersion)'==''">20.0.2.86</EpiDriverVersion>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Inf>
@@ -217,6 +217,7 @@
     <ClCompile Include="..\epi_gmu.cxx" />
     <ClCompile Include="..\epi_zap.cxx" />
     <ClCompile Include="..\epi_present.cxx" />
+    <ClCompile Include="..\epi_wddm.cxx" />
     <ResourceCompile Include="..\sampledisplay.rc" />
   </ItemGroup>
   <ItemGroup>

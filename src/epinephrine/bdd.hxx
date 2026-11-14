@@ -142,6 +142,7 @@ typedef struct _CURRENT_BDD_MODE
 #include "epi_dsi.hxx"
 
 class BASIC_DISPLAY_DRIVER;
+typedef struct _EPI_WDDM EPI_WDDM;   // epi_wddm.hxx (W-1 full driver mode)
 
 class BDD_HWBLT
 {
@@ -235,6 +236,11 @@ public:
     NTSTATUS ControlInterrupt(DXGK_INTERRUPT_TYPE InterruptType, BOOLEAN EnableInterrupt);
     NTSTATUS GetScanLine(_Inout_ DXGKARG_GETSCANLINE* pGetScanLine);
     const EPI_VSYNC* GetVsync() const { return &m_Vsync; }
+    // W-1 full driver mode (epi_wddm.cxx). NULL in display-only mode and outside StartDevice..StopDevice.
+    EPI_WDDM* m_Wddm;
+    EPI_VSYNC* EpiVsyncMut() { return &m_Vsync; }
+    PDEVICE_OBJECT EpiPdo() const { return m_DeviceInfo.PhysicalDeviceObject; }
+    CURRENT_BDD_MODE* EpiModeMut(UINT SourceId) { return (SourceId < MAX_VIEWS) ? &m_CurrentModes[SourceId] : NULL; }
     VOID EpiTrace(_In_z_ _Printf_format_string_ PCWSTR Format, ...);
     VOID EpiCountPresent(NTSTATUS Status, ULONG Us, _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPresent);
 private:
