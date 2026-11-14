@@ -35,9 +35,10 @@
 #define EPI_GMU_PROBE2_W1      0x20UL // requires T1; Probe2=63, opt-in 16-KB ring/wrap test
 #define EPI_GMU_PROBE2_M1      0x40UL // requires W1; Probe2=127, GMEM tile clear/load/store
 #define EPI_GMU_PROBE2_Q1      0x80UL // requires M1; Probe2=255, rotating textured quad
+#define EPI_GMU_PROBE2_H1      0x100UL // requires Q1; Probe2=511, boot-mapped heap and two-frame submission
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -473,6 +474,38 @@ inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 // Frame VB x/v updates stop at the first failure; no more WPTR writes/GX diagnostics after Reason18.
 // CPU band restore/free remains mandatory after successful backup. SMMU regions and T1 shared resources are unchanged.
 
+// GpuGmuH1: 1124 bytes (281 DWORDs), ULONG/NTSTATUS in this exact order:
+// Cp (140-byte G2), QChecks, QReason, CcuLive, RbCntlLive,
+// RegionCount, HeapIova, HeapSize, HeapFlags, HeapPaLow, HeapPaHigh, HeapMapped, HeapZeroBad, HeapZeroFirst,
+// LiveBytes, PeakBytes, HighWater, AllocCount, FreeCount, FailCount, ReuseCount, RetirePending, StaticOffset[6],
+// IbOffsetFirst, IbOffsetLast, VbOffsetFirst, VbOffsetLast, DistinctIb,
+// FramesDone, FailFrame, FailFence, FailRptr, FailWptr, MaxRptrSeen, PendingAtPublish, MaxInFlight, FenceBackwards, WptrWrites,
+// WaitMaxUs, WaitTotalUs, ElapsedMs,
+// TsAfter[3], StaticBad, StaticFirst, TailBad, TailFirst, RingBad, RingFirst, RingValue, RingExpected, OldTailBad, OldTailFirst,
+// SqGood[2], SqBad, SqFirst, SqValue, SqExpected, TexelBad[2], SqZero, SqPad, SqBg,
+// BgGood[2], BgBad, BgFirst, BgValue, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[20],
+// CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+// GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter,
+// RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus,
+// IbOffset[61], VbOffset[61]. Extra offset histories decode every ring packet even after heap reuse.
+// StaticOffset order TS,FS,SAMP,BORDER,TCONST,TEX = 0,80,40,100,180,200 (hex).
+// StaticFirst/TailFirst/HeapZeroFirst and all allocator offsets are heap byte offsets; OldTailFirst is a ring allocation
+// byte offset. RingFirst is a DWORD index; pixel Firsts/RestoreFirst are band byte offsets. Samples/TexelBad follow Q1.
+// Checks:1 Q1/preflight/zero heap,2 all61 frames/fence A300003C/pointers814/idle/IB0/no error/backwards/MaxInFlight<=2,
+// 4 allocator128 allocations/122 frees/Live960/Peak<=5120/Reuse>=1/no pending/no failures,
+// 8 static/TS/tail/ring/unchanged old tail,16 exact textured square+gray background+unchanged outside,32 band restore.
+// Require3F. Live/Peak count rounded allocated bytes only, not alignment holes; HighWater is the largest allocation end.
+// MaxInFlight at frame f is f-Completed, or f before any completion. FramesDone=highest valid completion+1.
+// FFFFFFFF is the only uninitialized fence; never passed to Reclaim. Malformed/future fences fail13, backwards fail20.
+// Reason19 allocator failure. Other reasons match Q1; Reason18 forbids more publications/GX diagnostic reads.
+// FramesDone/MaxRptrSeen/PendingAtPublish/MaxInFlight/FenceBackwards/WptrWrites/WaitMaxUs/WaitTotalUs/HoldMs/Checks/Prepared
+// start at0; unread values/absent offsets FFFFFFFF, unexecuted statuses NOT_FOUND. Summaries are sampled allocator state.
+// Breadcrumbs:2000/01 map/prior,2002 global,2008 backup,2003 static prepare,2040..43 each16 frames,
+// 2004 final wait,2010..1B diagnostics,2020 global,2030 save/flush+2s hold,2031 restore,2032 verify.
+// WaitUs covers completion waits; ElapsedMs runs from first publication through final drain (including frame pauses).
+// Allocator work and traces are pooled CPU metadata. The GPU accesses only the GMU_TEST-owned heap region, retained
+// alongside other regions on KeepCx; no runtime SMMU map/unmap or speculative free of pending GPU allocations.
+
 // Per-probe stack telemetry. Reset before entering the CX callout; GmuStep samples the minimum.
 // Minimum is FFFFFFFF until the first sample. Both values are byte counts.
 VOID EpiGmuStackReset();
@@ -523,4 +556,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE);

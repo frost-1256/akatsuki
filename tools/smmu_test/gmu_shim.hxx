@@ -315,6 +315,46 @@ inline void Q1PeerComplete(ULONG frame) {
     if(frame==120 && q1DamageOutside>=0x4000 && q1DamageOutside<0x8000) g2Ring[q1DamageOutside/4]^=1;
     *g2Shadow=(3272+9*(frame+1))%4096; *GmuCfgReg(0x806)=*g2Shadow; *GmuCfgReg(0x92A)=0;
 }
+// H-1 peer retains ordered jobs until their simulated completion, checking that their IB/VB is never reused early.
+static ULONG* h1Heap=nullptr;
+static bool allowH1Writes=false,h1Active=false,h1FenceForever=false,h1ShadowOnly=false,h1SaveFails=false;
+static bool h1NoDraw=false,h1Outside=false,h1BackgroundBad=false;
+static ULONG h1DelayUs=0,h1FenceDrops=0,h1StopFrame=0xFFFFFFFF,h1BadSizeFrame=0xFFFFFFFF;
+static ULONG h1BadFenceFrame=0xFFFFFFFF,h1BackwardsFrame=0xFFFFFFFF,h1ErrorFrame=0xFFFFFFFF;
+static ULONG h1DamageHeap=0xFFFFFFFF,h1DamageOldTail=0xFFFFFFFF,h1DamageRing=0xFFFFFFFF;
+static ULONG h1InitialFence=0xFFFFFFFF;
+struct H1_JOB { ULONG Frame,Ib,Vb,Target; ULONGLONG Due; std::vector<ULONG> Commands,Vertices; };
+static std::vector<H1_JOB> h1Jobs;
+static std::vector<ULONG> h1Writes,h1Progress;
+static ULONG h1DoneJobs=0;
+inline void H1Drain() {
+    while(h1DoneJobs<h1Jobs.size()) {
+        const auto& job=h1Jobs[h1DoneJobs];
+        if(job.Frame==h1StopFrame || testInterruptTime<job.Due) return;
+        for(ULONG i=0;i<107;++i) assert(h1Heap[job.Ib/4+i]==job.Commands[i]);
+        for(ULONG i=0;i<192;++i) assert(h1Heap[job.Vb/4+i]==job.Vertices[i]);
+        if(job.Frame==60) {
+            if(!h1NoDraw) for(ULONG y=1072;y<1328;++y) for(ULONG x=412;x<668;++x) {
+                const ULONG v=(y-1072)/2;
+                const ULONG color=x>=460 && x<620 && v>=24 && v<104 ? h1Heap[0x200/4+(v-24)/10*16+(x-460)/20] : 0xFF202020;
+                d1Band[(y*4320+x*4-0x462000)/4]=color;
+            }
+            if(h1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+            if(h1BackgroundBad) d1Band[(1076*4320+414*4-0x462000)/4]^=1;
+            if(h1DamageOldTail>=0x4000 && h1DamageOldTail<0x8000) g2Ring[h1DamageOldTail/4]^=1;
+            if(h1DamageRing<4096) g2Ring[h1DamageRing]^=1;
+        }
+        // Model the GPU: the PC_CCU_FLUSH_COLOR_TS payloads are the values inside the submitted IB (dw 76 / 105).
+        h1Heap[0]=h1Heap[job.Ib/4+76]; h1Heap[1]=h1Heap[job.Ib/4+105];
+        h1Heap[2]=job.Frame==h1BadFenceFrame ? 0x12340000 : (0xA3000000|(job.Frame==h1BackwardsFrame ? 0 : job.Frame));
+        // Damage after the TS/fence writes so a damaged TS word is not overwritten here.
+        if(job.Frame==60 && h1DamageHeap<0x40000) h1Heap[h1DamageHeap/4]^=1;
+        *g2Shadow=job.Target; *GmuCfgReg(0x806)=job.Target;
+        *GmuCfgReg(0x928)=0x70100000+job.Ib; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=0;
+        if(job.Frame==h1ErrorFrame) gPages[8][0x201]|=1UL<<9;
+        ++h1DoneJobs;
+    }
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -363,7 +403,7 @@ static ULONG* hfiMemory=nullptr;
 static std::map<std::wstring,ULONG> diagnostics;
 inline void* GmuMap(PHYSICAL_ADDRESS a,SIZE_T size,ULONG protection) {
     if(a.QuadPart==0xE1462000) {
-        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes || allowW1Writes || allowM1Writes || allowQ1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
+        assert((allowD1Writes || allowV1Writes || allowA1Writes || allowT1Writes || allowW1Writes || allowM1Writes || allowQ1Writes || allowH1Writes) && size==0x120000 && protection==(PAGE_READWRITE|PAGE_NOCACHE));
         if(d1MapFails) return nullptr;
         ++d1Maps; d1Restoring=false; return d1Band.data();
     }
@@ -385,6 +425,7 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(D1BandPointer(p)) return *p;
     if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
     if(t1Pending && testInterruptTime>=t1Due) T1PeerComplete();
+    if(h1Active) H1Drain();
     if(q1Pending && testInterruptTime>=q1Due) Q1PeerComplete(q1PendingFrame);
     if(m1Pending && testInterruptTime>=m1Due) M1PeerComplete();
     if(w1Pending && testInterruptTime>=w1Due) W1PeerComplete(w1PendingPub,w1PendingTarget,w1PendingLast);
@@ -404,6 +445,28 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && allowH1Writes && h1Active) {
+        const ULONG frame=static_cast<ULONG>(h1Jobs.size());
+        assert(frame<61 && h1Heap && v==265+9*(frame+1) && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
+        h1Writes.push_back(v); g2Writes.push_back({0x807,v});
+        if(frame==h1BadSizeFrame) {*p=v; *g2Shadow=4096; *GmuCfgReg(0x806)=h1ShadowOnly ? 265+9*frame : 4096; gPages[2][0x313]=h1FenceForever ? 1 : 0; return;}
+        if(h1FenceForever || h1FenceDrops) {if(h1FenceDrops) --h1FenceDrops; gPages[2][0x313]=1; return;}
+        gPages[2][0x313]=0; *p=v;
+        const ULONG* packet=g2Ring+265+9*frame;
+        assert(packet[0]==0x70BF8003 && packet[1]>=0x70100000 && packet[1]<0x70140000 && packet[2]==0 && packet[3]==107);
+        assert(packet[4]==0x70460004 && packet[5]==4 && packet[6]==0x70100008 && packet[7]==0 && packet[8]==(0xA3000000|frame));
+        const ULONG ib=packet[1]-0x70100000; assert(ib+428<=0x40000 && !(ib&63));
+        const ULONG* cmd=h1Heap+ib/4;
+        assert(cmd[12]==0x70100080 && cmd[20]==0x70100080 && cmd[23]==0x70100100 && cmd[26]==0x70100100);
+        assert(cmd[30]==0x70100040 && cmd[33]==0x70100040 && cmd[37]==0x70100180 && cmd[40]==0x70100180);
+        assert(cmd[74]==0x70100000 && cmd[103]==0x70100004 && cmd[88]==cmd[59]+384 && cmd[59]>=0x70100000);
+        const ULONG vb=cmd[59]-0x70100000; assert(vb+768<=0x40000 && !(vb&63));
+        if(frame==0) assert(ib==0x400 && vb==0x5C0);
+        H1_JOB job={frame,ib,vb,v,testInterruptTime+h1DelayUs*10,std::vector<ULONG>(cmd,cmd+107),std::vector<ULONG>(h1Heap+vb/4,h1Heap+vb/4+192)};
+        if(!h1Jobs.empty() && job.Due<h1Jobs.back().Due+h1DelayUs*10) job.Due=h1Jobs.back().Due+h1DelayUs*10;
+        h1Jobs.push_back(job); gPages[8][0x210]=1; gPages[8][0x201]=0; gPages[2][0x30C]=0;
+        H1Drain(); return;
+    }
     if(p==GmuCfgReg(0x807) && allowQ1Writes && q1Active) {
         const ULONG frame=static_cast<ULONG>(q1Frames.size()),target=(3272+9*(frame+1))%4096;
         assert(frame<121 && v==target && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
@@ -839,13 +902,15 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
+        if(v==0x2003 && allowH1Writes) h1Active=true;
+        if(v>=0x2040 && v<=0x2043) {h1Progress.push_back(v); if(v==0x2040 && h1InitialFence!=0xFFFFFFFF) h1Heap[2]=h1InitialFence;}
         if(v==0x1F03 && allowQ1Writes) q1Active=true;
         if(v>=0x1F40 && v<=0x1F47) q1Progress.push_back(v);
         if(v==0x1E03 && allowM1Writes) m1Active=true;
         if(v==0x1D03 && allowW1Writes) w1Active=true;
         if(v>=0x1D40 && v<=0x1D4A) w1Progress.push_back(v);
         if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
-        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31 || v==0x1E31 || v==0x1F31) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31 || v==0x1E31 || v==0x1F31 || v==0x2031) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -857,6 +922,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
+    if(std::wcscmp(name,L"GpuGmuH1")==0 && value && size && h1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuQ1")==0 && value && size && q1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuM1")==0 && value && size && m1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuW1")==0 && value && size && w1SaveFails) return STATUS_IO_DEVICE_ERROR;

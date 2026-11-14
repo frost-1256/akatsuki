@@ -5611,6 +5611,291 @@ DriverVer 20.0.2.80（oem138）で、再起動の直後（v34-akat）に Probe 0
 
 **この後：** G0 で予定した描画の基本（三角形、varying、texture、連続投入、ring の折り返し、GMEM）は、これでひととおり揃った。次の段階は別に決める。
 
+#### 9.21.59 H-1 の提案：IB・VB・texture 用の heap region を足し、そこから動的に確保して描く（文章仕様）
+
+これまでの段階は、IB、shader、頂点、texture、data を、ring の region（IOVA 0x70010000、32 KB）の後半に、決め打ちの場所で置いてきた。空きはもう 1 KB 程度しかない。M-1 の走査の除外表のとおり、ほとんどの範囲が使われている。
+
+H-1 では、GPU 用の heap region を 1 つ足す。その中をソフトウェアの allocator で切り出して、IB・VB・texture を**実行時に確保・解放**する。
+
+- 描く絵は Q-1 と同じ（texture を貼った正方形が回る）。ただし、ring の region の後半は一切使わない。
+- 毎フレーム、新しい IB と VB を heap から確保する。GPU が使い終わった（fence が進んだ）ものから解放して、再利用する。
+- 2 フレームまでを同時に投入した状態（in flight）にする。CPU が次のフレームを準備している間に、GPU が前のフレームを描く。これは、後の段階（GMEM の連続描画、DXGK の present）の土台になる。
+
+**前提の事実：**
+- **`EpiSmmuMap` は、SMMU を有効にする前にしか呼べない**（`epi_smmu.hxx`：「Disabled contexts only」）。
+  - 動いている途中で map を足すには、TLB の無効化を含む新しい SMMU の手順が要る。
+  - H-1 はこれを避ける。heap region は、ほかの region と同じく**起動前の計画（plan）の段階で足し**、確保・0 埋め・map を一緒に行う。
+  - 実行時の「動的な確保」は、map 済みの heap の中を allocator が切り出すことを指す。
+  - 実行時の map / unmap は、本当に必要になった段階で別に扱う（ユーザーの担当）。
+- `GmuAdd` の上限は 1 region 0x40000 B（256 KB）、region の数の上限は `EPI_GMU_MAX_REGIONS` = 16。H-1 で 1 つ増える。
+- 確保の方法は、ほかの region と同じで、`MmAllocateContiguousMemorySpecifyCache`（物理連続、MmNonCached、2^36 未満）の後に 0 埋めする。CPU から書いた値は、そのまま GPU から見える。
+- IOVA の空き：使っている範囲は、GMU の 0x60000000 台、G-1 の 0x70000000..0x70021000、D-1 の 0x71000000..0x71120000。**0x70100000..0x70140000** はどれとも重ならない。
+- 描画の state と IB の形は、Q-1 の IB11 と同じ。IB11 の 107 語のうち、ring の region のアドレスが入っているのは次の 12 語だけである（生成器で確かめた）。H-1 はこの 12 語を heap のアドレスに書き換えた複製を使う。
+
+| IB11 の dw | 元の値 | 書き換え先 | 意味 |
+|---|---|---|---|
+| 12 | 0x70016880 | FS | SP_FS_OBJ_START lo |
+| 20 | 0x70016880 | FS | CP_LOAD_STATE6_FRAG（FS）のアドレス |
+| 23 | 0x70016B00 | BORDER | SP_TP_BORDER_COLOR_BASE_ADDR lo |
+| 26 | 0x70016B00 | BORDER | SP_PS_TP_BORDER_COLOR_BASE_ADDR lo |
+| 30 | 0x70016AC0 | SAMP | CP_LOAD_STATE6_FRAG（sampler）のアドレス |
+| 33 | 0x70016AC0 | SAMP | SP_FS_TEX_SAMP lo |
+| 37 | 0x70016E00 | TCONST | CP_LOAD_STATE6_FRAG（texture）のアドレス |
+| 40 | 0x70016E00 | TCONST | SP_FS_TEX_CONST lo |
+| 59 | 0x70017100 | VB | VFD_FETCH[0] BASE lo（パス A） |
+| 74 | 0x700170B4 | TS + 0 | PC_CCU_FLUSH_COLOR_TS の宛先（パス A） |
+| 88 | 0x70017280 | VB + 384 | VFD_FETCH[0] BASE lo（パス B） |
+| 103 | 0x700170B8 | TS + 4 | PC_CCU_FLUSH_COLOR_TS の宛先（パス B） |
+
+- 書き換える語はすべて下位 32 bit で、上位（hi）は 0 のまま。heap は 4 GB 未満にある。
+
+**heap region（plan の段階、ユーザーの担当）：**
+- IOVA **0x70100000**、大きさ **0x40000**（256 KB）、flag は READ | WRITE（PRIVILEGED なし。ring の region と同じ）。
+- `EpiGpuProbe2` の bit8（H-1）が立っているときだけ、G-1 の plan の後で足す（D-1 の `GmuD1Plan` と同じ位置）。立っていなければ、region の表はいままでと 1 つも変わらない。
+- 確保・0 埋め・map・後始末（unmap と解放）は、既存の region の繰り返しにそのまま乗る。External ではない。
+- ほかの region と少しでも重なる場合や、region の数が上限の場合は、plan で失敗させる（EPI_GMU_E_GPU_MEMORY）。
+
+**allocator（ハードウェアに触らないソフトウェア）：**
+- 単位（granule）は 64 B で、256 KB は 4096 granule。使用中の granule は bitmap（128 ULONG）で持つ。
+- `Alloc(Size, Align)`：
+  - Align は 64、128、256 のどれか。
+  - 大きさを 64 B 単位に切り上げ、先頭から順に、Align に揃った最初の空きを探す（first fit）。
+  - 見つかれば heap 内の offset を返し、なければ失敗を返す。
+  - 確保した範囲は 0 にしない（使う側が全部書く）。
+- `Free(Offset, Size)`：その範囲の granule を空きに戻す。確保していない範囲や、二重の解放は検出して失敗にする（ソフトウェアの誤りの目印）。
+- `Retire(Offset, Size, Fence)`：すぐには解放せず、退避の表（32 個）に「この fence 値まで GPU が進んだら解放してよい」として積む。表があふれたら失敗にする。
+- `Reclaim(Completed)`：退避の表のうち、Fence ≤ Completed のものをすべて `Free` する。
+- 数値：`LiveBytes`、`PeakBytes`、`HighWater`（これまでに確保した最大の終わりの offset）、`AllocCount`、`FreeCount`、`FailCount`、`ReuseCount`（以前に解放した granule を含む範囲を返した回数）。
+  - `LiveBytes` / `PeakBytes` は確保中の granule の合計（揃えのための穴は含めない）。static だけなら 960。
+  - `ReuseCount` のために、「一度でも `Free` された granule」の bitmap をもう 1 つ持つ。`Alloc` が返した範囲に、その bit が立った granule が 1 つでもあれば 1 増やす。
+  - `Free` の誤り（確保していない granule を含む、範囲が heap の外）は `FailCount` を増やして失敗を返す。H-1 ではどれも 0 になるはずである。
+
+- 机上試験：境界、揃え、断片化、二重解放、退避の表のあふれ、Reclaim の順序を、ホストで確かめる。
+
+**heap の中身：**
+- **始めに一度だけ確保するもの（static）：**
+
+| 名前 | 大きさ | Align | 中身 |
+|---|---|---|---|
+| TS | 12 B（1 granule） | 64 | [0] パス A の TS、[1] パス B の TS、[2] フレームの fence。始めに 0xFFFFFFFF |
+| FS | 128 B | 128 | FS4 と同じ（`00000000 13000000` と、残り 0） |
+| SAMP | 16 B | 64 | T-1 の TEX_SAMP と同じ（`00060920 00000060 0 0`） |
+| BORDER | 128 B | 128 | すべて 0 |
+| TCONST | 64 B | 64 | Q-1 の TEX_CONST2 と同じ（9×8）。ただし word4 の BASE は heap の TEX のアドレス |
+| TEX | 512 B | 256 | Q-1 の texture 2 と同じ（列 8 が 0xFF202020、列 9..15 が 0xFFFF00FF） |
+
+- **フレームごとに確保するもの：**
+
+| 名前 | 大きさ | Align | 中身 |
+|---|---|---|---|
+| IB | 428 B（7 granule） | 64 | IB11 の複製に、上の 12 語の書き換えをしたもの |
+| VB | 768 B（12 granule） | 64 | 前半 384 B がパス A、後半 384 B がパス B。Q-1 の VB E / F と同じ形で、正方形は表 `(2f) % 120` |
+
+- **static の確保の順と offset（first fit なので一意に決まる）：** TS、FS、SAMP、BORDER、TCONST、TEX の順に `Alloc` する。
+  - TS 0x000..0x040、FS 0x080..0x100（Align 128 なので 0x040 を飛ばす）、SAMP 0x040..0x080（飛ばした穴に入る）、BORDER 0x100..0x180、TCONST 0x180..0x1C0、TEX 0x200..0x400（Align 256 なので 0x1C0..0x200 は空きのまま）。
+  - IOVA は 0x70100000 + offset。TS は 0x70100000（fence は +8 の 0x70100008）、FS 0x70100080、SAMP 0x70100040、BORDER 0x70100100、TCONST 0x70100180、TEX 0x70100200。TCONST の word4 は **0x70100200**。
+  - `StaticOffset[6]` の期待値は、この順で 0x000、0x080、0x040、0x100、0x180、0x200。違えば前段の失敗（Reason 13）にする。
+  - フレーム 0 の IB は 0x400（0x1C0..0x200 の 1 granule には入らない）、VB は 0x5C0 になる。フレーム 1 以降は、解放の時期が GPU の速さで変わるので、offset は決め打ちにしない。
+- **IB の書き換えの値：** FS / BORDER / SAMP / TCONST / TS は上の static の IOVA、dw 59 は `0x70100000 + VbOffset[f]`、dw 88 はその +384、dw 74 は TS + 0、dw 103 は TS + 4。ring packet の IB の IOVA は `0x70100000 + IbOffset[f]`。
+- **VB の中身：** 前半 384 B はパス A で、Q-1 の VB E と同じ。後半 384 B はパス B で、VB F と同じ。背景の 6 頂点は s = 8.5、t = 0.5。正方形は表 `(2f) % 120` の x / v と、隅ごとの s / t。毎フレーム、96 + 96 語をすべて書く（再利用した場所には前の中身が残っているため）。
+- static は 960 B、1 フレームは 1216 B。同時に生きているフレームは最大 3 つ（投入中 2、解放待ち 1）なので、使う量は揃えの詰め物を足しても 5 KB 未満である。
+- TS の値は、パス A が 0xCAFE001B、パス B が 0xCAFE001C（IB11 の値のまま。書き換えるのはアドレスの 12 語だけ）。fence は `0xA3000000 | f`。
+
+**フレーム（61 フレーム、6° 刻みで 1 周）：**
+- フレーム f = 0..60 の正方形は、A-1 の表 `GmuA1Table[(2f) % 120]` を使う。最後の f = 60 は角度 0 に戻る。
+- ring packet は 9 dw で、`70BF8003 (IB の IOVA) 00000000 0000006B 70460004 00000004 (TS の IOVA + 8) 00000000 (0xA3000000|f)`。
+- 書く位置は ring dword `265 + 9f .. 273 + 9f`、投入後の WPTR は `265 + 9(f+1)`。最後は **814**。折り返さない（16 KB の ring のまま）。
+
+**手順（Q-1 の復元の後、OOB 解除前）：**
+1. 前段：次がすべて成り立つことを確かめる。不成立なら Reason 8 / 12 / 15 で未投入とする。
+   - Q-1 の Status が成功、Reason 0、Checks 0x3F。
+   - RPTR / WPTR / shadow 265、`CP_RB_CNTL` 0x20B、RB_CCU_CNTL 0x10000000、MASK 0。
+   - ring が Q-1 の後の規則と一致する。
+   - heap region が IOVA 0x70100000、大きさ 0x40000、flag READ | WRITE、Mapped、External でない。
+   - heap の 256 KB がすべて 0（`HeapZeroBad` = 0）。
+2. band の map と退避は Q-1 と同じ。Q-1 の復元後の band を改めて退避する。ring の region の後半 16 KB も退避する。
+3. 準備：allocator を初期化し、static の 6 つを確保して書く。読み返して照合する。
+4. フレーム f = 0..60 について、次を繰り返す。
+   1. `Completed`（TS[2] が `0xA3000000|k` なら k、0xFFFFFFFF なら「まだない」）を読み、`Reclaim(Completed)` を呼ぶ。
+      - 「まだない」のときは `Reclaim` を呼ばない。上位 8 bit が 0xA3 でも 0xFF でもない値を読んだら止める（Reason 13）。
+      - `MaxInFlight` は、この時点の「f − Completed」（まだないなら f）の最大。手順 7 があるので、2 を超えない。
+      - Completed が前回より小さくなったら止める（Reason 20、fence の逆行）。
+   2. IB と VB を `Alloc` する。失敗したら止める（Reason 19、heap 不足）。確保した offset を `IbOffset[f]` / `VbOffset[f]` に記録する。
+   3. VB と IB を書き、バリアを置いて読み返す。違えば Reason 13。
+   4. ring packet を書き、バリアを置いて読み返し、WPTR を書く。
+   5. IB と VB を `Retire(…, f)` で退避の表に積む。
+   6. 書いた直後に TS[2] を一度読み、まだ f に届いていなければ `PendingAtPublish` を 1 増やす（GPU が CPU より遅れていた回数。判定には使わない）。
+   7. **f ≥ 1 なら、Completed ≥ f − 1 になるまで待つ**（同時に投入中なのは最大 2 フレーム）。
+      - 上限は 100 ms（Reason 16）。待つ間に RPTR ≥ 4096 を読んだら Reason 18。エラー割り込みは Reason 14。
+   8. `KeDelayExecutionThread` で 16 ms 待つ。16 フレームごとに breadcrumb `0x2040 + f/16` を書く。
+5. 最後に、Completed = 60、RPTR == WPTR == shadow == 814、RBBM / CX_BUSY が idle、IB1 の残り 0 になるまで待つ（上限 100 ms）。そのあと `Reclaim(60)` を呼ぶ。
+6. 判定し、**2 秒保持**してから復元する。保持中の画面は、角度 0 の正方形（Q-1 の最後と同じ絵）になる。
+7. 復元と照合は D-1 と同じ。途中で止まった場合も、band を map できていれば必ず復元する。
+- heap の中身は復元しない。heap region は、後始末で unmap と解放をするだけである。
+
+**判定（Checks）：**
+- bit0：前段の条件すべて（Q-1 成功、ring の状態、heap region の形と 0 埋め）。
+- bit1：61 フレームすべてが順に完了した。
+  - TS[2] の最終値が 0xA300003C。
+  - RPTR / WPTR / shadow 814、idle、IB1 の残り 0、エラー割り込みなし。
+  - fence が一度も逆行していない。
+  - `MaxInFlight` ≤ 2、`FramesDone` 61。
+- bit2：allocator が期待どおりに動いた。
+  - `FailCount` 0、`AllocCount` 128（static 6 + フレーム 122）、`FreeCount` 122。
+  - 最後の `LiveBytes` が static の分だけ（960 B）。
+  - `PeakBytes` ≤ 5120、`ReuseCount` ≥ 1（解放した場所を実際に使い回した）。
+  - 退避の表が空。
+- bit3：メモリがすべて期待どおり。
+  - TS[0] = 0xCAFE001B、TS[1] = 0xCAFE001C。
+  - static の 5 つ（FS、SAMP、BORDER、TCONST、TEX）が書いた値のまま。
+  - heap の `HighWater` より後ろがすべて 0（GPU が heap の範囲外に書いていない）。
+  - ring の 4096 語が「Q-1 の後の規則に、265..813 を H-1 の packet（記録した IB のアドレス入り）で置き換えたもの」と一致する。
+    - 位置 `265 + 9f + j` の期待値は、j = 1 が `0x70100000 + IbOffset[f]`、j = 8 が `0xA3000000|f`、ほかは上の packet の固定の語。
+  - ring の region の後半 16 KB が退避値と同じ（H-1 はそこを一切使わない）。
+- bit4：画面が期待どおり。正方形が両パリティとも 12800 画素すべて texel と完全に一致し、背景が両パリティとも 19968 画素すべて 0xFF202020。箱の外の band も退避値と同じ。
+- bit5：復元後の band が退避値と完全に一致する。
+- 期待値は **0x3F**。
+
+**probe：** `EpiGpuProbe2` の bit8 を H-1 とする。
+- H-1 は bit0..7 を必要とする。実行値は Probe 0xBFFFFE80 + Probe2 **511**。
+- 許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15, 31, 63, 127, 255, 511} だけで、それ以外は status 6。
+- heap region は、Probe2 = 511 のときだけ plan に足す。
+
+**診断 `GpuGmuH1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`QChecks`、`QReason`、`CcuLive`、`RbCntlLive`。
+- heap region：`RegionCount`、`HeapIova`、`HeapSize`、`HeapFlags`、`HeapPaLow / High`、`HeapMapped`、`HeapZeroBad`、`HeapZeroFirst`。
+- allocator：`LiveBytes`、`PeakBytes`、`HighWater`、`AllocCount`、`FreeCount`、`FailCount`、`ReuseCount`、`RetirePending`、`StaticOffset[6]`、`IbOffsetFirst / Last`、`VbOffsetFirst / Last`、`DistinctIb`（使った IB の offset の種類の数）。
+- フレーム：`FramesDone`（期待値 61）、`FailFrame`、`FailFence`、`FailRptr`、`FailWptr`、`MaxRptrSeen`、`PendingAtPublish`、`MaxInFlight`（publish の時点の f − Completed の最大）、`FenceBackwards`、`WptrWrites`。
+- 時間：`WaitMaxUs`、`WaitTotalUs`、`ElapsedMs`。
+- メモリ：`TsAfter[3]`、`StaticBad`、`StaticFirst`、`TailBad`、`TailFirst`（HighWater より後ろの 0 でない語）、`RingBad`、`RingFirst`、`RingValue`、`RingExpected`、`OldTailBad`、`OldTailFirst`（ring の region の後半 16 KB の変化）。
+- 画素：Q-1 と同じ `SqGood[2]` / `SqBad` / `SqFirst` / `SqValue` / `SqExpected` / `TexelBad[2]` / `SqZero` / `SqPad` / `SqBg` / `BgGood[2]` / `BgBad` / `BgFirst` / `BgValue` / `Outside*` / `Sample[20]`。
+- レジスタと状態：`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`、SMMU の `Fsr` / `Far` / `Fsynr`（Cp の中）。
+- 後始末：`RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- breadcrumb は 0x2000 番台（いまの実装では未使用）。保持は 0x2030、復元は 0x2031 / 32、フレームは 0x2040..0x2043。
+- Reason：19 は heap 不足、20 は fence の逆行。ほかは Q-1 と同じ。
+
+**失敗したときの見分け方：**
+- **前段で HeapZeroBad が出る場合：** heap の確保または 0 埋めの誤り。描画の前に止まる。
+- **フレーム 0 で SMMU fault が出る場合：** FAR が 0x70100000..0x70140000 にあれば、heap region の map（flag や大きさ）の誤り。FAR がそれ以外にあれば、IB の書き換え漏れ（12 語のどれかが古いアドレスのまま）を疑う。
+- **最後の絵が前のフレームの絵になる場合：** 再利用した VB に、UCHE の古い内容が残っている。IB の先頭の CACHE_INVALIDATE はそのまま残してあるので、起こらないはずである。
+- **TailBad が出る場合：** GPU が確保していない heap に書いた。TS のアドレスか、MRT / blit の宛先の誤り。
+- **OldTailBad が出る場合：** どこかに古いアドレスが残り、ring の region の後半に書いた。
+
+**危険と対策：**
+- **plan の変更：** Probe2 = 511 のときだけ region を足すので、255 以下の段階の動きは変わらない。
+- **時間：** H-1 は約 2 秒 + 保持 2 秒。StartDevice 全体で約 44 秒になる。長すぎる兆候が出たら、A-1 の FRAMES を減らす。
+- **in flight：** 同時に投入するのは最大 2 フレームで、それぞれ別の IB / VB を使う。CPU が書くのは、まだ GPU に渡していない新しい確保だけである。解放は fence を確かめてからなので、GPU が読んでいる途中の IB / VB を CPU が書き換えることはない。
+- **heap の範囲：** TP、VFD、CP が読むのは heap の中の確保済みの範囲だけで、region は map 済みである。書き込み先は TS（heap）と band（scissor で箱の中）だけである。
+
+**分担：**
+- heap region の plan と map 確認：ユーザー。
+- H-1 の投入と判定の実装：ユーザー。
+- allocator：ハードウェアに触らないので、ユーザーの判断で私が書いてもよい。その場合は、ホストの単体試験と一緒に、別のファイル（`epi_gpuheap.hxx`）にする。
+
+**生成器：** scratchpad の `tools/h1ib.py`。IB11 の書き換え 12 語（ほかの語に ring の region のアドレスがないことも確かめる）、heap の使用量、ring の位置を出力する。
+
+**この後：** H-1 が通れば、2（GMEM の連続描画）を、heap から確保した IB で組み立てる。
+
+#### 9.21.60 H-1 の実装
+
+Probe2 bit8 を実装した。許す値は `{0,1,3,7,15,31,63,127,255,511}`。H-1 は `Probe=0xBFFFFE80, Probe2=511` で Q-1 の復元後、同じ OOB の解除前に実行する。起動 API でも Q-1 を必須にした。255 以下では region を増やさない。
+
+**plan と lifetime：** G-1 の plan 後、SMMU の Enable より前に `GmuH1Plan` で IOVA 0x70100000 / 0x40000 B / READ|WRITE / 非 External の region を追加する。重なり（同じ領域の再追加を含む）と region 上限を拒否し、EPI_GMU_E_GPU_MEMORY にする。物理連続・noncached の確保、0 埋め、SMMU map、通常の解放と KeepCx は既存の region 経路を使う。実行中の map / unmap は加えていない。
+
+**allocator：** `epi_gpuheap.hxx` に CPU だけで動く first-fit allocator を置いた。単位は64 B、Alignは64/128/256。使用中と解放履歴の bitmap に加え、確保境界の bitmap を持ち、部分解放・隣り合う確保をまたぐ解放・二重解放・範囲外を拒否する。retire済みの範囲を直接Freeすることと、重複Retireも拒否する。エラーはFailCount、成功したFreeだけをFreeCountに数える。Retireは32件。LiveBytes/PeakBytesは確保したgranuleだけ、ReuseCountは解放履歴のあるgranuleを含む確保の回数である。allocator と実行状態は GMU_BOOT_TRACES の非ページプールに置き、カーネルスタックには載せない。
+
+**準備と投入：** 前段の Status/Reason/Checks、RPTR/WPTR/shadow=265、RB_CNTL=0x20B、CCU=0x10000000、MASK=0、ring全4096語、heapの形と全256 KBの0埋めを確認する。staticをTS/FS/SAMP/BORDER/TCONST/TEXの順で確保し、offsetが `{0,80,40,100,180,200}`（16進）であることを求める。TCONST word4は0x70100200。staticの丸めた確保範囲も書いて読み返す。
+
+61フレームについて、最初にfenceを観測してからReclaimし、新しいIBとVBを確保する。f=0のIB=0x400、VB=0x5C0を検査する。以降のoffsetは決め打ちにしない。毎フレームVBの192語すべてを書き、IB11の12語をheapのアドレスに書き換える。バリアと読み返しの後、ringの265+9fにpacketを置き、WPTRを更新する。公開したIB/VBは直後にRetireする。AHBの再送は同じWPTRに限り、2 ms/200回を上限とする。公開したメモリをtimeoutの推測だけで解放しない。
+
+fenceの0xFFFFFFFFは未完了の目印として扱い、Reclaimには渡さない。有効な0xA3xxxxxxだけを完了値として使い、まだ投入していない値や不正な値（0xFFFFFFFF以外の0xFFxxxxxxも含む）はReason13にする。完了値の逆行はReason20。MaxInFlightは各フレーム開始時のf−Completed（未完了ならf）の最大である。f≥1ではCompleted≥f−1を待ってから16 ms待機する。最後はCompleted=60、native RPTR/WPTR/shadow=814、idle、IB remaining=0まで最大100 ms待ち、Reclaimする。FramesDoneは観測した最大の完了番号+1である。native RPTRまたはshadowが4096以上ならReason18を優先し、以後の投入とGX診断読み取りを止める。
+
+**判定と復元：** Checksは§9.21.59のbit0..5を使い、期待値は0x3F。allocatorは128確保/122解放/Live960 B/Peak≤5120 B/Reuse≥1/退避表空/Fail0を求める。static5領域とTS、heapのHighWater以降の0埋め、動的IBアドレスを含むring全体を照合する。ringの後半16 KBは退避値と完全に一致することを求める。最終画素はQ-1と同じ整数判定である。帯と旧ring後半の退避には0x124000 Bのプールを使い、転送・診断が通れば2秒保持する。失敗時は保持を飛ばし、退避済みの帯はbreadcrumb等の失敗にもかかわらず必ず復元・照合・解放する。既存のslumber/reset/rpmh_stop/idle/SMMU Disable/KeepCxは維持する。heapは復元せず、既存のregion解放に任せる。
+
+**GpuGmuH1（REG_BINARY、1124 B / 281 dw）**：ULONGまたはNTSTATUSを次の順で置く。Cpは既存G-2形式140 B。
+
+```
+Cp, QChecks, QReason, CcuLive, RbCntlLive,
+RegionCount, HeapIova, HeapSize, HeapFlags, HeapPaLow, HeapPaHigh, HeapMapped, HeapZeroBad, HeapZeroFirst,
+LiveBytes, PeakBytes, HighWater, AllocCount, FreeCount, FailCount, ReuseCount, RetirePending, StaticOffset[6],
+IbOffsetFirst, IbOffsetLast, VbOffsetFirst, VbOffsetLast, DistinctIb,
+FramesDone, FailFrame, FailFence, FailRptr, FailWptr, MaxRptrSeen, PendingAtPublish, MaxInFlight, FenceBackwards, WptrWrites,
+WaitMaxUs, WaitTotalUs, ElapsedMs,
+TsAfter[3], StaticBad, StaticFirst, TailBad, TailFirst, RingBad, RingFirst, RingValue, RingExpected, OldTailBad, OldTailFirst,
+SqGood[2], SqBad, SqFirst, SqValue, SqExpected, TexelBad[2], SqZero, SqPad, SqBg,
+BgGood[2], BgBad, BgFirst, BgValue, OutsideChanged, OutsideFirst, OutsideOld, OutsideNew, Sample[20],
+CpInterrupt, CpProtect, CpStatus1, IbBaseLow, IbBaseHigh, IbRemaining,
+GlobalStatus[2], GlobalBefore[4], GlobalAfter[4], MaskBefore, MaskAfter,
+RestoreMismatch, RestoreFirst, HoldMs, Checks, Prepared, BackupStatus, HoldStatus, RestoreStatus,
+IbOffset[61], VbOffset[61]
+```
+
+末尾のoffset履歴を追加し、解放・再利用後でも全ring packetの期待アドレスを解読できるようにした。StaticOffsetの順は上記6領域。HeapZeroFirst/StaticFirst/TailFirstとallocatorのoffsetはheap先頭からのバイト数、OldTailFirstは旧ring allocation先頭からのバイト数、RingFirstはDWORD index、画素のFirst/RestoreFirstは帯先頭からのバイト数。SqGood/BgGoodは偶数行・奇数行の順で、Sample/TexelBadはQ-1と同じ。未読値・未検出位置はFFFFFFFF、未実行statusはNOT_FOUND。FramesDone/MaxRptrSeen/PendingAtPublish/MaxInFlight/FenceBackwards/WptrWrites/WaitMaxUs/WaitTotalUs/HoldMs/Checks/Preparedは0から始める。allocatorの集計値は終了時の状態を写す。
+
+WptrWritesはAHB再送を含む。WaitMaxUs/WaitTotalUsは完了待ちの時間、ElapsedMsは最初の投入から最後のdrainまで（フレーム間pauseを含み、2秒保持は含まない）。Reason19はallocator失敗、20はfence逆行で、ほかはQ-1と同じ。安全なteardown後のCP失敗はGpuGmuStatus=15、teardown不成立は8/KeepCxを優先する。診断は保持前に保存・flushし、cleanupとkeepの両方で最終値を保存する。
+
+| breadcrumb | 内容 |
+|---|---|
+| 0x2000/01 | map、前段・heapの確認 |
+| 0x2002/08 | global fault、帯と旧ring後半の退避 |
+| 0x2003 | staticの確保・準備・照合 |
+| 0x2040..43 | f=0,16,32,48の進捗 |
+| 0x2004 | 最後の完了・idle待ち |
+| 0x2010..1B/2020 | CP/RBBM/MASK、global faultの診断 |
+| 0x2030 | 保存・flushと2秒保持 |
+| 0x2031/32 | 帯の復元、復元照合 |
+
+机上試験用に、allocatorの境界・揃え・断片化・誤ったFree・retireの重複/満杯・Reclaim順序、未初期化/不正/逆行fenceのケースを追加した。shimはjobの完了を遅らせ、完了前のIB/VBが書き換わっていないことを記録した複製と照合する。高速完了と遅いGPU、準備・画像・メモリ破損、timeout、範囲外RPTR、IRQ、保存・map・pool・復元の失敗、SMMU map失敗とKeepCxも試験ケースに加えた。このモデルは実機の描画を保証しない。
+
+静的照合では、IBの12語の書き換えと旧ringアドレスの除去、固定offset、WPTR=814、ABI=1124 B、plan→map→Enableの順序を確認した。独立した区間リストのfirst-fit計算では、高速完了時のPeak2176 B/HighWater0x8C0/再利用120回、遅い完了時のPeak3392 B/HighWater0xD80/再利用118回となり、どちらも128確保・122解放・Live960 B・MaxInFlight≤2を満たした。C++ホスト試験、ビルド、署名、配置、実機実行、版番号変更、commitは行っていない。
+
+#### 9.21.61 H-1 の実機結果（v81 失敗、v82 成功）
+
+**v81（DriverVer 20.0.2.81、oem139）：Checks 0x37。** bit3（TS とフェンスの値）だけが失敗した。ほかの数値は v82 と同じだった。
+
+- 原因は仕様（§9.21.59）の誤り。TS の期待値を CAFE001D / CAFE001E と書いていた。
+- H-1 の IB は IB11 の写しで、パッチを当てるのはアドレスの 12 語だけ。TS に書く値は IB11 のまま CAFE001B / CAFE001C なので、GPU が書いた値のほうが正しい。
+- 直したもの（ドライバの動作は変えていない）：
+  - `epi_gmu.cxx` の bit3 の期待値を CAFE001B / CAFE001C にした。
+  - §9.21.59 の TS の行を直した。
+  - shim の TS の模型も直した。heap の TS の値を IB の中の値から取るようにし、最後のフレームで heap を壊す処理は TS を書いた後に移した。
+
+**v82（DriverVer 20.0.2.82、oem140）：成功。** 再起動の直後（v34-akat）に Probe 0xBFFFFE80 と Probe2 **511** を指定し、restart-device を 1 回実行した。
+
+- GpuProbeStatus 0、GpuGmuStatus 0。breadcrumb は最後に 0xFFFF になった。
+- 前段の Q-1 も QChecks 0x3F だった。
+
+**判定：** Checks **0x3F**、Reason 0。
+
+| 項目 | 結果 |
+|---|---|
+| heap | PA 0x2_7FF58000、IOVA 0x70100000、0x40000 B。map され、ゼロ確認も OK |
+| 確保 | Alloc 128、Free 122、Fail 0。Reuse 120、RetirePending 0 |
+| 使用量 | Live 960 B、Peak 2176 B、HighWater 2240 B |
+| 静的な offset | TS 0、FS 0x80、SAMP 0x40、BORDER 0x100、TCONST 0x180、TEX 0x200（仕様どおり）。DistinctIb 1 |
+| フレーム | FramesDone **61**、MaxRptrSeen 814、FenceBackwards 0 |
+| 時間 | ElapsedMs 1932 |
+| 同時に処理中のフレーム | PendingAtPublish 61、**MaxInFlight 1** |
+| RPTR / WPTR / shadow | 265 → **814** |
+| heap の TS とフェンス | CAFE001B / CAFE001C / **A300003C** |
+| メモリ | StaticBad 0、TailBad 0、RingBad 0、OldTailBad 0 |
+| 正方形 | SqGood 12800 × 2 |
+| 背景 | BgGood 19968 × 2、OutsideChanged 0 |
+| CP | IbBaseLow 0x70100400、IbRemaining 0。エラー割り込みと fault はなし |
+| 後始末 | HoldMs 2000、RestoreMismatch 0 |
+
+**わかったこと：**
+- 後から足した heap region（0x70100000）に置いた IB、VB、shader、sampler、texture で、そのまま描画できた。
+- allocator で確保・解放を繰り返しても壊れなかった。フェンスで Retire / Reclaim し、領域は再利用された（Reuse 120）。
+- 2 フレームを同時に処理する状態には、実際にはならなかった。各フレームの後に 16 ms 待っていて、その間に GPU が処理を終えるので、MaxInFlight は 1 のままだった。
+  - そのため、IB は毎フレーム 0x400、VB は 0x5C0 に確保された。
+  - フェンスより前に解放した領域を使い回していないかの確認は、次の段階でフレーム間の待ちをなくして行う。
+
+**後の段階の前提（H-1 の後）：**
+- ring の dword 265..813 は H-1 の packet。j=1 が 0x70100000+IbOffset[f]、j=6 が 0x70100008、j=8 が A3000000|f。それ以外は Q-1 の規則のまま。
+- WPTR / RPTR / shadow は 814。
+- heap region は map されたままで、静的なオブジェクトは上の offset にある。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`
