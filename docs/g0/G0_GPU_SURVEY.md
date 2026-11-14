@@ -5896,6 +5896,267 @@ WptrWritesはAHB再送を含む。WaitMaxUs/WaitTotalUsは完了待ちの時間�
 - WPTR / RPTR / shadow は 814。
 - heap region は map されたままで、静的なオブジェクトは上の offset にある。
 
+#### 9.21.62 B-1 の提案：GMEM で、heap から確保した IB を使って連続描画し、2 フレームを同時に処理させる（文章仕様）
+
+H-1 の回る正方形（Q-1 と同じ絵）を、M-1 の GMEM（tile 描画）で毎フレーム描く。IB と VB は H-1 の heap から毎フレーム確保する。フレームの間の待ち（H-1 の 16 ms）は入れない。
+
+この段階で新しく確かめることは次の 4 つである。
+
+- **GMEM での連続描画：** M-1 は 1 回だけだった。B-1 では、GMEM への切り替え、12 tile の load・draw・store、sysmem への切り戻しを 61 回繰り返す。
+- **背景と正方形を GMEM で 1 回の draw で描く：** Q-1 の texture の背景列と 12 頂点の VB を、そのまま tile の中で描く。
+- **2 フレームを同時に GPU に渡す：** H-1 では一度も起きなかった（MaxInFlight 1）。B-1 では、GPU 側で待つ packet（CP_WAIT_REG_MEM）を使って GPU をわざと止め、その間に次のフレームを確保・投入する。これで「GPU が処理中の IB / VB を CPU が書かない」ことを、確実に確かめる。
+- **GPU が memory を見て待つ packet：** CP_WAIT_REG_MEM はまだ使ったことがない。B-1 では、すべてのフレームの IB の先頭に置く。
+
+**前提の事実：**
+- **H-1 の後の状態：**
+  - RPTR / WPTR / shadow は 814、`CP_RB_CNTL` は 0x20B、RB_CCU_CNTL は 0x10000000。
+  - heap region（IOVA 0x70100000、0x40000 B）は map されたまま。
+  - allocator は static の 6 つ（960 B）だけを確保した状態で、退避の表は空。
+  - フレームの領域だった 0x400..0x8C0 には、H-1 のフレームの古い中身が残っている（解放済み）。
+- B-1 は **H-1 と同じ allocator をそのまま使い続ける**。初期化し直さない。H-1 の static の FS / SAMP / BORDER / TCONST / TEX も、書き直さずに使う。
+- **heap region は、Probe2 の bit8 が立っているときに plan に足す**（H-1 の「511 のときだけ」を「bit8 が立っているとき」に読み替える。B-1 の 1023 でも足す）。
+- 描画の state は IB11 の群 S（dw 0..48、49 語）と同じ。heap のアドレスに書き換える 8 語は H-1 と同じ（dw 12 / 20 が FS、23 / 26 が BORDER、30 / 33 が SAMP、37 / 40 が TCONST）。IB11 の群 A / B（sysmem 用の scissor・MRT・draw・TS）は使わない。
+- GMEM の部分は M-1 の表（`epi_gmu_m1_table.inc`）を使う。変えるのは次の点だけである。
+  - IB10S の 2 つの TS の宛先（data[43] / [44] から heap へ）。
+  - IB10PA / PB の VFD_FETCH の BASE（heap の VB）と SIZE（0xC0 から 0x180、12 頂点）。
+  - tile の本体はどちらのパスも **IB10TB（LOAD → draw → STORE）**。draw の頂点数を 6 から **12** にする。
+  - tile ごとの PC_CCU_RESOLVE_TS の宛先と値。
+- **パス A も LOAD にする理由：** 背景の draw は箱（列 412..667）の全体を塗る。一方で blit scissor は 16×4 単位に揃えた列 400..671 で、箱より 12 + 4 列広い。M-1 のように clear すると、この余りの列が clear 色に変わる。LOAD すれば、余りの列は sysmem の値のまま store で書き戻されるので、変わらない。
+- **CP_WAIT_REG_MEM（opcode 0x3C、6 語）：** Linux `adreno_pm4.xml` と Turnip での使い方。
+  - 語 0 は FUNCTION（bit0..2。WRITE_EQ = 3）と POLL（bit4..5。POLL_MEMORY = 1）で、**0x13**。
+  - 語 1 / 2 は待つ memory のアドレス lo / hi。語 3 は比べる値（REF）。語 4 は MASK（0xFFFFFFFF）。語 5 は DELAY_LOOP_CYCLES（Turnip と同じ **16**）。
+  - header は **0x70BC8006**。
+  - `(memory & MASK) == REF` になるまで CP がその場で待つ。後ろの packet は実行されない。
+
+**heap の追加の static（B-1 の始めに 1 回だけ確保）：**
+
+| 名前 | 大きさ | Align | offset | IOVA | 中身 |
+|---|---|---|---|---|---|
+| TS2 | 64 B（1 granule） | 64 | **0x1C0** | 0x701001C0 | 16 語。下の表。始めに書く |
+
+- first fit なので、H-1 の static の間に残っていた 0x1C0..0x200 の 1 granule に入る。違えば前段の失敗（Reason 13）にする。
+
+| TS2 の語 | IOVA | 用途 | 始めの値 | 最後の期待値 |
+|---|---|---|---|---|
+| 0..11 | 0x701001C0 + 4k | tile k の後の PC_CCU_RESOLVE_TS | 0xFFFFFFFF | `0xB4000000 \| (60<<8) \| k` = 0xB4003C00..0xB4003C0B |
+| 12 | 0x701001F0 | IB10S の PC_CCU_FLUSH_COLOR_TS | 0xFFFFFFFF | 0xB2000100（IB10S の値のまま） |
+| 13 | 0x701001F4 | IB10S の PC_CCU_FLUSH_DEPTH_TS | 0xFFFFFFFF | 0xB2000101（同上） |
+| 14 | 0x701001F8 | フレームの fence（ring の CACHE_FLUSH_TS） | 0xFFFFFFFF | `0xA4000000 \| 60` = 0xA400003C |
+| 15 | 0x701001FC | gate（CP_WAIT_REG_MEM が見る語） | **0xA5000000** | 0xA5000032 |
+
+- TS の値は、IB に書いた値のまま GPU が書く（H-1 の v81 の教訓）。tile の TS の値はフレームごとに違い、CPU が IB に書く。
+
+**フレームごとの IB（701 語 = 2804 B、44 granule、Align 64）：** 各部をつなげて 1 本の IB にする。中から別の IB は呼ばない（IB2 は使わない）。
+
+| dw | 長さ | 中身 | フレームごとに変わる語 |
+|---|---|---|---|
+| 0..6 | 7 | CP_WAIT_REG_MEM：`70BC8006 00000013 701001FC 00000000 (REF) FFFFFFFF 00000010` | dw 4 の REF = G(f) |
+| 7..55 | 49 | IB11 の群 S（8 語を heap のアドレスに書き換える） | なし |
+| 56..100 | 45 | IB10S。dw 58 = 0x701001F0、dw 63 = 0x701001F4 | なし |
+| 101..121 | 21 | IB10PA。dw 105 = VB、dw 107 = 0x180 | dw 105 |
+| 122..385 | 6 × 44 | パス A の tile k = 0..5：SEL k（16）、IB10TB で頂点数 12（23）、PC_CCU_RESOLVE_TS（5） | 各 tile の最後の語 |
+| 386..406 | 21 | IB10PB。dw 390 = VB + 384、dw 392 = 0x180 | dw 390 |
+| 407..670 | 6 × 44 | パス B の tile k = 6..11（同じ形） | 各 tile の最後の語 |
+| 671..700 | 30 | IB10E | なし |
+
+- tile k の PC_CCU_RESOLVE_TS は `70460004 0000001A (0x701001C0 + 4k) 00000000 (0xB4000000 | f<<8 | k)`。値の語は、k < 6 なら dw `165 + 44k`、k ≥ 6 なら dw `450 + 44(k−6)`。
+- tile k の SEL と tile の格子・順序は M-1 と同じ（SEL k を書き換えずに使う）。
+- IB の中に、ring の region（0x70010000..0x70018000）のアドレスが 1 つも残らないこと（生成器で確かめた）。
+- フレーム 0 の IB の全語は、生成器が `b1_ib_f0.txt` に出す（VB = 0x70100F00 のとき）。
+
+**gate の値 G(f)：**
+- gate を使うフレーム（**gate フレーム**）は g ∈ {**10, 30, 50**}。
+- G(f) は `0xA5000000 | (f 以下で最大の gate フレーム。なければ 0)`。
+  - f = 0..9 は 0xA5000000、10..29 は 0xA500000A、30..49 は 0xA500001E、50..60 は 0xA5000032。
+- gate の語の値は、始めは 0xA5000000。CPU は gate フレーム g の**次のフレーム g+1 を投入した後で**、0xA5000000|g を書く。
+- そのため、gate フレーム g の IB は、CPU が gate を書くまで先頭で止まる。ほかのフレームは、gate の値がもう一致しているので止まらない（CP_WAIT_REG_MEM は毎フレーム実行されるが、すぐに通る）。
+
+**VB：** H-1 と同じ（768 B、前半がパス A、後半がパス B、正方形は表 `(2f) % 120`、背景の 6 頂点は s = 8.5、t = 0.5）。毎フレーム 192 語をすべて書く。
+
+**ring packet：** H-1 と同じ形の 9 dw。
+- `70BF8003 (0x70100000 + IbOffset[f]) 00000000 000002BD 70460004 00000004 701001F8 00000000 (0xA4000000|f)`。
+- IB の大きさは 701 = **0x2BD**。
+- 書く位置は ring dword `814 + 9f .. 822 + 9f`、投入後の WPTR は `814 + 9(f+1)`。最後は **1363**。折り返さない。
+
+**heap の使い方の見込み**（生成器の first fit の計算）：
+- フレーム 0 は IB 0x400..0xF00、VB **0xF00**..0x1200（H-1 のフレームの跡 0x400..0x8C0 を含むので、再利用になる）。
+- 確保 123 回（TS2 1 + フレーム 122）、解放 122 回、最後の LiveBytes 1024 B（static 960 + TS2 64）。
+- 同時に生きているのは最大 3 フレーム（1 フレーム 3584 B）。PeakBytes は 1024 + 3 × 3584 = 11776 B 以下。計算では、gate のあるときに 8192 B。
+
+**手順（H-1 の復元の後、OOB 解除前）：**
+1. 前段：次がすべて成り立つことを確かめる。不成立なら Reason 8 / 12 / 13 / 15 で未投入とする。
+   - H-1 の Status が成功、Reason 0、Checks 0x3F。
+   - RPTR / WPTR / shadow 814、`CP_RB_CNTL` 0x20B、RB_CCU_CNTL 0x10000000、MASK 0。
+   - ring が H-1 の後の規則と一致する（記録した IbOffset[f] を使う）。
+   - allocator：LiveBytes 960、退避の表が空、FailCount 0。
+   - H-1 の static の 5 つ（FS、SAMP、BORDER、TCONST、TEX）が書いた値のまま。H-1 の TS[0..2] が CAFE001B / CAFE001C / A300003C。
+2. band と、ring の region の後半 16 KB の退避は H-1 と同じ。H-1 の復元後の band を改めて退避する。
+3. 準備：TS2 を `Alloc(64, 64)` で確保し（offset 0x1C0 を求める）、上の始めの値を書いて読み返す。
+4. フレーム f = 0..60 について、次を繰り返す。
+   1. `Completed`（TS2[14] が `0xA4000000|k` なら k、0xFFFFFFFF なら「まだない」= −1）を読む。まだないのでなければ `Reclaim(Completed)` を呼ぶ。
+      - 上位 8 bit が 0xA4 でも 0xFF でもない値、または投入していないフレームの値は Reason 13。前回より小さければ Reason 20。
+   2. IB（2804 B）と VB（768 B）を `Alloc` する。失敗したら Reason 19。offset を `IbOffset[f]` / `VbOffset[f]` に記録する。
+      - **重なりの確認：** まだ完了していないフレーム（Completed より後で、投入済みのもの）の IB / VB の範囲と、今回の範囲が重なっていないことを確かめる。重なれば `OverlapBad` を増やして止める（Reason 13）。
+   3. VB と IB を書き、バリアを置いて読み返す。違えば Reason 13。
+   4. ring packet を書き、バリアを置いて読み返し、WPTR を書く。
+   5. IB と VB を `Retire(…, f)` で退避の表に積む。
+   6. 書いた直後に TS2[14] を一度読み、`InFlight[f]` = f − Completed（まだないなら f + 1）を記録する。
+   7. **f が gate フレーム g の場合：**
+      - Completed ≥ g − 1 になるまで待つ（上限 100 ms）。
+      - そのあと **2 ms**（100 µs × 20 回の `KeStallExecutionProcessor`）待ち、TS2[14] がまだ g − 1 であることを確かめる（`GateHeldA`）。CP の IB1 の base を読み、`GateIbBase` に記録する（CP の先読みがあるので、判定には使わない。`0x70100000 + IbOffset[g]` の近くの値なら、gate で止まっている目安になる）。
+      - 次の手順 8 の待ちは飛ばし、すぐ次のフレーム g+1 に進む。
+   8. **f が gate フレームの次（f = g+1）の場合：**
+      - 手順 6 で読んだ Completed がまだ g − 1 であること（g と g+1 の 2 フレームがどちらも未完了）を `GateHeldB` とする。
+      - gate の語に `0xA5000000 | g` を書き、バリアを置く（`GateReleased`）。
+   9. **f ≥ 1 なら、Completed ≥ f − 1 になるまで待つ**（gate フレームは手順 7 で済んでいる）。上限は 100 ms（Reason 16）。待つ間に RPTR ≥ 4096 を読んだら Reason 18、エラー割り込みは Reason 14。
+   10. フレームの間の 16 ms の待ちは**入れない**。16 フレームごとに breadcrumb `0x2140 + f/16` を書く。
+5. 最後に、Completed = 60、RPTR == WPTR == shadow == 1363、RBBM / CX_BUSY が idle、IB1 の残り 0 になるまで待つ（上限 100 ms）。そのあと `Reclaim(60)` を呼ぶ。RB_CCU_CNTL を CPU から読む（`CcuAfter`、期待値 0x10000000）。
+6. 判定し、**2 秒保持**してから復元する。保持中の画面は角度 0 の正方形（H-1 の最後と同じ絵）。
+7. 復元と照合は D-1 と同じ。途中で止まった場合も、band を map できていれば必ず復元する。
+   - **途中で止まった場合の gate：** gate フレームで止まると、CP は gate の前で待ち続ける。復元の前に、gate の語にその gate フレームの値を書いて CP を進めてから、通常の後始末に入る（それでも進まない場合は、既存の slumber / reset の後始末に任せる）。
+- heap の中身は復元しない。
+
+- **gate フレームの待ちの組み立て（g = 10 の例）：** フレーム 10 を投入 → フレーム 9 の完了を待つ → 2 ms 待ってフレーム 10 が止まっていることを見る → フレーム 11 を確保・投入（このとき、10 と 11 の 2 フレームが GPU 側にある）→ フレーム 10 がまだ完了していないことを見る → gate を開ける → フレーム 10 の完了を待つ → フレーム 12 へ。
+
+**ring の最後の内容：** H-1 の後の規則に、814..1362 を B-1 の packet で置き換えたもの。位置 `814 + 9f + j` の期待値は、j = 1 が `0x70100000 + IbOffset[f]`、j = 3 が 0x2BD、j = 6 が 0x701001F8、j = 8 が `0xA4000000|f`、ほかは上の固定の語。
+
+**最後のフレーム（角度 0）の期待画像：** H-1 / Q-1 と同じ。
+- 正方形 12800 画素 × 2 パリティが texel と完全に一致する。
+- 背景 19968 画素 × 2 パリティが 0xFF202020。
+- 箱の外の band は退避値のまま。blit scissor の余り（パス A の列 400..411 / 668..671、パス B の画面列 408..411 / 668..679）も、LOAD と STORE を通るだけなので退避値のままである。
+- 標本は Q-1 と同じ 10 点 × 2 パリティ。
+
+**判定（Checks）：**
+- bit0：前段の条件すべて（H-1 成功、ring の状態、CCU、allocator と static の状態、TS2 の offset 0x1C0）。
+- bit1：61 フレームすべてが順に完了した。
+  - TS2[14] = 0xA400003C、TS2[0..11] = 0xB4003C00..0xB4003C0B、TS2[12] / [13] = 0xB2000100 / 0xB2000101。
+  - RPTR / WPTR / shadow 1363、idle、IB1 の残り 0、エラー割り込みなし、CcuAfter 0x10000000。
+  - fence が一度も逆行していない。`FramesDone` 61。
+- bit2：allocator が期待どおりに動いた。
+  - B-1 の中の数で、AllocCount 123、FreeCount 122、FailCount 0。
+  - 最後の LiveBytes 1024 B、PeakBytes ≤ 11776 B、ReuseCount ≥ 1、退避の表が空。
+- bit3：**2 フレームを同時に処理した。**
+  - 3 つの gate フレームのすべてで、GateHeldA と GateHeldB が成り立った。
+  - `MaxInFlight`（InFlight[f] の最大）が **2**（2 を超えない）。
+  - `OverlapBad` 0。
+  - gate の語の最後の値が 0xA5000032。
+- bit4：メモリがすべて期待どおり。
+  - H-1 の static の 5 つと H-1 の TS[0..2] が変わっていない。
+  - heap の `HighWater` より後ろがすべて 0。
+  - ring の 4096 語が上の規則と一致する。
+  - ring の region の後半 16 KB が退避値と同じ。
+- bit5：画面が期待どおり（上の期待画像）。
+- bit6：復元後の band が退避値と完全に一致する。
+- 期待値は **0x7F**。
+- Reason 21：bit3 だけが成り立たない場合（gate で止まらなかった、など）。ほかの失敗の理由があれば、そちらを優先する。gate が効かなくても、描画とほかの判定は最後まで続ける。
+
+**probe：** `EpiGpuProbe2` の bit9 を B-1 とする。
+- B-1 は bit0..8 を必要とする。実行値は Probe 0xBFFFFE80 + Probe2 **1023**。
+- 許す組み合わせは Probe2 ∈ {0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023} だけで、それ以外は status 6。
+
+**診断 `GpuGmuB1`（REG_BINARY、ABI は実装側で固定）：**
+- `Cp`（G2 形式）、`HChecks`、`HReason`、`CcuBefore`、`CcuAfter`、`RbCntlLive`。
+- allocator：`LiveBytes`、`PeakBytes`、`HighWater`、`AllocCount`、`FreeCount`、`FailCount`、`ReuseCount`、`RetirePending`、`Ts2Offset`、`DistinctIb`。B-1 の中の数（AllocCount など）は、B-1 の始めの値を引いたもの。
+- フレーム：`FramesDone`、`FailFrame`、`FailFence`、`FailRptr`、`FailWptr`、`MaxRptrSeen`、`MaxInFlight`、`InFlight2Count`（InFlight[f] = 2 だったフレームの数。gate のない自然な重なりも数える）、`FenceBackwards`、`OverlapBad`、`WptrWrites`。
+- gate：`GateHeldA[3]`、`GateHeldB[3]`、`GateFenceA[3]` / `GateFenceB[3]`（そのとき読んだ TS2[14]）、`GateIbBase[3]`、`GateReleased`（開けた数）、`GateFinal`。
+- 時間：`WaitMaxUs`、`WaitTotalUs`、`ElapsedMs`（最初の投入から最後の完了まで。保持は含まない）。
+- メモリ：`Ts2After[16]`、`StaticBad`、`StaticFirst`、`TailBad`、`TailFirst`、`RingBad`、`RingFirst`、`RingValue`、`RingExpected`、`OldTailBad`、`OldTailFirst`。
+- 画素：H-1 と同じ `SqGood[2]` … `Sample[20]`。
+- レジスタと状態：`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow / High`、`IbRemaining`、`GlobalStatus[2]`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`。
+- 後始末：`RestoreMismatch`、`RestoreFirst`、`HoldMs`、`Checks`、`Prepared`、`BackupStatus`、`HoldStatus`、`RestoreStatus`。
+- 履歴：`IbOffset[61]`、`VbOffset[61]`、`InFlight[61]`。
+- breadcrumb は 0x2100 番台。gate g の i 番目（i = 0..2）は 0x2150 + i、保持は 0x2130、復元は 0x2131 / 32、フレームは 0x2140..0x2143。
+- Reason：21 は gate の確認の失敗。ほかは H-1 と同じ。
+
+**失敗したときの見分け方：**
+- **フレーム 0 の先頭で止まる（Completed がずっと −1）：** CP_WAIT_REG_MEM の形の誤り（語 0 の値、アドレス、REF）。GateIbBase が IB の先頭付近なら、gate で止まっている。エラー割り込みが出れば、packet そのものを CP が受け付けていない。
+- **gate フレームで GateHeldA が成り立たない：** CP_WAIT_REG_MEM が待たずに通った（FUNCTION や POLL の誤り、または値の比べ方の違い）。描画は続くので、絵と bit3 以外の判定は確かめられる。
+- **フレーム 0 で絵や TS がおかしい：** GMEM の部分（IB10S / PA / PB / TB / E）の書き換え（VB のアドレス、SIZE、頂点数）か、IB11 の群 S と GMEM の組み合わせの誤り。TS2[0..11] で、どの tile まで進んだかがわかる。
+- **blit scissor の余りの列が変わる：** パス A の LOAD が効いていない。
+- **最後の絵が前のフレームの絵になる：** 再利用した VB の古い内容が UCHE に残っている（IB11 の先頭の CACHE_INVALIDATE が gate の後にあることを確かめる）。
+- **2 フレーム同時のときだけ絵や TS が壊れる：** CPU が処理中のフレームの領域を書いた。OverlapBad と IbOffset / VbOffset の履歴で調べる。
+
+**危険と対策：**
+- **CP を止めておく時間：** gate で止めるのは 1 回あたり 2 ms と少し。RBBM の hang 検出が出た場合は Reason 14 で止まる。そのときは待ちを 2 ms より短くする。
+- **gate が開かない：** CPU の書き込みは noncached で、バリアの後に GPU から見える（H-1 の fence と同じ経路の逆向き）。開かなければ 100 ms で Reason 16 になり、手順 7 の後始末に入る。
+- **GMEM の状態が残る：** 途中で止まると RB_CCU_CNTL が 0x3C400000 のまま残ることがある。M-1 と同じく CcuAfter を記録し、次の実行の前の再起動に頼る。
+- **時間：** フレームの間の待ちがないので、61 フレームで数十 ms の見込み。保持を足して約 2 秒。
+- **heap の範囲：** TP、VFD、CP が読むのは heap の中の確保済みの範囲と static だけである。書き込み先は TS2（heap）と band（blit scissor で箱の近くに限られる）だけである。
+
+**分担：**
+- 実装（gate、GMEM の IB の組み立て、投入、判定）：ユーザー。
+- 机上試験の shim の追加：実装と一緒にユーザー。shim は、gate の語が REF と一致するまで job を進めない。
+
+**生成器：** scratchpad の `tools/b1ib.py`。次を出力する。
+- フレーム 0 の IB（`b1_ib_f0.txt`、701 語）。
+- 古いアドレスが残っていないことの確認。
+- ring の位置。
+- heap の first fit の計算（GPU が速い場合、gate のときだけ遅れる場合、いつも 1 フレーム遅れる場合）。
+
+**この後：** B-1 が通れば、3（DXGK の present への接続）に進む。
+
+#### 9.21.63 B-1 の実装
+
+`GmuB1Submit`（`epi_gmu.cxx`）として実装した。`EPI_GMU_PROBE2_B1 = 0x200`、許す値に 1023 を追加。診断 `GpuGmuB1` は 1424 B（356 ULONG）。
+
+- **plan の条件：** `EpiGpuProbe2` の bit8 が H-1 を有効にし、`GmuH1Plan` はその H-1 の有効で呼ばれる。1023 は bit8 を含むので追加の変更は要らない。
+- **IB：** `GmuB1IbWord` が 701 語を 1 語ずつ計算する。生成器 `b1ib.py` の 6 通り（f と VB の組）と全語の FNV-1a が一致する。
+- **gate：** 仕様どおり。gate フレーム 10 / 30 / 50 は、投入、フレーム g−1 の完了待ち、2 ms の待ち、`GateHeldA`、次のフレームの投入、`GateHeldB`、gate を開ける、の順。
+- **途中で止まったとき：** 後始末が gate の語を最後に投入したフレームの値にし、最大 100 ms 待ってから band を復元する。
+- **FenceBackwards：** 後始末の待ちでも同じ fence を読むので、逆行を検出した場合は 2 以上になりうる（判定は 0 かどうかだけ）。
+- **机上試験：** `gmu_shim.hxx` に B-1 の peer を足した。IB の `CP_WAIT_REG_MEM` の REF と gate の語が一致するまで、そのジョブと後続を止める。成功（Checks 0x7F、MaxInFlight 2、alloc 123 / free 122 / live 1024 / peak 8192 / reuse 119、生成器の「gate only」と一致）、gate が効かない場合（0x77 / Reason 21）、描画・heap・fence の破損、タイムアウト（gate フレームを含む）、gate 中のエラー割り込み、前段の不成立、各 breadcrumb の失敗、保存・復元・確保の失敗を確かめた。
+- DriverVer 83 をビルドし、スタック検査に通った（max_frame 1456）。
+
+
+#### 9.21.64 B-1 の実機結果（v83、成功）
+
+DriverVer 20.0.2.83（oem141）で、再起動の直後（v34-akat）に Probe 0xBFFFFE80 と Probe2 **1023** を指定し、restart-device を 1 回実行した。
+
+- GpuProbeStatus 0、GpuGmuStatus 0。breadcrumb は最後に 0xFFFF になり、デバイスは正常（CM_PROB_NONE）。
+- stack は 0x11F60 / 0x113E8。
+- 前段の H-1 も Checks 0x3F だった。
+
+**判定：** Checks **0x7F**、Reason 0。
+
+| 項目 | 結果 |
+|---|---|
+| 前段 | HChecks 0x3F、CcuBefore 0x10000000、RbCntlLive 0x20B、TS2 の offset 0x1C0 |
+| フレーム | FramesDone **61**、FailFrame なし、WptrWrites 61、MaxRptrSeen 1363、FenceBackwards 0 |
+| RPTR / WPTR / shadow | 814 → **1363**（0x553） |
+| TS2 | tile の TS 0xB4003C00..0xB4003C0B、flush 0xB2000100 / 0xB2000101、fence **0xA400003C**、gate **0xA5000032** |
+| CCU | CcuAfter 0x10000000（61 回とも sysmem に戻った） |
+| 時間 | ElapsedMs **31**（61 フレームで、1 フレーム約 0.5 ms）。WaitMaxUs 0 |
+| gate | 3 回とも GateHeldA / GateHeldB が成り立った。gate で待っている間の fence は 0xA4000009 / 0xA400001D / 0xA4000031（g − 1）。GateIbBase はどれも 0x70100400（gate フレームの IB の先頭） |
+| 同時に処理中のフレーム | **MaxInFlight 2**、InFlight2Count **3**（フレーム 11、31、51 だけ）。ほかのフレームは 1 |
+| 確保 | Alloc 123、Free 122、Fail 0、Reuse 119、RetirePending 0、OverlapBad 0 |
+| 使用量 | Live 1024 B、Peak **8192** B、HighWater 0x2000、DistinctIb 2 |
+| 配置 | IB は 0x400 と 0x1200、VB は 0xF00 と 0x1D00 を、フレームごとに交互に使った |
+| メモリ | StaticBad 0、TailBad 0、RingBad 0、OldTailBad 0 |
+| 正方形 | SqGood 12800 × 2、TexelBad 0、SqBg 0 |
+| 背景 | BgGood 19968 × 2（0xFF202020）、OutsideChanged 0（blit scissor の余りの列も変わっていない） |
+| 標本 | 10 点すべて、偶数行・奇数行とも期待値どおり |
+| CP | IbBaseLow 0x70100400、IbRemaining 0。エラー割り込み、protect、global fault はなし。SMMU の Fsr 0x400 / Fsynr 0xF001B は以前からの古い値 |
+| 後始末 | HoldMs 2000、RestoreMismatch 0 |
+
+**わかったこと：**
+- GMEM での描画（GMEM への切り替え、12 tile の LOAD・draw・STORE、sysmem への切り戻し）を、61 回続けても正しく動いた。最後の絵は Q-1 / H-1 と同じで、許容 0 で一致した。
+- 両パスを LOAD にしたので、blit scissor の余りの列は 1 画素も変わらなかった。
+- CP_WAIT_REG_MEM（0x70BC8006、POLL_MEMORY、WRITE_EQ）は仕様どおりに働いた。
+  - gate の値が一致するまで、CP は IB の先頭で待った。2 ms 待っても fence は進まなかった。
+  - CPU が noncached の memory に書いた値を見て、先に進んだ。
+  - 一致しているフレームでは、すぐに通った。
+- 2 フレームを同時に GPU に渡した状態で、CPU は別の領域に次のフレームを確保して書いた。どちらのフレームの絵と TS も正しかった。
+- フレーム間の待ちをなくすと、GPU は CPU が次のフレームを準備する間に処理を終える（gate のないフレームは InFlight 1）。完了の確認が次のフレームの確保の後になるので、IB と VB は 2 か所を交互に使った。
+- 1 フレームの GMEM 描画は 0.5 ms 程度で、ring の 1 回の待ちは 1 tick 未満だった。
+
+**後の段階の前提（B-1 の後）：**
+- ring の dword 814..1362 は B-1 の packet。j = 1 が `0x70100000 + IbOffset[f]`（0x400 と 0x1200 が交互）、j = 3 が 0x2BD、j = 6 が 0x701001F8、j = 8 が 0xA4000000|f。それ以外は H-1 の後の規則のまま。
+- WPTR / RPTR / shadow は 1363。
+- allocator は static の 7 つ（1024 B）を確保した状態。TS2 は上の値。
+- RB_CCU_CNTL 0x10000000、bin の設定は sysmem 用の値。
+
+**この後：** 3（DXGK の present への接続）に進む。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

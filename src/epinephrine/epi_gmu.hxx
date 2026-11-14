@@ -35,10 +35,11 @@
 #define EPI_GMU_PROBE2_W1      0x20UL // requires T1; Probe2=63, opt-in 16-KB ring/wrap test
 #define EPI_GMU_PROBE2_M1      0x40UL // requires W1; Probe2=127, GMEM tile clear/load/store
 #define EPI_GMU_PROBE2_Q1      0x80UL // requires M1; Probe2=255, rotating textured quad
+#define EPI_GMU_PROBE2_B1      0x200UL // requires H1; Probe2=1023, gated GMEM frames
 #define EPI_GMU_PROBE2_H1      0x100UL // requires Q1; Probe2=511, boot-mapped heap and two-frame submission
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511 || Probe2==1023) && Probe==0xBFFFFE80UL);
 }
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
@@ -556,4 +557,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE,BOOLEAN B1 = FALSE);

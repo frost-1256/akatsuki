@@ -355,6 +355,48 @@ inline void H1Drain() {
         ++h1DoneJobs;
     }
 }
+// B-1 peer: an ordered GPU model. CP_WAIT_REG_MEM (IB dw 0..6) holds a job, and every later job, until the gate word equals REF.
+static bool allowB1Writes=false,b1Active=false,b1NoDraw=false,b1IgnoreGate=false,b1Outside=false,b1SaveFails=false;
+static ULONG b1StopFrame=0xFFFFFFFF,b1ErrorAtSubmit=0xFFFFFFFF,b1DamageHeap=0xFFFFFFFF,b1BadFenceFrame=0xFFFFFFFF,b1BackwardsFrame=0xFFFFFFFF;
+struct B1_JOB { ULONG Frame,Ib,Vb,Target; std::vector<ULONG> Commands,Vertices; };
+static std::vector<B1_JOB> b1Jobs;
+static std::vector<ULONG> b1Writes,b1Held;
+static ULONG b1DoneJobs=0,b1MaxPending=0;
+inline void B1Drain() {
+    while(b1DoneJobs<b1Jobs.size()) {
+        const auto& job=b1Jobs[b1DoneJobs];
+        if(job.Frame==b1StopFrame) break;
+        if(!b1IgnoreGate && h1Heap[0x1FC/4]!=job.Commands[4]) {
+            bool seen=false; for(ULONG f:b1Held) if(f==job.Frame) seen=true;
+            if(!seen) b1Held.push_back(job.Frame);
+            break;
+        }
+        // A job in flight must still see exactly what was published (the CPU never reuses its IB/VB early).
+        for(ULONG i=0;i<701;++i) assert(h1Heap[job.Ib/4+i]==job.Commands[i]);
+        for(ULONG i=0;i<192;++i) assert(h1Heap[job.Vb/4+i]==job.Vertices[i]);
+        const ULONG* c=job.Commands.data();
+        for(ULONG k=0;k<12;++k) {
+            const ULONG d=k<6 ? 163+44*k : 448+44*(k-6);
+            assert(c[d]==0x701001C0+4*k && c[d+2]==(0xB4000000UL|(job.Frame<<8)|k));
+            h1Heap[0x1C0/4+k]=c[d+2];
+        }
+        h1Heap[0x1F0/4]=c[60]; h1Heap[0x1F4/4]=c[65]; // IB10S flush TS payloads
+        h1Heap[0x1F8/4]=job.Frame==b1BadFenceFrame ? 0x12340000 : (0xA4000000|(job.Frame==b1BackwardsFrame ? 0 : job.Frame));
+        if(job.Frame==60) {
+            if(!b1NoDraw) for(ULONG y=1072;y<1328;++y) for(ULONG x=412;x<668;++x) {
+                const ULONG v=(y-1072)/2;
+                const ULONG color=x>=460 && x<620 && v>=24 && v<104 ? h1Heap[0x200/4+(v-24)/10*16+(x-460)/20] : 0xFF202020;
+                d1Band[(y*4320+x*4-0x462000)/4]=color;
+            }
+            if(b1Outside) d1Band[(1072*4320+411*4-0x462000)/4]^=1;
+            if(b1DamageHeap<0x40000) h1Heap[b1DamageHeap/4]^=1;
+        }
+        *g2Shadow=job.Target; *GmuCfgReg(0x806)=job.Target;
+        ++b1DoneJobs;
+    }
+    if(b1DoneJobs<b1Jobs.size()) {*GmuCfgReg(0x928)=0x70100000+b1Jobs[b1DoneJobs].Ib; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=1;}
+    else *GmuCfgReg(0x92A)=0;
+}
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -426,6 +468,7 @@ inline ULONG GmuMmioRead(volatile ULONG* p) {
     if(a1Pending!=0xFFFFFFFF && testInterruptTime>=a1Due) A1PeerComplete(a1Pending);
     if(t1Pending && testInterruptTime>=t1Due) T1PeerComplete();
     if(h1Active) H1Drain();
+    if(b1Active) B1Drain();
     if(q1Pending && testInterruptTime>=q1Due) Q1PeerComplete(q1PendingFrame);
     if(m1Pending && testInterruptTime>=m1Due) M1PeerComplete();
     if(w1Pending && testInterruptTime>=w1Due) W1PeerComplete(w1PendingPub,w1PendingTarget,w1PendingLast);
@@ -445,6 +488,33 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && allowB1Writes && b1Active) {
+        const ULONG frame=static_cast<ULONG>(b1Jobs.size());
+        assert(frame<61 && h1Heap && v==814+9*(frame+1) && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
+        b1Writes.push_back(v); g2Writes.push_back({0x807,v});
+        *p=v; gPages[2][0x313]=0;
+        const ULONG* packet=g2Ring+814+9*frame;
+        assert(packet[0]==0x70BF8003 && packet[1]>=0x70100000 && packet[1]<0x70140000 && packet[2]==0 && packet[3]==701);
+        assert(packet[4]==0x70460004 && packet[5]==4 && packet[6]==0x701001F8 && packet[7]==0 && packet[8]==(0xA4000000|frame));
+        const ULONG ib=packet[1]-0x70100000; assert(ib+2804<=0x40000 && !(ib&63));
+        const ULONG* cmd=h1Heap+ib/4;
+        const ULONG gate=0xA5000000|(frame>=50 ? 50 : frame>=30 ? 30 : frame>=10 ? 10 : 0);
+        assert(cmd[0]==0x70BC8006 && cmd[1]==0x13 && cmd[2]==0x701001FC && cmd[3]==0 && cmd[4]==gate && cmd[5]==0xFFFFFFFF && cmd[6]==16);
+        const ULONG b=7; // IB11 group S
+        assert(cmd[b+12]==0x70100080 && cmd[b+20]==0x70100080 && cmd[b+23]==0x70100100 && cmd[b+26]==0x70100100);
+        assert(cmd[b+30]==0x70100040 && cmd[b+33]==0x70100040 && cmd[b+37]==0x70100180 && cmd[b+40]==0x70100180);
+        assert(cmd[58]==0x701001F0 && cmd[63]==0x701001F4 && cmd[60]==0xB2000100 && cmd[65]==0xB2000101);
+        assert(cmd[107]==0x180 && cmd[392]==0x180 && cmd[390]==cmd[105]+384 && cmd[105]>=0x70100000);
+        for(ULONG i=0;i<701;++i) assert(!(cmd[i]>=0x70010000 && cmd[i]<0x70018000)); // no stale ring address
+        const ULONG vb=cmd[105]-0x70100000; assert(vb+768<=0x40000 && !(vb&63));
+        if(frame==0) assert(ib==0x400 && vb==0xF00);
+        b1Jobs.push_back({frame,ib,vb,v,std::vector<ULONG>(cmd,cmd+701),std::vector<ULONG>(h1Heap+vb/4,h1Heap+vb/4+192)});
+        gPages[8][0x210]=1; gPages[8][0x201]=0; gPages[2][0x30C]=0;
+        if(frame==b1ErrorAtSubmit) gPages[8][0x201]|=1UL<<9;
+        B1Drain();
+        const ULONG pending=static_cast<ULONG>(b1Jobs.size())-b1DoneJobs; if(pending>b1MaxPending) b1MaxPending=pending;
+        return;
+    }
     if(p==GmuCfgReg(0x807) && allowH1Writes && h1Active) {
         const ULONG frame=static_cast<ULONG>(h1Jobs.size());
         assert(frame<61 && h1Heap && v==265+9*(frame+1) && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
@@ -903,6 +973,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
         if(v==0x2003 && allowH1Writes) h1Active=true;
+        if(v==0x2103 && allowB1Writes) b1Active=true;
         if(v>=0x2040 && v<=0x2043) {h1Progress.push_back(v); if(v==0x2040 && h1InitialFence!=0xFFFFFFFF) h1Heap[2]=h1InitialFence;}
         if(v==0x1F03 && allowQ1Writes) q1Active=true;
         if(v>=0x1F40 && v<=0x1F47) q1Progress.push_back(v);
@@ -910,7 +981,7 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
         if(v==0x1D03 && allowW1Writes) w1Active=true;
         if(v>=0x1D40 && v<=0x1D4A) w1Progress.push_back(v);
         if(v>=0x1B40 && v<=0x1B4F) a1Progress.push_back(v);
-        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31 || v==0x1E31 || v==0x1F31 || v==0x2031) d1Restoring=true;
+        if(v==0x1931 || v==0x1A31 || v==0x1B31 || v==0x1C31 || v==0x1D31 || v==0x1E31 || v==0x1F31 || v==0x2031 || v==0x2131) d1Restoring=true;
         if(v==g3cMaskChangeStep) *GmuCfgReg(0x38)=1;
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
@@ -923,6 +994,7 @@ static std::vector<std::vector<UCHAR>> zapQuerySnapshots;
 static ULONG failZapQuerySave=0xFFFFFFFF;
 inline NTSTATUS EpiSetValue(HANDLE,const wchar_t* name,ULONG,const void* value,ULONG size) {
     if(std::wcscmp(name,L"GpuGmuH1")==0 && value && size && h1SaveFails) return STATUS_IO_DEVICE_ERROR;
+    if(std::wcscmp(name,L"GpuGmuB1")==0 && value && size && b1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuQ1")==0 && value && size && q1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuM1")==0 && value && size && m1SaveFails) return STATUS_IO_DEVICE_ERROR;
     if(std::wcscmp(name,L"GpuGmuW1")==0 && value && size && w1SaveFails) return STATUS_IO_DEVICE_ERROR;

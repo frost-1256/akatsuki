@@ -362,7 +362,7 @@ int main(int argc,char** argv) {
         assert(model[0]==0x70016400 && model[4095]==0x70BF8003 && model[3095]==0xB1000220);
     }
     assert(EpiGmuProbe2Valid(0xBFFFFE80,127) && !EpiGmuProbe2Valid(0x3FFFFE80,127));
-    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1023UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1022UL,1024UL,2047UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
     assert(sizeof(GMU_M1_TRACE)==600 && RTL_NUMBER_OF(GmuM1Packet)==177 && RTL_NUMBER_OF(GmuM1Ibs)==18);
     assert(GmuM1Packet[0]==0x70BF8003 && GmuM1Packet[1]==0x70015B80 && GmuM1Packet[176]==0xCAFE001A);
     assert(EpiGmuProbe2Valid(0xBFFFFE80,255) && !EpiGmuProbe2Valid(0x3FFFFE80,255));
@@ -2390,6 +2390,101 @@ int main(int argc,char** argv) {
             seedH1(); initH1(); failAfter=0;
             assert(submitH1()==STATUS_INSUFFICIENT_RESOURCES && !h1.Cp.Attempted && d1Maps==0 && allocations.size()==poolBefore);
             seedH1(); initH1(); q1.Checks=0x1F; assert(!GmuH1CanFollow(&q1));
+            // B-1: gated GMEM frames continue H-1's heap and allocator; the peer holds a job at CP_WAIT_REG_MEM until the gate opens.
+            {
+                const ULONG cases[][3]={{0,0xF00,0xEAFF5B85UL},{10,0xF00,0x4B7AECA7UL},{37,0x1D40,0x8894AA1FUL},
+                                        {60,0x1200,0x24B0EF41UL},{30,0x2000,0xD43FB151UL},{50,0x3C0,0x36E8A5C4UL}};
+                for(const auto& c:cases) { // FNV-1a of the whole IB, computed independently by tools/b1ib.py
+                    ULONG h=0x811C9DC5UL;
+                    for(ULONG i=0;i<701;++i) { const ULONG w=GmuB1IbWord(i,c[1],c[0]); for(ULONG sh=0;sh<32;sh+=8) { h^=(w>>sh)&0xFF; h*=0x01000193UL; } }
+                    assert(h==c[2]);
+                }
+                assert(GmuB1Gate(0)==0xA5000000 && GmuB1Gate(9)==0xA5000000 && GmuB1Gate(10)==0xA500000A && GmuB1Gate(29)==0xA500000A);
+                assert(GmuB1Gate(30)==0xA500001E && GmuB1Gate(49)==0xA500001E && GmuB1Gate(50)==0xA5000032 && GmuB1Gate(60)==0xA5000032);
+                assert(EpiGmuProbe2Valid(0xBFFFFE80UL,1023) && !EpiGmuProbe2Valid(0xBFFFFE80UL,1024) && !EpiGmuProbe2Valid(0xBFFFFE80UL,767) && !EpiGmuProbe2Valid(0,1023));
+            }
+            GMU_B1_TRACE b1;
+            const auto resetB1=[&]() {
+                allowB1Writes=true; b1Active=false; b1NoDraw=false; b1IgnoreGate=false; b1Outside=false; b1SaveFails=false;
+                b1StopFrame=0xFFFFFFFF; b1ErrorAtSubmit=0xFFFFFFFF; b1DamageHeap=0xFFFFFFFF; b1BadFenceFrame=0xFFFFFFFF; b1BackwardsFrame=0xFFFFFFFF;
+                b1Jobs.clear(); b1Writes.clear(); b1Held.clear(); b1DoneJobs=0; b1MaxPending=0;
+            };
+            const auto prepB1=[&]() {
+                allowB1Writes=false; b1Active=false; b1Jobs.clear(); b1DoneJobs=0;
+                seedH1(); initH1(); assert(submitH1()==0 && h1.Checks==0x3F);
+                h1Active=false; h1Jobs.clear(); h1DoneJobs=0; h1Writes.clear(); d1Maps=0;
+                resetB1(); GmuB1TraceInit(&b1); b1.HChecks=h1.Checks; b1.HReason=h1.Cp.Reason;
+            };
+            const auto submitB1=[&]() {return GmuB1Submit(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&b1,&hwork,reinterpret_cast<HANDLE>(2),&d1,&h1);};
+            prepB1(); const auto bandB1=d1Band;
+            assert(GmuB1CanFollow(&h1) && submitB1()==0 && b1.Checks==0x7F && b1.Cp.Reason==0);
+            assert(b1.FramesDone==61 && b1.Ts2Offset==0x1C0 && b1.Cp.Rptr==1363 && b1.Cp.WptrAfter==1363 && b1.Cp.ShadowAfter==1363);
+            assert(b1.AllocCount==123 && b1.FreeCount==122 && b1.FailCount==0 && b1.LiveBytes==1024 && b1.RetirePending==0);
+            assert(b1.PeakBytes==8192 && b1.ReuseCount==119 && b1.DistinctIb==2); // same numbers as tools/b1ib.py "gate only"
+            assert(b1.MaxInFlight==2 && b1.InFlight2Count==3 && b1.OverlapBad==0 && b1.GateReleased==3 && b1.GateFinal==0xA5000032 && b1.FenceBackwards==0);
+            for(ULONG i=0;i<3;++i) assert(b1.GateHeldA[i]==1 && b1.GateHeldB[i]==1 && b1.GateFenceA[i]==(0xA4000000UL|(9+20*i)) && b1.GateFenceB[i]==b1.GateFenceA[i]);
+            assert(b1Held.size()==3 && b1Held[0]==10 && b1Held[1]==30 && b1Held[2]==50 && b1MaxPending==2 && b1Writes.size()==61 && b1DoneJobs==61);
+            assert(b1.IbOffset[0]==0x400 && b1.VbOffset[0]==0xF00 && b1.StaticBad==0 && b1.TailBad==0 && b1.RingBad==0 && b1.OldTailBad==0);
+            for(ULONG i=0;i<12;++i) assert(b1.Ts2After[i]==(0xB4003C00UL|i));
+            assert(b1.Ts2After[12]==0xB2000100 && b1.Ts2After[13]==0xB2000101 && b1.Ts2After[14]==0xA400003C && b1.Ts2After[15]==0xA5000032);
+            assert(b1.SqGood[0]==12800 && b1.SqGood[1]==12800 && b1.BgGood[0]==19968 && b1.BgGood[1]==19968 && b1.OutsideChanged==0);
+            assert(b1.HoldMs==2000 && b1.RestoreMismatch==0 && d1Band==bandB1 && d1Band==bandBefore && allocations.size()==poolBefore);
+            for(ULONG fr=0;fr<61;++fr) { // every ring packet points at its own, never-overlapping IB/VB
+                assert(cpRing[814+9*fr+1]==0x70100000+b1.IbOffset[fr] && cpRing[814+9*fr+3]==701);
+                assert(b1.IbOffset[fr]+2816<=0x40000 && b1.VbOffset[fr]+768<=0x40000);
+            }
+            // The gate does not hold: GateHeldA/B fail, drawing and everything else still pass, and only Reason 21 reports it.
+            prepB1(); b1IgnoreGate=true;
+            assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.Checks==0x77 && b1.Cp.Reason==21 && b1.FramesDone==61 && d1Band==bandBefore);
+            assert(b1.GateHeldA[0]==0 && b1.MaxInFlight<2 && b1.HoldMs==2000 && allocations.size()==poolBefore);
+            for(ULONG bad=0;bad<5;++bad) {
+                prepB1();
+                if(bad==0) b1NoDraw=true;
+                if(bad==1) b1Outside=true;
+                if(bad==2) b1DamageHeap=0x180;
+                if(bad==3) b1DamageHeap=0x3FFFC;
+                if(bad==4) b1BadFenceFrame=60;
+                assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.Cp.Reason==13 && d1Band==bandBefore && allocations.size()==poolBefore);
+                if(bad<2) assert(b1.Checks==0x5F);
+                if(bad==2) assert(b1.Checks==0x6F && b1.StaticBad==1 && b1.StaticFirst==0x180);
+                if(bad==3) assert(b1.Checks==0x6F && b1.TailBad==1 && b1.TailFirst==0x3FFFC);
+            }
+            // A stuck frame times out; a stuck gate frame still leaves nothing pending after the cleanup opens the gate.
+            for(ULONG stop:{20UL,10UL,31UL}) {
+                prepB1(); b1StopFrame=stop;
+                assert(submitB1()==STATUS_IO_TIMEOUT && b1.Cp.Reason==16 && d1Band==bandBefore && b1.HoldMs==0 && allocations.size()==poolBefore);
+                assert(b1.FramesDone==stop && b1.FailFrame==(stop==10 ? 11UL : stop+1) && b1Jobs.size()==b1.FailFrame+1);
+            }
+            prepB1(); b1BackwardsFrame=5;
+            assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.Cp.Reason==20 && b1.FenceBackwards>=1 && b1.FailFrame==5 && d1Band==bandBefore);
+            // An error interrupt while a gate frame is held: the cleanup opens the gate so CP can finish before display RAM is restored.
+            prepB1(); b1ErrorAtSubmit=30;
+            assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.Cp.Reason==14 && b1.FailFrame==30 && b1.GateReleased>=1);
+            assert(b1Jobs.size()==31 && b1DoneJobs==31 && b1.GateFinal==0xA500001E && d1Band==bandBefore);
+            for(ULONG bad=0;bad<5;++bad) {
+                prepB1();
+                if(bad==0) cpHeap[0x200/4+1]^=1;
+                if(bad==1) cpRing[814]^=1;
+                if(bad==2) *GmuCfgReg(0x38)=1;
+                if(bad==3) cpHeap[0]^=1;
+                if(bad==4) h1.Checks=0x1F;
+                const NTSTATUS r=bad==4 ? (GmuB1CanFollow(&h1) ? 0 : STATUS_INVALID_DEVICE_STATE) : submitB1();
+                assert(r==STATUS_INVALID_DEVICE_STATE && !b1.Cp.Attempted && b1Writes.empty() && !(b1.Checks&1));
+                *GmuCfgReg(0x38)=0;
+            }
+            for(ULONG step:{0x2100UL,0x2101UL,0x2102UL,0x2108UL,0x2103UL,0x2140UL,0x2141UL,0x2150UL,0x2104UL,0x2110UL,0x2120UL,0x2130UL,0x2131UL,0x2132UL}) {
+                prepB1(); failGmuStep=step;
+                assert(!NT_SUCCESS(submitB1()) && d1Band==bandBefore && allocations.size()==poolBefore);
+                if(step==0x2150) assert(b1Jobs.size()==11 && b1DoneJobs==11 && b1.GateReleased==1);
+                failGmuStep=0xFFFFFFFF;
+            }
+            prepB1(); b1SaveFails=true;
+            assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.HoldMs==0 && d1Band==bandBefore);
+            prepB1(); d1RestoreDrop=(1130*4320+470*4-0x462000)/4;
+            assert(submitB1()==STATUS_IO_DEVICE_ERROR && b1.RestoreMismatch==1 && !(b1.Checks&64));
+            prepB1(); failAfter=0;
+            assert(submitB1()==STATUS_INSUFFICIENT_RESOURCES && !b1.Cp.Attempted && d1Maps==0 && allocations.size()==poolBefore);
+            failAfter=-1; allowB1Writes=false; b1Active=false;
             h1Heap=nullptr; h1Active=false; allowH1Writes=false;
             allowQ1Writes=false; q1Active=false;
             allowM1Writes=false; m1Active=false;
