@@ -37,10 +37,20 @@
 #define EPI_GMU_PROBE2_Q1      0x80UL // requires M1; Probe2=255, rotating textured quad
 #define EPI_GMU_PROBE2_B1      0x200UL // requires H1; Probe2=1023, gated GMEM frames
 #define EPI_GMU_PROBE2_H1      0x100UL // requires Q1; Probe2=511, boot-mapped heap and two-frame submission
+#define EPI_GMU_PROBE2_P1      0x400UL // requires B1; Probe2=2047, GPU kept running after StartDevice returns (worker thread)
 inline BOOLEAN EpiGmuProbe2Valid(ULONG Probe,ULONG Probe2)
 {
-    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511 || Probe2==1023) && Probe==0xBFFFFE80UL);
+    return Probe2==0 || ((Probe2==1 || Probe2==3 || Probe2==7 || Probe2==15 || Probe2==31 || Probe2==63 || Probe2==127 || Probe2==255 || Probe2==511 || Probe2==1023 || Probe2==2047) && Probe==0xBFFFFE80UL);
 }
+// P-1 session hooks. Implemented in epi_gpu.cxx (the worker thread owns the whole probe once P-1 is requested).
+// All are PASSIVE_LEVEL. EpiGpuSessionWait returns TRUE when a stop was requested within Milliseconds.
+BOOLEAN EpiGpuSessionActive(VOID);               // a worker session exists (thread created)
+VOID    EpiGpuSessionHandover(VOID);             // GPU is ready: let StartDevice return
+BOOLEAN EpiGpuSessionWait(ULONG Milliseconds);   // wait on StopEvent
+ULONG   EpiGpuSessionCause(VOID);                // 0 none, 1 StopDevice/unload, 2 power, 3 heartbeat limit, 4 failure
+VOID    EpiGpuSessionSetCause(ULONG Cause);      // first writer wins (the worker uses 3 and 4)
+ULONGLONG EpiGpuSessionStopTime(VOID);           // interrupt time of the stop request, 0 if none
+ULONGLONG EpiGpuSessionReturnTime(VOID);         // interrupt time StartDevice returned, 0 if not yet
 inline BOOLEAN EpiGmuD1DisplayMatches(const ULONG* D)
 {
     return D!=NULL && D[0]==0xE1000000 && D[1]==0 && D[2]==1080 && D[3]==2400 && D[4]==4320 && (D[5]==21 || D[5]==22);
@@ -557,4 +567,4 @@ ULONG EpiGmuBootTest(HANDLE hParams, HANDLE hDiag, volatile ULONG* Cc, const UCH
                      BOOLEAN G1 = FALSE, const UCHAR* Sqe = NULL, ULONG SqeLen = 0, BOOLEAN G2 = FALSE, BOOLEAN G3 = FALSE,
                      BOOLEAN G3b = FALSE, BOOLEAN G3c = FALSE, BOOLEAN G4 = FALSE, BOOLEAN G5 = FALSE, BOOLEAN G5b = FALSE,
                      BOOLEAN Z1 = FALSE, const UCHAR* Zap = NULL, ULONG ZapLen = 0, BOOLEAN S1 = FALSE, BOOLEAN R1 = FALSE,
-                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE,BOOLEAN B1 = FALSE);
+                     BOOLEAN D1 = FALSE,const ULONG* Disp = NULL,BOOLEAN V1 = FALSE,BOOLEAN A1 = FALSE,BOOLEAN T1 = FALSE,BOOLEAN W1 = FALSE,BOOLEAN M1 = FALSE,BOOLEAN Q1 = FALSE,BOOLEAN H1 = FALSE,BOOLEAN B1 = FALSE,BOOLEAN P1 = FALSE);

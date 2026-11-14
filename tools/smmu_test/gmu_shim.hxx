@@ -397,6 +397,25 @@ inline void B1Drain() {
     if(b1DoneJobs<b1Jobs.size()) {*GmuCfgReg(0x928)=0x70100000+b1Jobs[b1DoneJobs].Ib; *GmuCfgReg(0x929)=0; *GmuCfgReg(0x92A)=1;}
     else *GmuCfgReg(0x92A)=0;
 }
+// P-1 peer and session hooks. Beats complete immediately; EpiGpuSessionWait models the 100-ms StopEvent wait.
+static bool allowP1Writes=false,p1Active=false,p1Session=true,p1NoReturn=false;
+static ULONG p1StopAfter=0xFFFFFFFF,p1Waits=0,p1Handovers=0,p1Cause=0,p1Beats=0;
+static ULONG p1NoFenceBeat=0xFFFFFFFF,p1BadSlotBeat=0xFFFFFFFF,p1ErrorBeat=0xFFFFFFFF,p1BackwardsBeat=0xFFFFFFFF,p1BadFenceBeat=0xFFFFFFFF;
+static ULONGLONG p1StopTime=0,p1ReturnTime=0;
+static std::vector<ULONG> p1Writes;
+BOOLEAN EpiGpuSessionActive(VOID) { return p1Session; }
+VOID EpiGpuSessionHandover(VOID) { ++p1Handovers; }
+BOOLEAN EpiGpuSessionWait(ULONG Milliseconds)
+{
+    ++p1Waits; KeStallExecutionProcessor(static_cast<int>(Milliseconds*1000));
+    if(p1ReturnTime==0 && p1Handovers && !p1NoReturn) p1ReturnTime=testInterruptTime; // StartDevice returned
+    if(p1Waits>p1StopAfter) { if(p1Cause==0) {p1Cause=1; p1StopTime=testInterruptTime;} return TRUE; }
+    return FALSE;
+}
+ULONG EpiGpuSessionCause(VOID) { return p1Cause; }
+VOID EpiGpuSessionSetCause(ULONG Cause) { if(p1Cause==0) p1Cause=Cause; }
+ULONGLONG EpiGpuSessionStopTime(VOID) { return p1StopTime; }
+ULONGLONG EpiGpuSessionReturnTime(VOID) { return p1ReturnTime; }
 inline bool D1BandPointer(volatile ULONG* p) {
     const auto address=reinterpret_cast<std::uintptr_t>(p),base=reinterpret_cast<std::uintptr_t>(d1Band.data());
     return address>=base && address<base+0x120000;
@@ -488,6 +507,25 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
     ++gmuWrites;
     assert(p!=GmuCfgReg(0x38)); // MASK is never written, including in G-3c
+    if(p==GmuCfgReg(0x807) && allowP1Writes && p1Active) {
+        const ULONG n=p1Beats,pos=1363+9*n,target=(pos+9)%4096;
+        assert(h1Heap && v==target && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
+        p1Writes.push_back(v); g2Writes.push_back({0x807,v});
+        *p=v; gPages[2][0x313]=0;
+        ULONG packet[9]; for(ULONG i=0;i<9;++i) packet[i]=g2Ring[(pos+i)%4096];
+        assert(packet[0]==0x70BF8003 && packet[2]==0 && packet[3]==6 && packet[4]==0x70460004 && packet[5]==4);
+        assert(packet[6]==0x70100400 && packet[7]==0 && packet[8]==(0xA6000000|n));
+        const ULONG ib=packet[1]-0x70100000; assert(packet[1]>=0x70100440 && ib+64<=0x40000 && !(ib&63));
+        const ULONG* cmd=h1Heap+ib/4;
+        assert(cmd[0]==0x70460004 && cmd[1]==4 && cmd[2]==packet[1]+32 && cmd[3]==0 && cmd[4]==(0xA7000000|n) && cmd[5]==0x70268000 && cmd[8]==0xFFFFFFFF);
+        h1Heap[ib/4+8]=n==p1BadSlotBeat ? 0x12345678 : cmd[4]; // the GPU executed this very IB: it wrote the slot inside it
+        ULONG fence=0xA6000000|n; if(n==p1BackwardsBeat) fence=0xA6000000; if(n==p1BadFenceBeat) fence=0x12340000|n;
+        if(n!=p1NoFenceBeat) h1Heap[0x400/4]=fence;
+        *g2Shadow=target; *GmuCfgReg(0x806)=target; *GmuCfgReg(0x92A)=0;
+        gPages[8][0x210]=1; gPages[8][0x201]=0; gPages[2][0x30C]=0;
+        if(n==p1ErrorBeat) gPages[8][0x201]|=1UL<<9;
+        ++p1Beats; return;
+    }
     if(p==GmuCfgReg(0x807) && allowB1Writes && b1Active) {
         const ULONG frame=static_cast<ULONG>(b1Jobs.size());
         assert(frame<61 && h1Heap && v==814+9*(frame+1) && *GmuCfgReg(0x802)==0x20B && *GmuCfgReg(0x38)==0);
@@ -971,6 +1009,7 @@ inline void GmuMmioWrite(volatile ULONG* p,ULONG v) {
     }
 }
 inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
+    const bool stepName=std::wcscmp(name,L"EpiGpuProbeStep")==0 || std::wcscmp(name,L"GpuSessionStep")==0;
     if(std::wcscmp(name,L"EpiGpuProbeStep")==0) {
         if(v==0x2003 && allowH1Writes) h1Active=true;
         if(v==0x2103 && allowB1Writes) b1Active=true;
@@ -986,8 +1025,8 @@ inline NTSTATUS GmuDword(HANDLE,const wchar_t* name,ULONG v) {
         if(v==0x1009) { g3cPolling=true; g3cSample=0; }
         if(v==0x100A) g3cPolling=false;
     }
-    if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==dropGxAtStep) gPages[1][0xD0]=0xC0;
-    if(std::wcscmp(name,L"EpiGpuProbeStep")==0 && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
+    if(stepName && v==dropGxAtStep) gPages[1][0xD0]=0xC0;
+    if(stepName && v==failGmuStep) return STATUS_IO_DEVICE_ERROR;
     diagnostics[name]=v; return 0;
 }
 static std::vector<std::vector<UCHAR>> zapQuerySnapshots;

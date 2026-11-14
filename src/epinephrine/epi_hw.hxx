@@ -49,6 +49,11 @@ VOID EpiVsyncProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo);
 
+// GPU P-1 (epi_gpu.cxx): stop the worker session that keeps the GPU running after StartDevice and wait up to 5 s
+// for it to tear the GPU down. Cause: 1 StopDevice/unload, 2 non-D0 power state. No-op without a session.
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID EpiGpuSessionStop(ULONG Cause);
+
 // EpiDiag registry helpers (shared by the snapshot and the panel loader).
 // EpiOpenDiag opens <device key>\Device Parameters and its volatile EpiDiag subkey; close both handles with ZwClose.
 _IRQL_requires_(PASSIVE_LEVEL) NTSTATUS EpiOpenDiag(PDEVICE_OBJECT Pdo, HANDLE* phParams, HANDLE* phDiag);

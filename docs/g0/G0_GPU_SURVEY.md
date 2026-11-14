@@ -6157,6 +6157,181 @@ DriverVer 20.0.2.83（oem141）で、再起動の直後（v34-akat）に Probe 0
 
 **この後：** 3（DXGK の present への接続）に進む。
 
+#### 9.21.65 段階 3 の分け方と P-1 の提案：GPU を動かしたまま StartDevice を抜け、worker thread で使い続ける（文章仕様）
+
+段階 3（DXGK の present への接続）は、次の 2 つに分ける（2026-11-14 にユーザーが決めた）。
+
+- **P-1（この節）：GPU の寿命。** これまでの GPU は、StartDevice の中の 1 回きりの probe だった。最後に必ず後始末（OOB の解放、slumber、CM3 の reset、rpmh_stop、idle の確認、SMMU の Disable）をしていた。P-1 では、B-1 の後に後始末をせず、**GPU を動かしたまま StartDevice を抜ける**。そのあと、専用の worker thread が CP を持ち続ける。後始末は StopDevice（または異常・上限）のときに行う。
+- **P-2（次の段階）：present。** PresentDisplayOnly の dirty rect を、CPU が heap の staging に写す。GPU はそこから画面へ blit する（ユーザーの選択。SMMU の実行時の map は使わない）。P-2 の仕様は P-1 の結果を見て書く。
+
+P-1 では画面（band）に触らない。worker が GPU に渡すのは、heap の中だけで完結する小さな仕事（fence と、IB の中の TS）である。画面への描画を除くことで、desktop の present（CPU の blit）と GPU の書き込みが同じ画面を奪い合うことを避ける。
+
+**前提の事実：**
+- いまの probe は `EpiGpuProbe`（`bdd.cxx` の StartDevice から呼ぶ）の中で動く。GX 側の作業は `KeExpandKernelStackAndCalloutEx` の中で行い（stack の最小は 0x113E8 前後）、最後に後始末をして戻る。
+- 後始末が安全に終わらなかったときは、`g_KeptGmu` に GMU の文脈を残し（KeepCx）、次の起動では GMU に触らない。P-1 の「動かしたまま残す」は、これを意図的に、安全な状態で行うものである。
+- B-1 の後の状態：RPTR / WPTR / shadow 1363、`CP_RB_CNTL` 0x20B（16 KB の ring）、RB_CCU_CNTL 0x10000000。heap は static の 7 つ（1024 B）を確保した状態で、退避の表は空。band は復元済み。
+- 割り込みは使っていない（§9.21.16 の ISR は未実装）。P-1 でも fence は polling で見る。
+- OOB GPU_SET の投票は、probe の間ずっと保持している。P-1 の session の間も保持し続ける（GX の power collapse や IFPC は起こさない）。
+
+**probe：** `EpiGpuProbe2` の bit10 を P-1 とする。
+- P-1 は bit0..9 を必要とする。実行値は Probe 0xBFFFFE80 + Probe2 **2047**。
+- 許す組み合わせは Probe2 ∈ {0, 1, 3, …, 1023, 2047} だけで、それ以外は status 6。
+- probe の値は、これまでと同じく実行の始めに 0 に戻す。そのため、次の StartDevice（restart-device の後）では GPU に触らない。
+
+**引き継ぎ（handover、StartDevice の中）：**
+1. B-1 が成功したこと（Checks 0x7F、Reason 0）と、上の状態を確かめる。成り立たなければ P-1 は行わず、いままでどおり後始末して戻る（`SessionReason` 8）。
+2. session の文脈（GMU / CP / SMMU / heap / allocator / map の情報、ring の位置）を、NonPagedPool の 1 つの構造体 `EPI_GPU_SESSION` にまとめる。これは StartDevice より長く生きる。グローバルの `g_GpuSession` から指す（`g_KeptGmu` と同じ扱い）。
+3. static を 1 つ足す：**SESS**（64 B、Align 64）。first fit で offset **0x400**（IOVA 0x70100400）になる。違えば引き継ぎをやめて後始末する。
+   - SESS[0] = fence（ring の CACHE_FLUSH_TS の宛先）。始めは 0xFFFFFFFF。
+   - SESS[1..15] = 0。
+4. worker thread を `PsCreateSystemThread` で作る。作れなければ後始末して戻る（`SessionReason` 5）。
+5. probe の後始末（OOB の解放から SMMU の Disable まで）を**行わずに**、`EpiGpuProbe` から戻る。GX 側の map（`gpu`、`cp`、`gpucc` など）も解放しない。
+   - band の map と退避の pool は、B-1 の復元の後に解放してよい（P-1 では使わない）。
+6. `GpuSessionState` = 1（running）を EpiDiag に書く。
+
+**worker thread：**
+- 全体を `KeExpandKernelStackAndCalloutEx` の中で動かす（probe と同じ stack の余裕を持たせる）。
+- 優先度は通常（8）で、PASSIVE_LEVEL で動く。EpiDiag の key は、worker が自分で `IoOpenDeviceRegistryKey` で開く。
+- **heartbeat** を 100 ms ごとに 1 回行う（`KeDelayExecutionThread`）。heartbeat n（n = 0, 1, …）は次のとおり。
+  1. SESS[0] を読んで `Completed` を求め、`Reclaim(Completed)` を呼ぶ（B-1 と同じ fence の読み方。上位 8 bit は 0xA6）。
+  2. heap から IB を `Alloc(64, 64)` で確保する。失敗したら停止（Reason 19）。
+  3. IB に 8 語を書き、読み返す。
+     - `70460004 00000004 (IB の IOVA + 32) 00000000 (0xA7000000 | (n & 0xFFFFFF)) 70268000`（CACHE_FLUSH_TS を IB の中から、IB 自身の +32 に書かせる。そのあと CP_WAIT_FOR_IDLE）。
+     - IB の +32（語 8）は 0xFFFFFFFF にする。残りの語は 0。
+  4. ring packet（9 dw）を書く：`70BF8003 (IB の IOVA) 00000000 00000006 70460004 00000004 70100400 00000000 (0xA6000000 | (n & 0xFFFFFF))`。
+     - ring の位置は `(1363 + 9n + j) mod 4096`。WPTR は `(1363 + 9(n+1)) mod 4096`。Q-1 と同じく、折り返しをまたぐ packet もある（約 46 秒ごとに 1 回折り返す）。
+  5. WPTR を書き、IB を `Retire(…, n)` で退避の表に積む。
+  6. 完了を待つ。fence が `0xA6000000|n` になり、RPTR == WPTR == shadow になるまで。上限は 100 ms（Reason 16）。RPTR ≥ 4096 は Reason 18、エラー割り込みは Reason 14。
+  7. IB の +32 が `0xA7000000|(n & 0xFFFFFF)` であることを確かめる（`SlotBad`）。GPU がその heartbeat の IB を実際に読んで実行した証拠になる。
+- 1 秒ごと（10 heartbeat ごと）に、診断 `GpuSession` を EpiDiag に書く（下の ABI）。
+- **止める条件**（どれか 1 つで、worker は heartbeat をやめて後始末に進む）：
+  - StopDevice などからの停止要求（`KEVENT` の StopEvent）。heartbeat の待ちは `KeWaitForSingleObject(StopEvent, timeout 100 ms)` で行い、要求にすぐ気づく。
+  - heartbeat の失敗（上の Reason）。
+  - 上限：**6000 heartbeat（約 10 分）**。試験のための安全な上限で、P-2 で見直す。
+- **後始末**（worker の中で行う）：probe の最後と同じ手順（OOB の解放、slumber、CM3 の reset、rpmh_stop、idle の確認、SMMU の Disable、region の unmap と解放、CX の扱い）。結果は probe と同じ規則で `KeepCx` を決める。安全に終わらなければ `g_KeptGmu` に残す。
+- 後始末の後に最後の `GpuSession` を書き、`GpuSessionState` = 2（stopped）にして、thread を終える。
+
+**StopDevice と電源：**
+- `BASIC_DISPLAY_DRIVER::StopDevice` の始めで、`g_GpuSession` があれば StopEvent を立て、thread object を **最大 5 秒** 待つ。
+  - 待ちが上限を超えたら、`SessionStopTimeout` = 1 を記録し、session の構造体は解放しない（thread がまだ使っている可能性があるため）。DXGK にはそのまま成功を返す。
+- adapter の `SetPowerState` で D0 以外が来た場合も、同じ停止を行う（P-1 では D0 への復帰で GPU を再開しない）。
+- DriverUnload でも、session が残っていれば同じ停止を行う。
+- StopDevice の後の StartDevice では、probe の値が 0 なので GPU に触らない。`g_GpuSession` が残っている（停止の待ちが上限を超えた）場合は、GPU の probe を行わない。
+
+**判定（Checks、後始末の後に最後の `GpuSession` に書く）：**
+- bit0：引き継ぎの前提（B-1 が成功、ring と CCU の状態、SESS の offset 0x400、thread の作成）。
+- bit1：StartDevice から戻った後に、heartbeat が 1 回以上完了した（`BeatsAfterReturn` ≥ 1）。StartDevice から戻った時刻は、`EpiGpuProbe` から戻る直前に session に記録する。
+- bit2：heartbeat がすべて順に完了した。
+  - `BeatsDone` = `BeatsSubmitted`、`SlotBad` 0、`FenceBackwards` 0、timeout なし。
+  - 最後の fence が `0xA6000000 | ((BeatsDone − 1) & 0xFFFFFF)`。
+- bit3：allocator が期待どおり。FailCount 0、停止の時点で LiveBytes 1088（static 7 つ + SESS）、退避の表が空。
+- bit4：止め方が正しい。
+  - `StopCause` が 1（StopDevice）、2（電源）、3（上限）のどれか。
+  - 停止要求から thread の終了まで 5 秒未満（`StopLatencyMs`）。
+  - 後始末が成功した（`TeardownStatus` 0、KeepCx 0）。
+- bit5：fault がない。エラー割り込み、CP_PROTECT、SMMU の FSR の新しい fault、global fault のどれもない（session の前後で比べる）。
+- 期待値は **0x3F**。
+
+**診断 `GpuSession`（REG_BINARY、ABI は実装側で固定）：** 1 秒ごとと最後に書く。
+- 状態：`State`（1 running、2 stopped）、`StopCause`、`SessionReason`、`Checks`（running の間は 0）、`StopLatencyMs`、`SessionStopTimeout`、`TeardownStatus`、`KeepCx`。
+- 時間：`StartReturnMs`（引き継ぎから StartDevice に戻るまで）、`UptimeMs`、`BeatMaxUs`、`BeatTotalUs`。
+- heartbeat：`BeatsSubmitted`、`BeatsDone`、`BeatsAfterReturn`、`FailBeat`、`FailFence`、`FailRptr`、`FailWptr`、`SlotBad`、`SlotFirstBeat`、`FenceBackwards`、`WrapCount`、`WptrWrites`、`LastFence`、`Rptr`、`Wptr`、`Shadow`。
+- allocator：`LiveBytes`、`PeakBytes`、`HighWater`、`AllocCount`、`FreeCount`、`FailCount`、`ReuseCount`、`RetirePending`、`SessOffset`。
+- レジスタ：`RbbmStatus`、`CpInterrupt`、`CpProtect`、`CpStatus1`、`IbBaseLow`、`IbRemaining`、SMMU の `Fsr` / `FarLow` / `FarHigh` / `Fsynr`、`GlobalBefore[4]`、`GlobalAfter[4]`、`MaskBefore / After`、GX の `Gdscr`、`GxHm`。
+- breadcrumb は 0x2200 番台。引き継ぎは 0x2200..0x2204、worker の開始は 0x2210、停止要求は 0x2220、後始末は 0x2230..、thread の終了は 0x22FF。worker の間の breadcrumb は、`EpiGpuProbeStep` ではなく `GpuSessionStep` に書く（StartDevice の probe の 0xFFFF を上書きしない）。
+
+**実機での確かめ方（1 回の実行）：**
+1. 再起動の直後に Probe2 2047 で restart-device を 1 回行う。StartDevice が戻り、デバイスが正常（CM_PROB_NONE）になること。
+2. 約 60 秒待ち、`GpuSession` を 2 回読む。BeatsDone が約 10 / 秒で増え、Checks 0、fault がないこと。この間、画面は普通に使えること（desktop の present は CPU のまま）。
+3. もう一度 restart-device を行う（Probe2 は 0 に戻っている）。StopDevice が session を止めて後始末し、次の StartDevice は GPU に触らずに正常に戻ること。
+4. 最後の `GpuSession` を読む。State 2、StopCause 1、Checks 0x3F。
+
+**危険と対策：**
+- **後始末を後に回すこと：** GPU を動かしたまま StartDevice を抜けるのは初めてである。worker が止まらないまま driver が unload されると、GPU のレジスタの map を解放した後で触る危険がある。StopDevice と DriverUnload で必ず thread の終了を待つ。待ちが上限を超えたら、session の構造体と map を残す（解放しない）。
+- **電源：** OOB の投票を保持したままなので、GX は session の間ずっと on になる。10 分の上限で必ず止める。
+- **CX と他の driver：** CX の投票も session の間は保持する。システムの sleep（Modern Standby）に入る前には adapter の D3 が来るはずなので、そこで止める。来ない場合の振る舞いは未確認で、試験の間は画面を消さない。
+- **hang 検出：** heartbeat の IB は短く、CP はほとんど idle で待つ。B-1 の gate（2 ms の停止）でも問題はなかった。
+- **registry：** worker が書くのは EpiDiag の `GpuSession` と `GpuSessionStep`、`GpuSessionState` だけ。1 秒ごとなので負荷は小さい。
+
+**分担：**
+- 引き継ぎ、session の構造体、worker thread、StopDevice / 電源 / unload での停止、後始末を worker に移すこと：GMU / GX / CP の寿命に関わるので、ユーザー。
+- 机上試験の shim（StopEvent、上限、heartbeat の失敗、停止の待ちの上限）：実装と一緒にユーザー。
+- 私の担当：この仕様、確かめ方のスクリプト（2 回の読み取りと、2 回目の restart-device）、診断の解読、記録。
+
+**この後：** P-1 が通れば、P-2（present の dirty rect を heap の staging から GPU で画面に blit する）の仕様を書く。そこでは、画面全体（約 10 MB）を GPU から書けるように map すること、present と GPU の完了の順序（fence）、VSync との関係を扱う。
+
+#### 9.21.66 P-1 の実装
+
+`EPI_GMU_PROBE2_P1 = 0x400`（Probe2 = 2047）。heartbeat 本体と判定は `GmuP1Run` / `GmuP1Final`（`epi_gmu.cxx`）、session の寿命は `epi_gpu.cxx`。診断 `GpuSession` は `GMU_P1_TRACE`（`GMU_G2_TRACE` + 58 ULONG）。
+
+**仕様からの変更点（1 つ）：引き継ぎの作り方。** 後始末に必要な局所変数（GMU の文脈、GX の trace、CX の元の値、SMMU、gpucc の map など）が `EpiGpuProbe` → `EpiGpuCxTest` → `EpiGmuBootTest` に広く散らばっているため、それらを構造体へ移さずに、**probe 全体を worker thread で動かす**形にした。
+
+- Probe2 の bit10 があるとき、`EpiGpuProbe`（StartDevice）は `EPI_GPU_SESSION` を作り、`EpiGpuProbeRun`（従来の probe そのもの）を system thread で実行する。StartDevice は handover event か thread の終了を待つ。
+- GMU 側は、従来の probe が OOB を解放する直前（B-1 の後、`GmuGxOob` の末尾）で `GmuP1Run` に入る。SESS（heap 0x400）の確保、前段の確認、handover の通知、100 ms ごとの heartbeat をここで行う。停止要求・失敗・6000 回で抜けると、**従来どおりの後始末**（OOB 解放、slumber、CM3 reset、rpmh_stop、idle 確認、SMMU Disable、unmap・解放、CX の扱い、KeepCx の規則）が同じ thread で続く。
+- 後始末の後に `GmuP1Final` が bit1 と bit4 を判定し、最後の `GpuSession`（State 2）を書く。
+- handover 以降の breadcrumb は `GpuSessionStep` に書く（`g_GmuStepName` を切り替える）。`EpiGpuProbeStep` は StartDevice 側の値のまま。
+- 仕様の `SessionReason` 5（thread を作れない）は、thread を作れないとき、または session がないときに `GmuP1Run` が返す。この場合 GPU は従来どおり後始末される。
+
+**停止：**
+- `EpiGpuSessionStop(cause)`（StopDevice は 1、非 D0 の電源は 2、DriverUnload は 1）。StopEvent を立て、thread object を最大 5 秒待つ。上限を超えたら `GpuSessionStopTimeout` = 1 を EpiDiag に書き、session の構造体は解放しない。
+- 上限（6000 回）は cause 3、heartbeat の失敗は cause 4（判定の bit4 は 1〜3 だけを正しい停止とする）。
+- `g_GpuSession` が残っている間は新しい probe をしない。
+
+**机上試験：** shim に P-1 の peer（ring の packet、IB の内容、fence、slot を検証して即時に完了させる）と session の hook を足した。25 回で停止（0x2D → 後始末後 0x3F）、折り返し（320 回、WrapCount 1）、6000 回の上限（cause 3、WrapCount 13）、後始末の失敗・KeepCx（0x2F）、StartDevice に戻らない（0x3D）、global fault の変化（bit5 なし）、fence なし・slot の不一致・エラー割り込み・fence の逆行・fence の形の異常、前段の不成立 6 通り、各 breadcrumb の失敗（handover の前後）を確かめた。Probe2 の許す値に 2047 を追加し、2046 / 2048 / 4095 は無効のまま。
+
+DriverVer 84 をビルドし、スタック検査に通り（max_frame 1888）、署名した。実機では未実行。
+
+
+#### 9.21.67 P-1 の実機結果（v84、成功）
+
+DriverVer 20.0.2.84（oem142）で、再起動の直後（v34-akat）に Probe 0xBFFFFE80 と Probe2 **2047** を指定し、restart-device を 1 回実行した。
+
+**引き継ぎと動作中：**
+- 約 50 秒（前段の 10 段階）の後、breadcrumb が 0x2204 になり、`GpuSessionState` = 1 になった。デバイスは正常（CM_PROB_NONE）。
+- `EpiGpuProbeStep` は 0x2204 のまま止まり、`GpuSessionStep` が 0x2210（heartbeat の繰り返し）になった。仕様どおり、probe の 0xFFFF は後始末の後に書かれる。
+- 前段の B-1 は Checks 0x7F。
+- 動作中の 2 回の読み取り（間隔 45 秒）：
+
+| 読み取り | UptimeMs | BeatsDone | WrapCount | LastFence | 失敗 |
+|---|---|---|---|---|---|
+| 1 回目 | 380101 | 3430 | 7 | 0xA6000D65 | なし（SlotBad 0、FenceBackwards 0） |
+| 2 回目 | 425349 | 3840 | 8 | 0xA6000EFF | なし |
+
+- heartbeat は約 **9.1 回／秒**（100 ms の待ちと、1 回の処理・registry の書き込み）。BeatsSubmitted と BeatsDone は常に等しかった。
+- この間、PC から WinRM で何度も読み取れた。ただし、新しい session の作成が 2 回、一時的に失敗した（再試行で通った）。P-1 との関係は未確認。
+
+**停止（2 回目の restart-device、Probe2 は 0 に戻っていた）：**
+- StopDevice が session を止め、後始末をして、次の StartDevice は GPU に触らずに正常に戻った（デバイスは CM_PROB_NONE）。
+  - 2 回目の StartDevice の `GpuProbeStatus` 1 は「probe の指定なし」の意味で、期待どおり。
+- 最後に `GpuSessionState` 2、`GpuSessionStep` 0x22FF、`EpiGpuProbeStep` 0xFFFF、`GpuGmuStatus` 0。`GpuSessionStopTimeout` は書かれていない。
+
+**判定：** Checks **0x3F**、SessionReason 0。
+
+| 項目 | 結果 |
+|---|---|
+| 止め方 | StopCause **1**（StopDevice）、StopLatencyMs **203**、TeardownStatus 0、KeepCx 0 |
+| heartbeat | BeatsSubmitted = BeatsDone = BeatsAfterReturn = **4031**、FailBeat なし、SlotBad 0、FenceBackwards 0 |
+| 時間 | UptimeMs 446749（約 7 分 27 秒）。StartReturnMs 0、BeatMaxUs 0（どれも 1 tick 未満） |
+| ring | WrapCount **9**、MaxRptrSeen 4095。最後の RPTR / WPTR / shadow 0x30A（778）、IB の残り 0 |
+| fence | LastFence 0xA6000FBE（= 4030） |
+| allocator | Alloc 4032（SESS 1 + heartbeat 4031）、Free 4031、Fail 0、Reuse 4032、Live **1088** B、Peak 8192 B、RetirePending 0 |
+| SESS | offset 0x400。最後の IB は 0x70100440（heartbeat の IB は毎回 0x440 を再利用） |
+| CCU | 前後とも 0x10000000 |
+| fault | CpInterrupt / CpProtect / CpStatus1 0、MASK 0、global fault は前後とも 0、SMMU の Fsr 0x400 は前と同じ古い値 |
+| stack | 0x11F60 / 0x113D8 |
+
+**わかったこと：**
+- GPU を動かしたまま StartDevice を抜けられた。DXGK と desktop は普通に動き、その裏で worker thread が約 7.5 分の間 GPU を使い続けた（4031 回、失敗なし）。
+- 100 ms ごとの heartbeat でも、GMU / GX は落ちなかった。OOB の投票を保持し続けるやり方で、session の間の電源は保てる。
+- ring は 16 KB のまま 9 回折り返した。heap の allocator は 4000 回以上の確保・解放でも漏れや失敗がなかった。
+- StopDevice からの停止は 203 ms で終わった（100 ms の待ちの中で停止要求に気づき、そのあと後始末をした）。後始末は probe と同じく成功し、次の StartDevice は正常だった。
+
+**後の段階の前提（P-1 の後）：**
+- GPU は後始末されている（次の実行は、いままでどおり再起動から）。
+- P-2 は、P-1 の session の中で present の仕事を GPU に渡す形にする。
+
+**この後：** P-2（present の dirty rect を heap の staging から GPU で画面に blit する）の仕様を書く。
+
 ## 参照
 
 - 本家 Linux（master）：`drivers/gpu/drm/msm/adreno/{a6xx_gmu.c, a6xx_gmu.xml, a6xx_gpu.c, a6xx_hfi.c, a6xx_hfi.h, a6xx_catalog.c, adreno_gpu.c}`、`drivers/iommu/arm/arm-smmu/{arm-smmu.h, arm-smmu.c}`、`drivers/iommu/io-pgtable-arm.c`、`drivers/clk/qcom/{gpucc-sc7280.c, gcc-sc7280.c}`、`arch/arm64/boot/dts/qcom/{kodiak.dtsi, sm7325-nothing-spacewar.dts}`

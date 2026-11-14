@@ -47,11 +47,12 @@ NTSTATUS EpiSmmuDestroy(EPI_SMMU* c) {assert(!c->enabled); ExFreePoolWithTag(c,0
 static ULONG testFaultFsr=2;
 NTSTATUS EpiSmmuQueryFault(EPI_SMMU*,ULONG* fsr,ULONGLONG* addr,ULONG* syn) {*fsr=testFaultFsr;*addr=0x4000;*syn=0;return 0;}
 static ULONG testGlobalCalls=0;
+static bool testGlobalStable=false; // P-1 compares the global fault registers before/after: stable unless a test says otherwise
 static NTSTATUS testGlobalStatus=STATUS_SUCCESS;
 NTSTATUS EpiSmmuQueryGlobalFault(EPI_SMMU* c,ULONG* values) {
     if(!c || !values) return STATUS_INVALID_PARAMETER;
     ++testGlobalCalls; if(!NT_SUCCESS(testGlobalStatus)) return testGlobalStatus;
-    for(ULONG i=0;i<4;++i) values[i]=0x100*testGlobalCalls+i;
+    for(ULONG i=0;i<4;++i) values[i]=(testGlobalStable ? 0x100UL : 0x100*testGlobalCalls)+i;
     return STATUS_SUCCESS;
 }
 NTSTATUS EpiSmmuQueryLastError(EPI_SMMU*,ULONG*,ULONG*,ULONG*,ULONG*) {return STATUS_NOT_FOUND;}
@@ -362,7 +363,7 @@ int main(int argc,char** argv) {
         assert(model[0]==0x70016400 && model[4095]==0x70BF8003 && model[3095]==0xB1000220);
     }
     assert(EpiGmuProbe2Valid(0xBFFFFE80,127) && !EpiGmuProbe2Valid(0x3FFFFE80,127));
-    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1022UL,1024UL,2047UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
+    for(ULONG invalid:{65UL,95UL,126UL,128UL,254UL,256UL,510UL,512UL,1022UL,1024UL,2046UL,2048UL,4095UL}) assert(!EpiGmuProbe2Valid(0xBFFFFE80,invalid));
     assert(sizeof(GMU_M1_TRACE)==600 && RTL_NUMBER_OF(GmuM1Packet)==177 && RTL_NUMBER_OF(GmuM1Ibs)==18);
     assert(GmuM1Packet[0]==0x70BF8003 && GmuM1Packet[1]==0x70015B80 && GmuM1Packet[176]==0xCAFE001A);
     assert(EpiGmuProbe2Valid(0xBFFFFE80,255) && !EpiGmuProbe2Valid(0x3FFFFE80,255));
@@ -2485,6 +2486,101 @@ int main(int argc,char** argv) {
             prepB1(); failAfter=0;
             assert(submitB1()==STATUS_INSUFFICIENT_RESOURCES && !b1.Cp.Attempted && d1Maps==0 && allocations.size()==poolBefore);
             failAfter=-1; allowB1Writes=false; b1Active=false;
+            // P-1: the heartbeat session. The peer completes every beat at once; a stop is requested by EpiGpuSessionWait.
+            GMU_P1_TRACE p1;
+            const auto resetP1=[&]() {
+                allowP1Writes=true; p1Active=true; p1Session=true; p1NoReturn=false; testGlobalStable=true;
+                p1StopAfter=0xFFFFFFFF; p1Waits=0; p1Handovers=0; p1Cause=0; p1Beats=0; p1StopTime=0; p1ReturnTime=0;
+                p1NoFenceBeat=p1BadSlotBeat=p1ErrorBeat=p1BackwardsBeat=p1BadFenceBeat=0xFFFFFFFF; p1Writes.clear();
+                diagnostics.erase(L"GpuSessionState"); diagnostics.erase(L"GpuSessionStep");
+            };
+            const auto prepP1=[&]() {
+                allowP1Writes=false; p1Active=false; // the earlier P-1 peer must not see the H-1/B-1 WPTR writes
+                prepB1(); assert(submitB1()==0 && b1.Checks==0x7F);
+                allowB1Writes=false; b1Active=false; b1Jobs.clear(); b1DoneJobs=0; b1Writes.clear(); d1Maps=0;
+                resetP1(); GmuP1TraceInit(&p1);
+            };
+            const auto runP1=[&]() {const NTSTATUS r=GmuP1Run(&probe,reinterpret_cast<HANDLE>(1),cc,&oob,&p1,&hwork,reinterpret_cast<HANDLE>(2),&b1); p1.Cp.Status=r; return r;};
+            const auto finalP1=[&](ULONG result,bool keep) {GmuP1Final(reinterpret_cast<HANDLE>(1),reinterpret_cast<HANDLE>(2),&p1,result,keep ? TRUE : FALSE);};
+            // 25 beats, then StopDevice: everything passes, Checks 0x3F only after the teardown result is known.
+            prepP1(); p1StopAfter=25;
+            assert(GmuP1CanFollow(&b1));
+            const NTSTATUS first=runP1(); assert(first==0);
+            assert(p1.Prepared==1);
+            assert(p1.BeatsDone==25);
+            assert(p1.BeatsSubmitted==25);
+            assert(p1.Checks==0x2D);
+            assert(p1.State==1 && std::wcscmp(g_GmuStepName,L"GpuSessionStep")==0 && p1Handovers==1 && p1Beats==25 && p1Writes.size()==25);
+            assert(p1.SessOffset==0x400 && p1.LiveBytes==1088 && p1.FailCount==0 && p1.RetirePending==0 && p1.FenceBackwards==0 && p1.SlotBad==0);
+            assert(p1.LastFence==(0xA6000000UL|24) && p1.FailBeat==0xFFFFFFFF && p1.Cp.Rptr==(1363+9*25)%4096 && p1.WrapCount==0 && p1.CcuAfter==0x10000000);
+            assert(p1.AllocCount==26 && p1.FreeCount==25 && p1.ReuseCount>=24); // SESS + one IB per beat, each IB reused at 0x440
+            assert(cpRing[1363+1]==0x70100440 && cpRing[1363+9*24+1]==0x70100440 && cpHeap[0x400/4]==(0xA6000000UL|24) && cpHeap[0x404/4]==0);
+            finalP1(0,false);
+            assert(p1.Checks==0x3F && p1.State==2 && p1.StopCause==1 && p1.BeatsAfterReturn==25 && p1.StopLatencyMs==0 && p1.TeardownStatus==0 && p1.KeepCx==0);
+            assert(diagnostics[L"GpuSessionState"]==2 && diagnostics[L"GpuSessionStep"]==0x22FF && std::wcscmp(g_GmuStepName,L"EpiGpuProbeStep")==0);
+            // A teardown that fails (or keeps CX) is not a clean stop.
+            prepP1(); p1StopAfter=5; assert(runP1()==0); finalP1(EPI_GMU_E_TEARDOWN,true);
+            assert(p1.Checks==0x2F && p1.KeepCx==1 && p1.TeardownStatus==EPI_GMU_E_TEARDOWN);
+            prepP1(); p1StopAfter=5; assert(runP1()==0); finalP1(EPI_GMU_E_GX,false);
+            assert(p1.Checks==0x2F);
+            // A global fault register that changed during the session is a fault: bit5 stays clear.
+            prepP1(); testGlobalStable=false; p1StopAfter=5; assert(runP1()==0 && !(p1.Checks&32) && (p1.Checks&4)); finalP1(0,false);
+            assert(p1.Checks==0x1F);
+            // StartDevice never returned: no beat counts for bit1.
+            prepP1(); p1StopAfter=5; p1NoReturn=true; assert(runP1()==0 && p1.BeatsAfterReturn==0); finalP1(0,false);
+            assert(p1.Checks==0x3D);
+            // The ring wraps (305 beats cross 4096), including the packet that straddles the end.
+            prepP1(); p1StopAfter=320; assert(runP1()==0 && p1.BeatsDone==320 && p1.WrapCount==1 && p1Beats==320); finalP1(0,false);
+            assert(p1.Checks==0x3F && p1.Cp.Rptr==(1363+9*320)%4096);
+            // The 6000-beat limit (about 10 minutes) is a normal stop with cause 3.
+            prepP1(); assert(runP1()==0 && p1.BeatsDone==6000 && p1.BeatsSubmitted==6000 && p1Cause==3 && p1.WrapCount==13); finalP1(0,false);
+            assert(p1.Checks==0x3F && p1.StopCause==3 && p1.LastFence==(0xA6000000UL|5999) && p1.LiveBytes==1088 && p1.AllocCount==6001 && p1.FreeCount==6000);
+            // An immediate stop request: handover happened, no beat ran, bit1/bit2 cannot hold.
+            prepP1(); p1StopAfter=0; assert(runP1()==0 && p1.BeatsDone==0 && p1Handovers==1 && p1Beats==0); finalP1(0,false);
+            assert(!(p1.Checks&6) && (p1.Checks&1));
+            // Heartbeat failures stop the session with cause 4 and never report success.
+            for(ULONG bad=0;bad<5;++bad) {
+                prepP1();
+                if(bad==0) p1NoFenceBeat=5;
+                if(bad==1) p1BadSlotBeat=3;
+                if(bad==2) p1ErrorBeat=4;
+                if(bad==3) p1BackwardsBeat=4;
+                if(bad==4) p1BadFenceBeat=2;
+                const NTSTATUS r=runP1();
+                assert(!NT_SUCCESS(r) && p1Cause==4 && p1.FailBeat==(bad==0 ? 5UL : bad==1 ? 3UL : bad==2 ? 4UL : bad==3 ? 4UL : 2UL));
+                assert(p1.Cp.Reason==(bad==0 ? 16UL : bad==1 ? 13UL : bad==2 ? 14UL : bad==3 ? 20UL : 13UL));
+                if(bad==0) assert(r==STATUS_IO_TIMEOUT && p1.BeatsDone==5 && p1.BeatsSubmitted==6);
+                if(bad==1) assert(p1.SlotBad==1 && p1.SlotFirstBeat==3);
+                if(bad==3) assert(p1.FenceBackwards>=1);
+                finalP1(EPI_GMU_E_CP,false);
+                assert(!(p1.Checks&0x3C) && p1.StopCause==4 && p1.State==2 && std::wcscmp(g_GmuStepName,L"EpiGpuProbeStep")==0);
+            }
+            // Prerequisites: nothing is handed over and nothing is submitted.
+            for(ULONG bad=0;bad<6;++bad) {
+                prepP1();
+                if(bad==0) p1Session=false;
+                if(bad==1) b1.Checks=0x5F;
+                if(bad==2) cpHeap[0x204/4]^=1;
+                if(bad==3) *GmuCfgReg(0x807)=1364;
+                if(bad==4) *GmuCfgReg(0x38)=1;
+                if(bad==5) hwork.Heap.LiveBytes+=64;
+                p1StopAfter=3;
+                const NTSTATUS r=runP1();
+                assert(!NT_SUCCESS(r) && p1Handovers==0 && p1Beats==0 && p1Writes.empty() && !p1.Prepared);
+                assert(p1.SessionReason==p1.Cp.Reason);
+                if(bad<2) assert(p1.Cp.Reason==(bad==0 ? 5UL : 8UL)); else assert(p1.Cp.Reason==12 || p1.Cp.Reason==15);
+                finalP1(EPI_GMU_E_CP,false);
+                assert(p1.Checks==0 && p1.State==2);
+                *GmuCfgReg(0x38)=0; *GmuCfgReg(0x807)=1363;
+            }
+            for(ULONG step:{0x2200UL,0x2201UL,0x2202UL,0x2203UL,0x2204UL,0x2210UL}) {
+                prepP1(); failGmuStep=step; p1StopAfter=3;
+                assert(!NT_SUCCESS(runP1()) && p1Beats==0 && p1Handovers==(step==0x2210 ? 1UL : 0UL));
+                failGmuStep=0xFFFFFFFF; finalP1(EPI_GMU_E_CP,false);
+                assert(std::wcscmp(g_GmuStepName,L"EpiGpuProbeStep")==0 && p1.Checks<2);
+            }
+            assert(sizeof(GMU_P1_TRACE)==sizeof(GMU_G2_TRACE)+4*58);
+            allowP1Writes=false; p1Active=false; p1Session=true; testGlobalStable=false;
             h1Heap=nullptr; h1Active=false; allowH1Writes=false;
             allowQ1Writes=false; q1Active=false;
             allowM1Writes=false; m1Active=false;

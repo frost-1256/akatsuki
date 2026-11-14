@@ -206,6 +206,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::StopDevice(VOID)
 {
     PAGED_CODE();
 
+    EpiGpuSessionStop(1);   // P-1: the GPU worker must be gone before anything is released
     EpiVsyncStop(&m_Vsync);
     EpiDsiStop(&m_Dsi);
     CleanUp();
@@ -255,6 +256,7 @@ NTSTATUS BASIC_DISPLAY_DRIVER::SetPowerState(_In_  ULONG              HardwareUi
 
     if (HardwareUid == DISPLAY_ADAPTER_HW_ID)
     {
+        if (DevicePowerState != PowerDeviceD0) { EpiGpuSessionStop(2); } // P-1: no GPU session across D3
         if (DevicePowerState == PowerDeviceD0)
         {
 

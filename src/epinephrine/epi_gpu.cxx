@@ -845,7 +845,8 @@ static ULONG EpiGpuCxTest(HANDLE hParams, HANDLE hDiag, ULONG Flags, ULONG Flags
                                                (Flags2 & EPI_GMU_PROBE2_M1) ? TRUE : FALSE,
                                                (Flags2 & EPI_GMU_PROBE2_Q1) ? TRUE : FALSE,
                                                (Flags2 & EPI_GMU_PROBE2_H1) ? TRUE : FALSE,
-                                               (Flags2 & EPI_GMU_PROBE2_B1) ? TRUE : FALSE);
+                                               (Flags2 & EPI_GMU_PROBE2_B1) ? TRUE : FALSE,
+                                               (Flags2 & EPI_GMU_PROBE2_P1) ? TRUE : FALSE);
         EpiSetDword(hDiag, L"GpuGmuStatus", gmuStatus);
         if (gmuStatus != EPI_GMU_OK) { status = 16; }
         // No further probes after boot, especially when teardown retained the CX window.
@@ -951,7 +952,7 @@ static VOID NTAPI EpiGpuCxCallout(PVOID Context)
                               ctx->Cc,ctx->Text,ctx->Fw,&ctx->FwStatus,&ctx->KeepCx);
 }
 
-VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
+static VOID EpiGpuProbeRun(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
 {
     PAGED_CODE();
     HANDLE hParams = NULL;
@@ -1201,4 +1202,110 @@ done:
     if (pairs != NULL) { ExFreePoolWithTag(pairs, 'gpEE'); }
     ZwClose(hDiag);
     ZwClose(hParams);
+}
+
+// ---- P-1: the GPU keeps running after StartDevice returns ----
+// Once EpiGpuProbe2 bit10 is requested, a system thread runs the whole probe (EpiGpuProbeRun) exactly as before,
+// including its teardown. At the point where the old probe would have shut the GPU down, the GMU code (GmuP1Run)
+// signals HandoverEvent and keeps issuing heartbeats until StopEvent, a failure or the heartbeat limit; only then
+// the unchanged teardown runs, in the same thread. StartDevice waits for the handover and returns while the GPU
+// stays powered. StopDevice, a non-D0 power state and DriverUnload stop the session (5 s bound).
+struct EPI_GPU_SESSION {
+    PDEVICE_OBJECT Pdo;
+    EPI_HW_RESOURCES Res;
+    KEVENT StopEvent,HandoverEvent;
+    PETHREAD Thread;
+    volatile LONG StopCause;          // 1 StopDevice/unload, 2 power, 3 heartbeat limit, 4 failure; first writer wins
+    volatile LONG Returned;
+    volatile LONGLONG StopTime,ReturnTime;
+};
+static EPI_GPU_SESSION* volatile g_GpuSession=NULL;
+BOOLEAN EpiGpuSessionActive(VOID) { return g_GpuSession!=NULL; }
+VOID EpiGpuSessionHandover(VOID)
+{ EPI_GPU_SESSION* s=g_GpuSession; if (s!=NULL) { KeSetEvent(&s->HandoverEvent,IO_NO_INCREMENT,FALSE); } }
+BOOLEAN EpiGpuSessionWait(ULONG Milliseconds)
+{
+    EPI_GPU_SESSION* s=g_GpuSession; if (s==NULL) { return TRUE; }
+    LARGE_INTEGER t; t.QuadPart=-static_cast<LONGLONG>(Milliseconds)*10000;
+    return KeWaitForSingleObject(&s->StopEvent,Executive,KernelMode,FALSE,&t)==STATUS_SUCCESS;
+}
+ULONG EpiGpuSessionCause(VOID) { EPI_GPU_SESSION* s=g_GpuSession; return s!=NULL ? static_cast<ULONG>(s->StopCause) : 0; }
+VOID EpiGpuSessionSetCause(ULONG Cause)
+{ EPI_GPU_SESSION* s=g_GpuSession; if (s!=NULL) { InterlockedCompareExchange(&s->StopCause,static_cast<LONG>(Cause),0); } }
+ULONGLONG EpiGpuSessionStopTime(VOID) { EPI_GPU_SESSION* s=g_GpuSession; return s!=NULL ? static_cast<ULONGLONG>(s->StopTime) : 0; }
+ULONGLONG EpiGpuSessionReturnTime(VOID)
+{
+    EPI_GPU_SESSION* s=g_GpuSession;
+    return (s!=NULL && s->Returned) ? static_cast<ULONGLONG>(s->ReturnTime) : 0;
+}
+_Function_class_(KSTART_ROUTINE)
+static VOID NTAPI EpiGpuSessionThread(PVOID Context)
+{
+    EPI_GPU_SESSION* s=static_cast<EPI_GPU_SESSION*>(Context);
+    EpiGpuProbeRun(&s->Res,s->Pdo);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+// TRUE when there is no session any more (the thread has ended and the structure is freed).
+static BOOLEAN EpiGpuSessionReap(ULONG Milliseconds)
+{
+    EPI_GPU_SESSION* s=g_GpuSession; if (s==NULL) { return TRUE; }
+    if (s->Thread==NULL) { return FALSE; } // thread exists but could not be referenced: never free what it may still use
+    LARGE_INTEGER t; t.QuadPart=-static_cast<LONGLONG>(Milliseconds)*10000;
+    if (KeWaitForSingleObject(s->Thread,Executive,KernelMode,FALSE,&t)!=STATUS_SUCCESS) { return FALSE; }
+    ObDereferenceObject(s->Thread);
+    g_GpuSession=NULL;
+    ExFreePoolWithTag(s,'ssEE');
+    return TRUE;
+}
+VOID EpiGpuSessionStop(ULONG Cause)
+{
+    PAGED_CODE();
+    EPI_GPU_SESSION* s=g_GpuSession; if (s==NULL) { return; }
+    if (InterlockedCompareExchange(&s->StopCause,static_cast<LONG>(Cause),0)==0)
+    { InterlockedExchange64(&s->StopTime,static_cast<LONGLONG>(KeQueryInterruptTime())); }
+    KeSetEvent(&s->StopEvent,IO_NO_INCREMENT,FALSE);
+    if (!EpiGpuSessionReap(5000))
+    {
+        // The thread may still use the structure and the GPU maps: neither is freed.
+        HANDLE hp=NULL,hd=NULL;
+        if (NT_SUCCESS(EpiOpenDiag(s->Pdo,&hp,&hd))) { EpiSetDword(hd,L"GpuSessionStopTimeout",1); ZwClose(hd); ZwClose(hp); }
+    }
+}
+
+VOID EpiGpuProbe(_In_ const EPI_HW_RESOURCES* pRes, _In_ PDEVICE_OBJECT Pdo)
+{
+    PAGED_CODE();
+    if (g_GpuSession!=NULL && !EpiGpuSessionReap(0)) { return; } // a previous session still owns the GPU
+    ULONG flags=0,flags2=0;
+    {
+        HANDLE hp=NULL,hd=NULL;
+        if (!NT_SUCCESS(EpiOpenDiag(Pdo,&hp,&hd))) { return; }
+        flags=EpiQueryDword(hp,L"EpiGpuProbe",0); flags2=EpiQueryDword(hp,L"EpiGpuProbe2",0);
+        ZwClose(hd); ZwClose(hp);
+    }
+    if (flags==0 || !(flags2&EPI_GMU_PROBE2_P1) || !EpiGmuProbe2Valid(flags,flags2))
+    { EpiGpuProbeRun(pRes,Pdo); return; }
+    EPI_GPU_SESSION* s=static_cast<EPI_GPU_SESSION*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(EPI_GPU_SESSION),'ssEE'));
+    if (s==NULL) { EpiGpuProbeRun(pRes,Pdo); return; } // P-1 then reports SessionReason 5 and tears down as before
+    s->Pdo=Pdo; s->Res=*pRes;
+    KeInitializeEvent(&s->StopEvent,NotificationEvent,FALSE);
+    KeInitializeEvent(&s->HandoverEvent,NotificationEvent,FALSE);
+    g_GpuSession=s;
+    HANDLE th=NULL;
+    NTSTATUS st=PsCreateSystemThread(&th,THREAD_ALL_ACCESS,NULL,NULL,NULL,EpiGpuSessionThread,s);
+    if (!NT_SUCCESS(st))
+    {
+        g_GpuSession=NULL; ExFreePoolWithTag(s,'ssEE');
+        EpiGpuProbeRun(pRes,Pdo); return;
+    }
+    PETHREAD thread=NULL;
+    if (NT_SUCCESS(ObReferenceObjectByHandle(th,SYNCHRONIZE,*PsThreadType,KernelMode,reinterpret_cast<PVOID*>(&thread),NULL)))
+    { s->Thread=thread; }
+    ZwClose(th);
+    if (s->Thread==NULL) { return; } // cannot wait for it; the session stays until unload (never freed under the thread)
+    PVOID objects[2]={&s->HandoverEvent,s->Thread};
+    KeWaitForMultipleObjects(2,objects,WaitAny,Executive,KernelMode,FALSE,NULL,NULL);
+    InterlockedExchange64(&s->ReturnTime,static_cast<LONGLONG>(KeQueryInterruptTime()));
+    InterlockedExchange(&s->Returned,1);
+    EpiGpuSessionReap(0); // the probe ended without a handover: free the session now
 }

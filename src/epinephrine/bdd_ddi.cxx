@@ -95,6 +95,7 @@ VOID
 BddDdiUnload(VOID)
 {
     PAGED_CODE();
+    EpiGpuSessionStop(1);   // P-1: never unload under a running GPU worker
 }
 
 NTSTATUS
